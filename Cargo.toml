@@ -1,0 +1,38 @@
+[package]
+name = "huskarl-route-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Path-to-rule routing with a path-confusion (parser differential) guard for authorization layers."
+repository = "https://github.com/huskarl-rs/huskarl-route-guard"
+homepage = "https://github.com/huskarl-rs/huskarl-route-guard"
+documentation = "https://docs.rs/huskarl-route-guard"
+license = "MIT OR Apache-2.0"
+keywords = ["security", "authorization", "routing", "path-traversal"]
+categories = ["authentication", "web-programming"]
+exclude = ["src/__fuzz__/**"]
+
+[dependencies]
+bon = "3.9"
+http = "1"
+
+[dev-dependencies]
+# Test oracle for the owned matcher (proptest + fuzz differentials) — never a
+# runtime dependency.
+matchit = "0.9"
+proptest = "1"
+bolero = "0.13"
+
+# Statistical benchmarks over the public request-resolution API.
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "route_guard"
+harness = false
+
+# Build profile cargo-bolero uses for fuzz runs. Optimized (so the fuzzer explores fast)
+# but with assertions and overflow checks on, since a fuzzer's job is to trip them.
+[profile.fuzz]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

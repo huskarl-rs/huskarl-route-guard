@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a5be6ff9f5ef1f1b4090e4e200417904b5e353ee117793f4fb3fc7c185bbb100 # shrinks to pattern = "", path = ""
+cc a6c18ee3487ec8c44dcdf1e92618012a3b5dc1ec20e9a8cd9f2a596c773b9b1b # shrinks to specs = [('s', "/admin")], (classes, layers, case) = (StructuralClasses { backslash: false, overlong_slash: true, overlong_dot: false, unicode: false, probes: [] }, Single, Sensitive), path = "/%61dmin/%c0%afadmin"
+cc 90c897f526385033d219db81d49392c753e861b50576c3a78d46f414c44ddc15 # shrinks to specs = [('e', "/a/b")], (classes, layers, case) = (StructuralClasses { backslash: false, overlong_slash: false, overlong_dot: false, unicode: true, probes: [] }, Single, Sensitive), path = "/..../a／b", order_seed = 0

@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: quality (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The project deliberately uses unstable rustfmt options; keep compilation on
+      # stable while formatting with the same nightly toolchain as `mise run fmt`.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo +stable test --locked --all-targets
+
+      - name: Run documentation tests
+        run: cargo +stable test --locked --doc
+
+      - name: Build documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --locked --no-deps
+
+  msrv:
+    name: MSRV (1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: Check all targets on the minimum supported Rust version
+        run: cargo check --locked --all-targets

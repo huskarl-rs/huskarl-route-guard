@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e9720454b5631a6f06dc9204eb0c414a8bcfdfae586ef3523acf7c1a7e128997 # shrinks to path = "/a/Abc/.."
+cc 81c7c5604bbe2fe225e6383f4c24eb40298db6792b59419f5af4521983ac774a # shrinks to cfg = Cfg { mode: RejectStructural, insensitive: false, backslash: false, up_to_two: true, unicode: false, overlong: false }, step = Overlong, path = "/files/a%c0%afb/a;b"
