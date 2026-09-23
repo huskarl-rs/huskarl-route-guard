@@ -11,7 +11,7 @@
 //!
 //! The *routing* half — the anchor's coverage walk and the deny verdict — lives in
 //! [`route_tree`](crate::route_tree)'s owned segment-tree matcher and
-//! `StructuralGuard`, which call [`scan`] here. [`enabled_classes`] /
+//! `PathConfusionGuard`, which call [`scan`] here. [`enabled_classes`] /
 //! [`enabled_encodings`] derive the scan's masks from the configured
 //! [`StructuralClasses`](crate::path_confusion::StructuralClasses).
 

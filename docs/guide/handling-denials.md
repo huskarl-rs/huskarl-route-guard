@@ -25,6 +25,7 @@ triaging structural classes.
 
 | `DenyReason` | What it means | Sanctioned response |
 |---|---|---|
+| `InvalidRuleId` | An internal invariant failed: the matched ID is absent from the rule table | Deny authorization, report a server error (`500`), and investigate the library failure. Never substitute the default rule. |
 | `InvalidPathInput` | The supplied value was not a request path alone | Pass `uri.path()`; do not strip or reinterpret the input inside the authorization layer. |
 | `Structural(NulTruncation)` | A raw or `%00` NUL — no legitimate path carries one | Treat as hostile or corrupt. No remedy by design. |
 | `Structural(DotSegment)` | A `.`/`..` (in any enabled spelling) whose conservative reach extends outside the matched rule | Dot-segments that stay within a single-rule subtree already flow. A denial means another rule is reachable within the modeled bound, not that every backend would actually reach it. If legitimate keys carry `..`, see §3. |
@@ -79,6 +80,8 @@ the denials — they are the protection.
 resolves *other* methods to the default rule, so the subtree stops being uniform
 for everyone. Per-method policy inside an opaque-key space cannot be expressed
 without paying that price; put the method-split endpoint outside the key space.
+This also applies to a lone method-qualified subtree or blob subtree: a GET-only
+blob denies structural keys even for GET because unlisted methods leave gaps.
 
 **Declare blobs when you want the guarantee.**
 [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree) behaves like `subtree` at

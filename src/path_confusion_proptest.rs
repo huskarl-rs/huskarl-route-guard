@@ -358,7 +358,7 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
 /// ones never do. That is not a hole in the soundness argument — the guard never
 /// picks a normalization: it bounds every structural rewrite by an **anchor** and
 /// denies unless the whole region past that anchor is one rule
-/// ([`crate::route_tree::StructuralGuard`]'s positional verdict). That bound is
+/// ([`crate::guard::PathConfusionGuard`]'s positional verdict). That bound is
 /// order-agnostic by construction, resting only on "a structural byte rewrites at
 /// or after its own position, and each dot-segment climbs one level", which holds
 /// under *every* composition order. Reordering changes where inside the anchored

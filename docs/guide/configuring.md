@@ -60,6 +60,29 @@ guess in either direction:
    when route agreement is enforced elsewhere or this route result is not an
    authorization boundary.
 
+## Reuse a deployment configuration
+
+[`GuardConfig`](crate::path_confusion::GuardConfig) groups the four settings for
+[`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config). Its
+constructor requires case sensitivity and decode depth; mode and structural classes
+start at their defaults. Customize its fields and clone it when several route
+tables share the same downstream assumptions. The existing router builder remains
+available for declaring settings individually.
+
+## Method-qualified subtrees
+
+Structural coverage is computed across **all methods**, even though an individual
+request has one method. A GET-only `subtree_for` or `blob_subtree_for` therefore
+does not establish uniform coverage: unlisted methods fall through to the default
+rule. `/files/a%2fb` is denied even for GET under a lone GET-only `/files` subtree,
+while `/files/clean` still resolves normally. Case-folding and content-decode
+comparisons, in contrast, use the request's actual method.
+
+This is a deliberate availability tradeoff in the structural approximation.
+The blob declaration prevents nested paths; it does not make coverage uniform
+across methods. An all-method subtree can provide encoded-key tolerance, but only
+register one when its rule actually enforces the intended policy for every method.
+
 ## When behavior remains uncertain
 
 **The library cannot certify an uncharacterized deployment.** Within the built-in

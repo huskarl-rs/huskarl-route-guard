@@ -8,8 +8,9 @@
 //! guard denies a request when an interpretation in its declared model selects a
 //! different rule; it never rewrites what is forwarded.
 //!
-//! Four types configure the guard, all consumed by
-//! [`RuleRouter::build`](crate::RuleRouter::build):
+//! Four types configure the guard, individually through
+//! [`RuleRouter::build`](crate::RuleRouter::build) or grouped in [`GuardConfig`]
+//! through [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config):
 //!
 //! - [`PathConfusion`] selects the mode (the default scoped structural check, the strict
 //!   all-positions reject, or off);
@@ -44,6 +45,57 @@
 //!   library-specific vocabulary.
 
 use std::sync::Arc;
+
+/// Reusable deployment assumptions and enforcement settings for a route guard.
+///
+/// Case sensitivity and decode depth are required; there is deliberately no
+/// `Default` implementation. The mode and structural classes start with their
+/// conservative built-in defaults and can be customized before construction.
+/// Use with [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config).
+///
+/// ```
+/// use huskarl_route_guard::{
+///     Registration, RuleRouter,
+///     path_confusion::{CaseSensitivity, DecodeLayers, GuardConfig},
+/// };
+///
+/// let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single);
+/// let router = RuleRouter::build_with_config(
+///     vec![Registration::subtree("/admin", "protected")],
+///     "public",
+///     config,
+/// )
+/// .expect("valid routes");
+/// assert!(
+///     router
+///         .resolve("/admin%2fusers", &http::Method::GET)
+///         .is_err()
+/// );
+/// ```
+#[derive(Clone, Debug)]
+pub struct GuardConfig {
+    /// Enforcement mode; defaults to scoped structural rejection.
+    pub path_confusion: PathConfusion,
+    /// Additional structural classes and custom probes.
+    pub structural_classes: StructuralClasses,
+    /// Declared maximum whole-path percent-decode depth.
+    pub decode_layers: DecodeLayers,
+    /// Whether downstream path interpretation folds ASCII case.
+    pub case_sensitivity: CaseSensitivity,
+}
+
+impl GuardConfig {
+    /// Declare the required deployment assumptions with default enforcement settings.
+    #[must_use]
+    pub fn new(case_sensitivity: CaseSensitivity, decode_layers: DecodeLayers) -> Self {
+        Self {
+            path_confusion: PathConfusion::default(),
+            structural_classes: StructuralClasses::default(),
+            decode_layers,
+            case_sensitivity,
+        }
+    }
+}
 
 /// Which path-confusion guard is active.
 ///
@@ -259,6 +311,10 @@ impl std::fmt::Display for StructuralClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DenyReason {
+    /// The route tree returned an ID absent from the rule table. This indicates an
+    /// internal invariant violation, not invalid client input. Deny the request and
+    /// report an internal server error; never authorize it using the default rule.
+    InvalidRuleId,
     /// The supplied value was not a request path: paths must start with `/` (or be the
     /// special `*` request target) and must not contain a query (`?`) or fragment (`#`).
     /// Pass `uri.path()`, never a complete request target or URI.
@@ -301,6 +357,7 @@ impl DenyReason {
     #[must_use]
     pub fn message(&self) -> &'static str {
         match self {
+            Self::InvalidRuleId => "Internal routing error",
             Self::InvalidPathInput => "Invalid request path",
             Self::Structural(_)
             | Self::CaseFoldRelocation
@@ -315,6 +372,9 @@ impl DenyReason {
 impl std::fmt::Display for DenyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidRuleId => {
+                f.write_str("internal routing error: matched rule ID is absent from the rule table")
+            }
             Self::InvalidPathInput => f.write_str(
                 "invalid request path input: pass uri.path(), not a complete request target or URI",
             ),

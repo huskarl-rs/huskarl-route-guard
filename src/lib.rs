@@ -141,6 +141,7 @@
 //! ```
 
 pub mod _docs;
+mod guard;
 pub mod path_confusion;
 #[cfg(test)]
 mod path_confusion_proptest;

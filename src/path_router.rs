@@ -10,7 +10,7 @@
 //!   by a normalizing backend than the rule the raw path matched.
 //!
 //! [`RuleRouter`] owns the `id → rule` table, the default rule, and a
-//! [`StructuralGuard`] over the
+//! [`PathConfusionGuard`] over the
 //! [owned segment-tree router](crate::route_tree). Public matchit-style pattern strings
 //! are lowered into the owned grammar at build time; whatever the grammar cannot express
 //! (in-segment prefix/suffix params) is a build-time error.
@@ -26,10 +26,11 @@
 use bon::bon;
 
 use crate::{
-    path_confusion::{CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralClasses},
-    route_tree::{
-        BuildError, LowerError, MethodMatch, Router, Segment, StructuralGuard, lower_matchit,
+    guard::PathConfusionGuard,
+    path_confusion::{
+        CaseSensitivity, DecodeLayers, DenyReason, GuardConfig, PathConfusion, StructuralClasses,
     },
+    route_tree::{BuildError, LowerError, MethodMatch, Router, Segment, lower_matchit},
     structural::{classes_present, enabled_classes, enabled_encodings},
 };
 
@@ -220,6 +221,10 @@ impl<R> Registration<R> {
     /// Restrict the registration to the given method(s) — a bare [`http::Method`],
     /// an array, or a `Vec` of them — all under the registration's single rule id.
     /// Path precedence is resolved before method matching; see [`MethodMatch`].
+    /// Structural coverage spans all methods: restricting a subtree (including a
+    /// blob subtree) introduces default-rule gaps for other methods, so structural
+    /// keys can be denied even for a listed method. See
+    /// [method-qualified subtrees](crate::_docs::guide::configuring).
     #[must_use]
     pub fn for_methods(mut self, method: impl Into<MethodMatch>) -> Self {
         self.method = method.into();
@@ -231,7 +236,7 @@ impl<R> Registration<R> {
 pub struct RuleRouter<R> {
     rules: Vec<R>,
     default: R,
-    guard: StructuralGuard,
+    guard: PathConfusionGuard,
 }
 
 impl<R> std::fmt::Debug for RuleRouter<R> {
@@ -251,6 +256,8 @@ impl<R> RuleRouter<R> {
     /// [`Registration`]s inside a builder of their own (as huskarl-pingora's
     /// `Guard`/`LoginProxy` do). Everyone else should prefer [`RuleRouter::builder`],
     /// whose methods construct the registrations internally.
+    /// Use [`build_with_config`](Self::build_with_config) to pass deployment
+    /// settings as a reusable [`GuardConfig`].
     ///
     /// Runs the build-time canonical-pattern checks unless the guard is `Off`: a pattern
     /// that itself carries an enabled structural form is rejected
@@ -274,8 +281,39 @@ impl<R> RuleRouter<R> {
         decode_layers: DecodeLayers,
         case_sensitivity: CaseSensitivity,
     ) -> Result<Self, RuleRouterError> {
-        let byte_enabled = enabled_classes(&structural_classes);
-        let enc = enabled_encodings(&structural_classes, decode_layers);
+        Self::build_with_config(
+            registrations,
+            default,
+            GuardConfig {
+                path_confusion,
+                structural_classes,
+                decode_layers,
+                case_sensitivity,
+            },
+        )
+    }
+
+    /// Builds from registrations and a reusable deployment configuration.
+    ///
+    /// Equivalent to [`build`](Self::build), with the four guard settings grouped
+    /// into one value. Clone the configuration to share assumptions across routers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same registration and canonical-pattern errors as [`build`](Self::build).
+    pub fn build_with_config(
+        registrations: Vec<Registration<R>>,
+        default: R,
+        config: GuardConfig,
+    ) -> Result<Self, RuleRouterError> {
+        let GuardConfig {
+            path_confusion,
+            ref structural_classes,
+            decode_layers,
+            case_sensitivity,
+        } = config;
+        let byte_enabled = enabled_classes(structural_classes);
+        let enc = enabled_encodings(structural_classes, decode_layers);
 
         let mut tree_entries = Vec::new();
         // Patterns parallel to `tree_entries`, kept so a tree build failure can be
@@ -339,13 +377,7 @@ impl<R> RuleRouter<R> {
         }
 
         let router = Router::build(&tree_entries).map_err(|e| map_build_err(e, &patterns))?;
-        let guard = StructuralGuard::new(
-            router,
-            path_confusion,
-            structural_classes,
-            decode_layers,
-            case_sensitivity,
-        );
+        let guard = PathConfusionGuard::new(router, config);
 
         Ok(Self {
             rules,
@@ -355,9 +387,9 @@ impl<R> RuleRouter<R> {
     }
 
     /// Resolves `path` in one call: the path-confusion verdict first, then the rule
-    /// match. `Err(reason)` means the request must be **denied** (`400`) as ambiguous —
-    /// no rule is offered, because the guard cannot know which rule the backend would
-    /// actually serve. `Ok` carries the [`RuleMatch`]: the matched registration's rule,
+    /// match. `Err(reason)` means the request must be **denied** — no rule is offered.
+    /// Path denials normally map to `400`; an internal invariant failure maps to `500`.
+    /// `Ok` carries the [`RuleMatch`]: the matched registration's rule,
     /// or the default rule for a path no registration covers.
     ///
     /// This is the intended entry point for request handling: it cannot be called
@@ -376,13 +408,16 @@ impl<R> RuleRouter<R> {
     ///
     /// # Errors
     ///
-    /// The guard's [`DenyReason`], naming the check and byte class that fired:
+    /// The guard's [`DenyReason`] names the check and byte class that fired.
     /// [`message`](DenyReason::message) is the short static string for the denial
     /// response body; its `Display` is the attributed line for the *log*, so an
     /// operator can trace a `400` to the configuration knob or registration that
     /// governs it. Which forms deny on sight and which deny only when they would
     /// relocate the path to a different rule is tabulated in
     /// [How the guard decides](crate::_docs::explanation::decision).
+    ///
+    /// [`DenyReason::InvalidRuleId`] indicates an internal invariant violation
+    /// and should be reported as a server error, not a client `400`.
     pub fn resolve(
         &self,
         path: &str,
@@ -393,7 +428,7 @@ impl<R> RuleRouter<R> {
         }
         match self.guard.verdict(path, method) {
             Some(reason) => Err(reason),
-            None => Ok(self.match_rule_unchecked(path, method)),
+            None => self.matched_rule(path, method),
         }
     }
 
@@ -405,18 +440,35 @@ impl<R> RuleRouter<R> {
     /// `_unchecked` suffix is intentional: this method can authorize a path the backend
     /// interprets differently, and exists for diagnostics, tests, and callers that have
     /// already performed both checks themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the route tree returns an invalid rule ID, which indicates an
+    /// internal invariant violation. [`resolve`](Self::resolve) returns
+    /// [`DenyReason::InvalidRuleId`] for that failure instead.
+    #[expect(
+        clippy::expect_used,
+        reason = "the unchecked diagnostic API cannot return an error; an invalid ID must never authorize the default rule"
+    )]
     pub fn match_rule_unchecked(&self, path: &str, method: &http::Method) -> RuleMatch<'_, R> {
+        self.matched_rule(path, method)
+            .expect("route tree returned an invalid rule ID")
+    }
+
+    fn matched_rule(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Result<RuleMatch<'_, R>, DenyReason> {
         match self.guard.resolve(path, method) {
-            // Fail closed if an id ever falls outside `rules`, rather than panicking.
-            Some(id) => match self.rules.get(id as usize) {
-                Some(rule) => RuleMatch::Matched { id, rule },
-                None => RuleMatch::Default {
-                    rule: &self.default,
-                },
-            },
-            None => RuleMatch::Default {
+            Some(id) => self
+                .rules
+                .get(id as usize)
+                .map(|rule| RuleMatch::Matched { id, rule })
+                .ok_or(DenyReason::InvalidRuleId),
+            None => Ok(RuleMatch::Default {
                 rule: &self.default,
-            },
+            }),
         }
     }
 
@@ -609,6 +661,10 @@ impl<R, S: rule_router_builder::State> RuleRouterBuilder<R, S> {
     /// `method`(s) — a bare [`http::Method`], an array, or a `Vec` of them, all under
     /// this one registration's rule id. Path precedence is resolved before method
     /// matching; see [`MethodMatch`].
+    ///
+    /// Structural coverage spans all methods, so unlisted methods introduce
+    /// default-rule gaps and structural keys can be denied even for listed methods.
+    /// See [`Registration::for_methods`].
     pub fn subtree_for(self, method: impl Into<MethodMatch>, path: &str, rule: R) -> Self {
         self.push(Registration::subtree(path, rule).for_methods(method))
     }
@@ -649,6 +705,11 @@ impl<R, S: rule_router_builder::State> RuleRouterBuilder<R, S> {
     /// given `method`(s) — a bare [`http::Method`], an array, or a `Vec` of them, all
     /// under this one registration's rule id. Path precedence is resolved before
     /// method matching; see [`MethodMatch`].
+    ///
+    /// Structural coverage spans all methods. A method-qualified blob does not
+    /// guarantee encoded-key tolerance, even for its listed methods: unlisted
+    /// methods contribute default-rule gaps. The opaque flag prevents nested paths,
+    /// but does not remove those gaps. See [`Registration::for_methods`].
     pub fn blob_subtree_for(self, method: impl Into<MethodMatch>, path: &str, rule: R) -> Self {
         self.push(Registration::blob_subtree(path, rule).for_methods(method))
     }
@@ -719,6 +780,73 @@ mod tests {
 
     fn denied(r: &RuleRouter<u32>, path: &str) -> bool {
         r.ambiguous(path, &http::Method::GET).is_some()
+    }
+
+    #[test]
+    fn invalid_rule_id_denies_instead_of_authorizing_with_default() {
+        let mut r = RuleRouter::build_with_config(
+            vec![Registration::route("/admin", "protected")],
+            "public",
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single),
+        )
+        .expect("build");
+        // Inject an invariant violation that public construction cannot create.
+        r.rules.clear();
+        assert_eq!(
+            r.resolve("/admin", &http::Method::GET),
+            Err(DenyReason::InvalidRuleId)
+        );
+        assert!(
+            r.resolve("/unmatched", &http::Method::GET)
+                .expect("default")
+                .is_default()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "route tree returned an invalid rule ID")]
+    fn unchecked_match_does_not_hide_an_invalid_rule_id() {
+        let mut r = router(&[("/admin", 0)], PathConfusion::Off).expect("build");
+        r.rules.clear();
+        let _ = r.match_rule_unchecked("/admin", &http::Method::GET);
+    }
+
+    #[test]
+    fn method_qualified_subtrees_deny_structural_keys_for_listed_methods() {
+        for registration in [
+            Registration::subtree("/files", "files"),
+            Registration::blob_subtree("/files", "files"),
+        ] {
+            let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single);
+            let unrestricted = RuleRouter::build_with_config(
+                vec![registration.clone()],
+                "default",
+                config.clone(),
+            )
+            .expect("build");
+            let restricted = RuleRouter::build_with_config(
+                vec![registration.for_methods(http::Method::GET)],
+                "default",
+                config,
+            )
+            .expect("build");
+            assert!(
+                unrestricted
+                    .resolve("/files/a%2fb", &http::Method::GET)
+                    .is_ok()
+            );
+            assert_eq!(
+                restricted.resolve("/files/a%2fb", &http::Method::GET),
+                Err(DenyReason::Structural(crate::StructuralClass::Separator))
+            );
+            assert_eq!(
+                *restricted
+                    .resolve("/files/clean", &http::Method::GET)
+                    .expect("clean")
+                    .rule(),
+                "files"
+            );
+        }
     }
 
     #[test]
