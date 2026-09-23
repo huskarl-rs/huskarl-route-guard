@@ -37,6 +37,24 @@ form cannot cross a rule boundary.
 This distinction explains both the useful tolerance under a complete subtree
 and the extra denials under partially covered prefixes.
 
+## One pipeline for every percent interpretation
+
+A single decoder supplies the original byte path, the result of one complete
+percent-decode pass, and (under `UpToTwo`) the result of a second pass. Every
+interpretation receives the same structural scan and rule comparison. Invalid
+UTF-8 remains byte data and receives the same checks.
+
+Structural detectors recognize bytes, not separate single- and double-encoded
+spellings. For example, decoding `/admin%25EF%25BC%258Fusers` twice reveals
+`/admin／users`. With fullwidth structure enabled, the shared scanner recognizes
+that slash and rejects the possible change to the `/admin` rule.
+
+Each decoded byte retains its original source offset. Structural analysis joins
+classes and the earliest source position across interpretations, and takes the
+maximum possible dot-segment climb count. The anchor is always computed in the
+original request, never with offsets borrowed from a decoded buffer. Every rule
+comparison also uses the original request's identity as its baseline.
+
 ## Structural ambiguity: find a stable prefix
 
 For `/files/a%2fb`, the slash before `a` ends the prefix `/files/`.
@@ -135,8 +153,9 @@ rule, such as `/files/ReadMe.TXT` to `/files/readme.txt`, is accepted.
 The percent-decoding check compares the raw rule against the result after one
 complete decode pass, and also after two passes under
 [`DecodeDepth::UpToTwo`](crate::config::DecodeDepth::UpToTwo).
-Each candidate is lowercased too when case folding is configured. This catches
-escapes that reveal uppercase letters, such as `/%41dmin`.
+Each candidate receives structural analysis and is lowercased for rule comparison
+when case folding is configured. This catches escapes that reveal uppercase letters,
+such as `/%41dmin`, and structural forms that only become visible after decoding.
 
 Each pass matters. A sequence of rule identities A → B → A is unsafe if a
 downstream component might stop after one pass. The check uses a consistent

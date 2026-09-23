@@ -15,7 +15,7 @@
 //! [`enabled_encodings`] derive the scan's masks from the configured
 //! [`StructuralClasses`](crate::config::StructuralClasses).
 
-use crate::percent::{byte_at, double_byte_at, fullwidth_at, overlong_at};
+use crate::percent::{Interpretation, fullwidth_at, interpretations, overlong_at};
 
 /// A set of structural *classes* — byte families a backend parser may treat as
 /// path structure. Used two ways with the same representation, so a deny check is
@@ -123,13 +123,10 @@ impl std::fmt::Debug for ClassSet {
     }
 }
 
-/// Which *alternate encodings* of the structural bytes the scanner should look for,
-/// beyond the literal and single-`%XX` forms it always recognises. Both are off
-/// unless the matching opt-in normalization is configured (their decoded forms are
-/// not a differential for a standards-conforming backend), so a default config pays
-/// nothing and never rejects them. Derived from the route's
-/// [`StructuralClasses`](crate::config::StructuralClasses) by
-/// [`enabled_encodings`].
+/// Alternate byte interpretations and the bounded percent-decode policy.
+/// Only the interpretation driver consults `double_decode`; structural detectors
+/// operate on the resulting bytes and never parse percent escapes themselves.
+/// Derived by [`enabled_encodings`] from the deployment configuration.
 // Each field is an independent, orthogonal alternate-encoding toggle — a flat set of
 // booleans is the clearest representation here.
 #[allow(clippy::struct_excessive_bools)]
@@ -169,7 +166,7 @@ impl Encodings {
     }
 }
 
-/// The result of one scanner pass: the classes present, plus the two positional
+/// The result of structural analysis: the classes present, plus the two positional
 /// facts the scoped structural verdict anchors on.
 ///
 /// `classes` keeps [`classes_present`]'s contract (every single-byte class is always
@@ -177,6 +174,7 @@ impl Encodings {
 /// `dot_pops` are **gated by `enabled`** instead: they exist to place the verdict's
 /// anchor, so an occurrence of a class the configuration does not treat as structure
 /// must not move it.
+#[derive(Clone, Copy)]
 pub(crate) struct ScanResult {
     /// The classes present — identical to [`classes_present`].
     pub(crate) classes: ClassSet,
@@ -194,346 +192,137 @@ pub(crate) struct ScanResult {
     pub(crate) dot_pops: usize,
 }
 
-/// Scan a request path for the structural byte classes present in it, the offset of
-/// the earliest enabled occurrence, and the dot-segment pop count. Cheap,
-/// allocation-free, ~O(n) — the per-request hot path. A clean path returns
-/// `classes == ClassSet::empty()` (and `earliest == None`, `dot_pops == 0`).
-///
-/// Class semantics are unchanged from [`classes_present`] (its docs are the
-/// reference): every single-byte class is always scanned and the caller gates by
-/// intersect; alternate encodings are scanned only where `enc` opts in; encoded dots
-/// flag conservatively; literal dot-segments are delimited by **any enabled**
-/// separator or param form, so `a%2f..%2fadmin` and `..;x` are caught.
-pub(crate) fn scan(path: &str, enabled: ClassSet, enc: Encodings) -> ScanResult {
-    let dots = dot_walk(path, enabled, enc);
-    let mut found = ClassSet::empty();
-    if dots.literal {
-        found.insert(ClassSet::DOT_SEGMENT);
-    }
-    let mut earliest = dots.earliest;
-    let hit = |found: &mut ClassSet, earliest: &mut Option<usize>, c: ClassSet, at: usize| {
-        found.insert(c);
-        if c.contains_any(enabled) {
-            *earliest = Some(earliest.map_or(at, |e| e.min(at)));
+impl ScanResult {
+    pub(crate) fn empty() -> Self {
+        Self {
+            classes: ClassSet::empty(),
+            earliest: None,
+            dot_pops: 0,
         }
-    };
-    if let Some(idx) = path.find("//") {
-        // An empty segment a merge would collapse. The occurrence is the *second*
-        // slash: the first is the separator the router already honoured, and a merge
-        // keeps it, so everything before it is stable.
-        hit(&mut found, &mut earliest, ClassSet::SEPARATOR, idx + 1);
     }
-    let b = path.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        // `i < b.len()` is the loop invariant, so this never breaks; reading via
-        // `get` keeps the scan panic-free under `deny(clippy::indexing_slicing)`.
-        let Some(&cur) = b.get(i) else { break };
-        // Fullwidth-form confusables (`／`·`．`·`；`·`＼`, raw or percent-encoded) flag the
-        // class they NFKC-fold to, when the unicode encoding is enabled.
-        if enc.unicode
-            && let Some((ascii, _)) = fullwidth_at(b, i)
-        {
-            match ascii {
-                b'/' => hit(&mut found, &mut earliest, ClassSet::SEPARATOR, i),
-                b'.' => hit(&mut found, &mut earliest, ClassSet::DOT_SEGMENT, i),
-                b';' => hit(&mut found, &mut earliest, ClassSet::PARAM, i),
-                b'\\' => hit(&mut found, &mut earliest, ClassSet::BACKSLASH, i),
-                _ => {}
-            }
+
+    /// Union interpretations in original-input coordinates. The maximum climb
+    /// count preserves every shallower interpretation without counting the same
+    /// dot-segment again for each decoding pass.
+    pub(crate) fn include(&mut self, other: Self) {
+        self.classes.insert(other.classes);
+        if let Some(offset) = other.earliest {
+            self.earliest = Some(self.earliest.map_or(offset, |old| old.min(offset)));
         }
-        match cur {
-            b';' => hit(&mut found, &mut earliest, ClassSet::PARAM, i),
-            b'\\' => hit(&mut found, &mut earliest, ClassSet::BACKSLASH, i),
-            b'A'..=b'Z' => hit(&mut found, &mut earliest, ClassSet::CASE, i),
-            // A *raw* NUL truncates a C-string backend exactly as `%00` does. Detected on
-            // the guard's own terms (the always-on TRUNCATION class), never trusting
-            // an upstream parser to have stripped it — mirroring raw `;`/`\` above.
-            0 => hit(&mut found, &mut earliest, ClassSet::TRUNCATION, i),
-            b'%' => {
-                if let Some(byte) = byte_at(b, i) {
-                    match byte {
-                        b'/' => hit(&mut found, &mut earliest, ClassSet::SEPARATOR, i),
-                        b'.' => hit(&mut found, &mut earliest, ClassSet::DOT_SEGMENT, i),
-                        b';' => hit(&mut found, &mut earliest, ClassSet::PARAM, i),
-                        b'\\' => hit(&mut found, &mut earliest, ClassSet::BACKSLASH, i),
-                        0 => hit(&mut found, &mut earliest, ClassSet::TRUNCATION, i),
-                        // `%25` is a literal `%`: a double-decoding backend peels it
-                        // and honours the *next* escape (`%252F` → `/`). The class
-                        // mask still gates whether the revealed class denies.
-                        b'%' if enc.double_decode => {
-                            let c = double_encoded_class(b, i);
-                            if !c.is_empty() {
-                                hit(&mut found, &mut earliest, c, i);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Overlong UTF-8 forms of `/`·`.` (`%C0%AF`, …) that a backend
-                // accepting non-shortest-form UTF-8 would decode to a separator/dot.
-                if (enc.overlong_slash || enc.overlong_dot)
-                    && let Some((decoded, _)) = overlong_at(b, i)
-                {
-                    match decoded {
-                        b'/' if enc.overlong_slash => {
-                            hit(&mut found, &mut earliest, ClassSet::SEPARATOR, i);
-                        }
-                        b'.' if enc.overlong_dot => {
-                            hit(&mut found, &mut earliest, ClassSet::DOT_SEGMENT, i);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+        self.dot_pops = self.dot_pops.max(other.dot_pops);
     }
-    ScanResult {
-        classes: found,
-        earliest,
-        dot_pops: dots.pops,
+
+    fn hit(&mut self, class: ClassSet, offset: usize, enabled: ClassSet) {
+        self.classes.insert(class);
+        if class.contains_any(enabled) {
+            self.earliest = Some(self.earliest.map_or(offset, |old| old.min(offset)));
+        }
     }
 }
 
-/// The classes present in `path` — [`scan`] without the positional facts. See
-/// [`scan`] for the semantics (this remains the reference entry point for the
-/// build-time canonicality check and the strict mode's presence scan).
+/// Scan all permitted interpretations, retaining original-input offsets.
+/// Clean paths allocate nothing; percent decoding is bounded to one or two passes.
+pub(crate) fn scan(path: &str, enabled: ClassSet, enc: Encodings) -> ScanResult {
+    let mut result = ScanResult::empty();
+    interpretations(path.as_bytes(), enc.double_decode, |view| {
+        result.include(scan_interpretation(view, enabled, enc));
+    });
+    result
+}
+
 pub(crate) fn classes_present(path: &str, enabled: ClassSet, enc: Encodings) -> ClassSet {
     scan(path, enabled, enc).classes
 }
 
-/// The class of a double-percent-encoded structural byte at a `%25` wrapper
-/// (`b[i]` begins `%25`): the byte [`double_byte_at`] reveals a second decode pass
-/// would produce. Empty if there is no such byte, or it is not structural.
-fn double_encoded_class(b: &[u8], i: usize) -> ClassSet {
-    match double_byte_at(b, i) {
-        Some(b'/') => ClassSet::SEPARATOR,
-        Some(b'.') => ClassSet::DOT_SEGMENT,
-        Some(b';') => ClassSet::PARAM,
-        Some(b'\\') => ClassSet::BACKSLASH,
-        Some(0) => ClassSet::TRUNCATION,
-        _ => ClassSet::empty(),
+/// Segment state shared by byte classification and climb counting. Encoded dots
+/// count conservatively even inside content or parameters, as do alternate dots.
+#[derive(Default)]
+struct DotSegment {
+    bare_len: usize,
+    bare_dots: usize,
+    in_param: bool,
+    alternate_dot: bool,
+    start: usize,
+}
+
+impl DotSegment {
+    fn finish(&self, result: &mut ScanResult, enabled: ClassSet) {
+        let literal = self.bare_len == self.bare_dots && (1..=2).contains(&self.bare_len);
+        if literal {
+            result.hit(ClassSet::DOT_SEGMENT, self.start, enabled);
+        }
+        if literal || self.alternate_dot {
+            result.dot_pops += 1;
+        }
     }
 }
 
-/// Whether any segment of `path` is a dot-segment (`.`/`..`) once **every enabled
-/// separator and `;`-param introducer** is accounted for.
-///
-/// A dot-segment can be *revealed* by a backend transform, so it is not enough to look
-/// between literal `/`s:
-///
-/// - **`;`-param strip** turns `..;jsessionid=1` into `..` (the Tomcat `..;/` vector).
-///   The `;` introducer is honored in **every form the byte scan treats as
-///   [`PARAM`](ClassSet::PARAM)** — literal `;`, `%3B`, double-encoded `%253B`, and the
-///   fullwidth `；` — so an *encoded* matrix param reveals the dot-segment exactly as a
-///   literal one does. (Without this, `..%3bx` would flag only `PARAM`, which an opaque
-///   `exclusive_subtree` tolerates, letting traversal escape the blob.)
-/// - **separator decode** turns `a%2f..%2fadmin` into `a/../admin` — the literal `..` is
-///   flanked by *encoded* slashes, so it is not a whole literal segment, yet a backend
-///   that decodes `%2F` and resolves dot-segments climbs out of the matched rule.
-///
-/// Implemented as a single **allocation-free** pass: it walks the bytes, classifying each
-/// position as a separator, a param introducer, or plain content (recognising every
-/// enabled encoded form via [`delimiter_at`]), and asks whether any segment's pre-`;`
-/// "bare" prefix is exactly `.` or `..`. The only dot-segment shape is a bare prefix that
-/// is all dots and 1–2 bytes long, so it is tracked with two counters rather than a
-/// materialised substring — which removes a per-request heap allocation on any `%`-bearing
-/// path (the earlier form rewrote the whole path into an owned `String`).
-///
-/// Encoded dots (`%2e`) are already flagged by the byte scan in [`scan`]; this
-/// covers the *literal* `..` case. Equivalent to `dot_walk(..).literal`.
+/// Classify bytes, never percent spellings. Adding a structural form here applies
+/// it automatically at every configured decode depth, even for invalid UTF-8.
+/// A decoded slash/dot retains its source provenance so it is still recognized as
+/// structural even though the decoded spelling looks canonical.
+pub(crate) fn scan_interpretation(
+    view: &Interpretation<'_>,
+    enabled: ClassSet,
+    enc: Encodings,
+) -> ScanResult {
+    let bytes = view.bytes.as_ref();
+    let mut result = ScanResult::empty();
+    let mut segment = DotSegment::default();
+    let mut previous_slash = false;
+    let mut i = 0;
+    while let Some(&raw) = bytes.get(i) {
+        let fullwidth = enc.unicode.then(|| fullwidth_at(bytes, i)).flatten();
+        let overlong = if enc.overlong_slash || enc.overlong_dot {
+            overlong_at(bytes, i).filter(|(c, _)| {
+                (*c == b'/' && enc.overlong_slash) || (*c == b'.' && enc.overlong_dot)
+            })
+        } else {
+            None
+        };
+        let alternate = fullwidth.or(overlong);
+        let (byte, width) = alternate.unwrap_or((raw, 1));
+        let source = view.source_offset(i);
+        let encoded = alternate.is_some() || view.escaped(i);
+        let class = match byte {
+            b'/' if encoded || previous_slash => ClassSet::SEPARATOR,
+            b'.' if encoded => ClassSet::DOT_SEGMENT,
+            b';' => ClassSet::PARAM,
+            b'\\' => ClassSet::BACKSLASH,
+            0 => ClassSet::TRUNCATION,
+            b'A'..=b'Z' => ClassSet::CASE,
+            _ => ClassSet::empty(),
+        };
+        result.hit(class, source, enabled);
+        let separator = (byte == b'/' && (!encoded || enabled.contains_any(ClassSet::SEPARATOR)))
+            || (byte == b'\\' && enabled.contains_any(ClassSet::BACKSLASH));
+        if separator {
+            segment.finish(&mut result, enabled);
+            segment = DotSegment {
+                start: view.source_offset(i + width),
+                ..DotSegment::default()
+            };
+        } else if byte == b';' && enabled.contains_any(ClassSet::PARAM) {
+            segment.in_param = true;
+        } else {
+            if !segment.in_param {
+                segment.bare_len += 1;
+                segment.bare_dots += usize::from(byte == b'.');
+            }
+            segment.alternate_dot |= byte == b'.' && encoded;
+        }
+        previous_slash = byte == b'/';
+        i += width;
+    }
+    segment.finish(&mut result, enabled);
+    result
+}
+
 #[cfg(test)]
 fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
-    dot_walk(path, enabled, enc).literal
-}
-
-/// What the segmentation walk found — the dot half of a [`ScanResult`].
-struct DotScan {
-    /// Number of dot-segment-capable segments (see [`ScanResult::dot_pops`]).
-    pops: usize,
-    /// Whether any segment's bare prefix is a *literal* `.`/`..` (the condition that
-    /// flags [`DOT_SEGMENT`](ClassSet::DOT_SEGMENT) for literal dots; encoded forms
-    /// flag through the byte scan instead).
-    literal: bool,
-    /// Offset of the first byte of the first literal dot-segment, when
-    /// [`DOT_SEGMENT`](ClassSet::DOT_SEGMENT) is enabled (encoded forms report their
-    /// offsets through the byte scan).
-    earliest: Option<usize>,
-}
-
-/// The segmentation walk behind [`scan`]: split `path` at **every enabled separator
-/// and `;`-param introducer** and classify each segment's dot potential.
-///
-/// A dot-segment can be *revealed* by a backend transform, so it is not enough to look
-/// between literal `/`s:
-///
-/// - **`;`-param strip** turns `..;jsessionid=1` into `..` (the Tomcat `..;/` vector).
-///   The `;` introducer is honored in **every form the byte scan treats as
-///   [`PARAM`](ClassSet::PARAM)** — literal `;`, `%3B`, double-encoded `%253B`, and the
-///   fullwidth `；` — so an *encoded* matrix param reveals the dot-segment exactly as a
-///   literal one does.
-/// - **separator decode** turns `a%2f..%2fadmin` into `a/../admin` — the literal `..` is
-///   flanked by *encoded* slashes, so it is not a whole literal segment, yet a backend
-///   that decodes `%2F` and resolves dot-segments climbs out of the matched rule.
-///
-/// A segment **pops** (counts toward [`ScanResult::dot_pops`]) when its pre-`;` "bare"
-/// prefix is exactly `.` or `..`, or when any enabled encoded-dot form occurs anywhere
-/// in it (position-blind, mirroring the byte scan's conservative `%2E` rule — a
-/// decoded `a.b` cannot climb, but proving that is the precise checks' job, and an
-/// overcount only widens the anchor).
-///
-/// Implemented as a single **allocation-free** pass: the only dot-segment shape is a
-/// bare prefix that is all dots and 1–2 bytes long, so it is tracked with two counters
-/// rather than a materialised substring.
-fn dot_walk(path: &str, enabled: ClassSet, enc: Encodings) -> DotScan {
-    let sep = enabled.contains_any(ClassSet::SEPARATOR);
-    let back = enabled.contains_any(ClassSet::BACKSLASH);
-    let param = enabled.contains_any(ClassSet::PARAM);
-    let dot_enabled = enabled.contains_any(ClassSet::DOT_SEGMENT);
-    let b = path.as_bytes();
-
-    // The current segment's "bare" prefix is the bytes before its first param introducer;
-    // the segment is a literal dot-segment iff that prefix is all dots and 1–2 bytes long.
-    let mut bare_dots: usize = 0;
-    let mut bare_len: usize = 0;
-    let mut in_param = false; // past a `;` in this segment → remaining bytes are param data
-    let mut enc_dot = false; // an enabled encoded-dot form occurs in this segment
-    let mut seg_start = 0; // byte offset where the current segment began
-    let is_dot_segment = |dots: usize, len: usize| len == dots && (len == 1 || len == 2);
-
-    let mut out = DotScan {
-        pops: 0,
-        literal: false,
-        earliest: None,
-    };
-    // Close out one segment: classify, count, and record the literal offset.
-    let mut end_segment = |dots: usize, len: usize, enc_dot: bool, start: usize| {
-        let lit = is_dot_segment(dots, len);
-        if lit {
-            out.literal = true;
-            if dot_enabled {
-                out.earliest = Some(out.earliest.map_or(start, |e| e.min(start)));
-            }
-        }
-        if lit || enc_dot {
-            out.pops += 1;
-        }
-    };
-
-    let mut i = 0;
-    while i < b.len() {
-        let Some(&cur) = b.get(i) else { break };
-        // Classify this position: a literal `/` or `;` first (cheap), else any enabled
-        // encoded separator / param / backslash form via `delimiter_at`. The byte returned
-        // is always `/` (separator) or `;` (param introducer).
-        let delim = if cur == b'/' {
-            Some((b'/', 1))
-        } else if param && cur == b';' {
-            Some((b';', 1))
-        } else {
-            delimiter_at(b, i, sep, back, param, enc)
-        };
-        match delim {
-            // Separator ends the segment — classify it, then reset for the next one.
-            Some((b'/', len)) => {
-                end_segment(bare_dots, bare_len, enc_dot, seg_start);
-                bare_dots = 0;
-                bare_len = 0;
-                in_param = false;
-                enc_dot = false;
-                i += len;
-                seg_start = i;
-            }
-            // Param introducer truncates the bare prefix; the segment's rest is param data.
-            Some((b';', len)) => {
-                in_param = true;
-                i += len;
-            }
-            // Plain byte: extends the bare prefix until the first param introducer.
-            _ => {
-                if !in_param {
-                    bare_len += 1;
-                    bare_dots += usize::from(cur == b'.');
-                }
-                enc_dot |= enc_dot_at(b, i, enc);
-                i += 1;
-            }
-        }
-    }
-    // The final segment carries no trailing separator.
-    end_segment(bare_dots, bare_len, enc_dot, seg_start);
-    out
-}
-
-/// Whether an enabled **encoded-dot** form begins at `b[i]` — single `%2E` (always
-/// recognised), double `%252E`, overlong (`%C0%AE`, …), or fullwidth `．`, each gated
-/// by its [`Encodings`] switch exactly as the byte scan gates the DOT class.
-fn enc_dot_at(b: &[u8], i: usize, enc: Encodings) -> bool {
-    byte_at(b, i) == Some(b'.')
-        || (enc.double_decode && double_byte_at(b, i) == Some(b'.'))
-        || (enc.overlong_dot && matches!(overlong_at(b, i), Some((b'.', _))))
-        || (enc.unicode && matches!(fullwidth_at(b, i), Some((b'.', _))))
-}
-
-/// Recognise a single delimiter at `b[i]` that a modeled backend would honor, returning
-/// the canonical ASCII byte it folds to (`/` for a separator, `;` for a param introducer)
-/// and the number of input bytes it spans. `None` for an ordinary byte (including a
-/// *literal* `/` or `;`, which [`dot_walk`] classifies directly before consulting
-/// this).
-///
-/// Forms are tried widest-first — fullwidth (raw 3 / encoded 9), double-encoded `%25XX`
-/// (5), overlong `%C0%AF` (≥6), single `%XX` (3), then a literal `\` — mirroring the byte
-/// scan's priority. Each tier is gated by the same switch the scan uses, so this folds a
-/// form to a delimiter exactly when [`classes_present`] would flag its class.
-fn delimiter_at(
-    b: &[u8],
-    i: usize,
-    sep: bool,
-    back: bool,
-    param: bool,
-    enc: Encodings,
-) -> Option<(u8, usize)> {
-    // Fullwidth `／`·`＼`·`；` (gated by unicode).
-    if enc.unicode
-        && let Some((c, len)) = fullwidth_at(b, i)
-    {
-        if (sep && c == b'/') || (back && c == b'\\') {
-            return Some((b'/', len));
-        }
-        if param && c == b';' {
-            return Some((b';', len));
-        }
-    }
-    // Double-encoded `%252F`·`%255C`·`%253B` (gated by double_decode).
-    if enc.double_decode {
-        match double_byte_at(b, i) {
-            Some(b'/') if sep => return Some((b'/', 5)),
-            Some(b'\\') if back => return Some((b'/', 5)),
-            Some(b';') if param => return Some((b';', 5)),
-            _ => {}
-        }
-    }
-    // Overlong `%C0%AF` (gated by overlong_slash; only `/` is a separator).
-    if sep
-        && enc.overlong_slash
-        && let Some((b'/', len)) = overlong_at(b, i)
-    {
-        return Some((b'/', len));
-    }
-    // Single-encoded `%2F`·`%5C`·`%3B`.
-    match byte_at(b, i) {
-        Some(b'/') if sep => return Some((b'/', 3)),
-        Some(b'\\') if back => return Some((b'/', 3)),
-        Some(b';') if param => return Some((b';', 3)),
-        _ => {}
-    }
-    // Literal backslash.
-    if back && b.get(i) == Some(&b'\\') {
-        return Some((b'/', 1));
-    }
-    None
+    scan(path, enabled, enc)
+        .classes
+        .contains_any(ClassSet::DOT_SEGMENT)
 }
 
 /// The structural classes a [`StructuralClasses`](crate::config::StructuralClasses)
@@ -840,7 +629,7 @@ mod tests {
                 "/a%ef%bc%bcb",
                 ClassSet::BACKSLASH,
             ),
-            // ── CASE (raw only — see the content-decode note below) ──
+            // ── CASE (runtime coverage masks this out) ──
             ("case raw", "/Admin", ClassSet::CASE),
             // ── TRUNCATION ──
             ("nul raw", "/a\u{0}b", ClassSet::TRUNCATION),
@@ -854,13 +643,9 @@ mod tests {
             );
         }
 
-        // CASE is the deliberate exception: encoded uppercase (`%41`) is *not* a positional
-        // concern — it is caught by the content-decode relocation check (which lowercases the
-        // decoded path and re-routes). Pinned so the split stays intentional, not accidental.
-        assert!(
-            !classes_present("/%41dmin", enabled, enc).contains_any(ClassSet::CASE),
-            "encoded uppercase belongs to content-decode, not the positional scan"
-        );
+        // Every interpretation now uses the same scanner. Runtime positional
+        // analysis masks CASE; exact rule comparison still handles case folding.
+        assert!(classes_present("/%41dmin", enabled, enc).contains_any(ClassSet::CASE));
 
         // Known, documented scope limit (not a gap): overlong UTF-8 is modeled only for `/`
         // and `.` (the traversal vector; see `StructuralChar`), so overlong `;`/`\`/NUL are

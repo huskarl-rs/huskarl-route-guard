@@ -1,13 +1,81 @@
-//! Percent-escape decoding primitives shared by the path-confusion guard.
+//! Bounded whole-path percent interpretations, with source offsets.
 //!
-//! The positional structural scanner ([`crate::structural`]) needs to read `%XX`
-//! escapes, their overlong-UTF-8 forms (`%C0%AF`), and double-encoded forms
-//! (`%252F`). This module owns that byte-level knowledge in one tested place, so each
-//! new encoding the guard learns to recognise is a single change here rather than
-//! logic duplicated across modules.
-//!
-//! Every function reads *at a position* in a byte slice and never allocates — the
-//! callers (a per-request scan, a single-pass rewrite) drive the cursor.
+//! Decoding is independent of structural classes. Every enabled interpretation is
+//! scanned and routed, including invalid UTF-8. Source offsets let structural
+//! analysis conservatively anchor in the original request without mixing buffers.
+
+use std::borrow::Cow;
+
+/// One possible whole-path interpretation. Offsets always refer to the original input.
+pub(crate) struct Interpretation<'a> {
+    pub(crate) bytes: Cow<'a, [u8]>,
+    origins: Option<Vec<usize>>,
+    original: &'a [u8],
+}
+
+impl<'a> Interpretation<'a> {
+    pub(crate) fn original(path: &'a [u8]) -> Self {
+        Self {
+            bytes: Cow::Borrowed(path),
+            origins: None,
+            original: path,
+        }
+    }
+
+    pub(crate) fn source_offset(&self, offset: usize) -> usize {
+        self.origins
+            .as_ref()
+            .map_or(offset, |origins| origins.get(offset).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn escaped(&self, offset: usize) -> bool {
+        self.origins.is_some() && self.original.get(self.source_offset(offset)) == Some(&b'%')
+    }
+
+    pub(crate) fn is_original(&self) -> bool {
+        self.origins.is_none()
+    }
+
+    fn decode(&self) -> Option<Self> {
+        // Malformed escapes are a fixed point: do not allocate buffers for them.
+        (0..self.bytes.len()).find(|&i| byte_at(&self.bytes, i).is_some())?;
+        let mut out = Vec::with_capacity(self.bytes.len());
+        let mut origins = Vec::with_capacity(self.bytes.len());
+        let mut i = 0;
+        while let Some(&byte) = self.bytes.get(i) {
+            let decoded = byte_at(&self.bytes, i);
+            out.push(decoded.unwrap_or(byte));
+            origins.push(self.source_offset(i));
+            i += if decoded.is_some() { 3 } else { 1 };
+        }
+        Some(Self {
+            bytes: Cow::Owned(out),
+            origins: Some(origins),
+            original: self.original,
+        })
+    }
+}
+
+/// Calls the same analysis for the raw path and each permitted complete decode.
+/// Stops when decoding cannot change the path; malformed escapes are left literal.
+pub(crate) fn interpretations(
+    path: &[u8],
+    up_to_two: bool,
+    mut visit: impl FnMut(&Interpretation<'_>),
+) {
+    let mut view = Interpretation::original(path);
+    visit(&view);
+    for _ in 0..if up_to_two { 2 } else { 1 } {
+        if !view.bytes.contains(&b'%') {
+            break;
+        }
+        let Some(next) = view.decode() else {
+            break;
+        };
+        view = next;
+        visit(&view);
+    }
+}
 
 /// Decode one hex digit (`0`–`9`, `a`–`f`, `A`–`F`) to its value, or `None`.
 pub(crate) fn hex_val(b: u8) -> Option<u8> {
@@ -30,26 +98,10 @@ pub(crate) fn byte_at(b: &[u8], i: usize) -> Option<u8> {
     Some(hi * 16 + lo)
 }
 
-/// Decode the inner byte of a *double*-encoded escape at `b[i]` — a `%25` wrapper
-/// (so `byte_at` here is a literal `%`) followed by two hex digits naming the byte a
-/// second decode pass would reveal (`%252F` → `/`). `None` unless `b[i]` begins
-/// `%25` and two hex digits follow it.
-pub(crate) fn double_byte_at(b: &[u8], i: usize) -> Option<u8> {
-    if byte_at(b, i)? != b'%' {
-        return None;
-    }
-    let hi = hex_val(*b.get(i + 3)?)?;
-    let lo = hex_val(*b.get(i + 4)?)?;
-    Some(hi * 16 + lo)
-}
-
-/// If a 2-, 3-, or 4-byte UTF-8 sequence whose bytes are all percent-encoded starts
-/// at `b[i]` and decodes to an ASCII byte, return that byte and the number of input
-/// bytes it spans (`%XX` ×N). Because the only targets that matter (`/`, `.`) are
-/// ASCII, any multi-byte encoding of them is by definition *overlong* (non-shortest
-/// form) — so this only ever returns `/` or `.`.
+/// Recognize raw overlong UTF-8 bytes encoding `/` or `.`, after percent decoding.
+/// Returns the ASCII byte and the number of bytes consumed (2, 3, or 4).
 pub(crate) fn overlong_at(b: &[u8], i: usize) -> Option<(u8, usize)> {
-    let lead = byte_at(b, i)?;
+    let lead = *b.get(i)?;
     let seq_len: usize = match lead {
         0xC0..=0xDF => 2,
         0xE0..=0xEF => 3,
@@ -58,26 +110,18 @@ pub(crate) fn overlong_at(b: &[u8], i: usize) -> Option<(u8, usize)> {
     };
     let mut cp = u32::from(lead & (0x7Fu8 >> seq_len));
     for k in 1..seq_len {
-        let cont = byte_at(b, i + k * 3)?;
+        let cont = *b.get(i + k)?;
         if cont & 0xC0 != 0x80 {
             return None;
         }
         cp = (cp << 6) | u32::from(cont & 0x3F);
     }
     let decoded = u8::try_from(cp).ok()?;
-    (decoded == b'/' || decoded == b'.').then_some((decoded, seq_len * 3))
+    (decoded == b'/' || decoded == b'.').then_some((decoded, seq_len))
 }
 
-/// Recognise a **fullwidth-form structural confusable** at `b[i]` — a character that
-/// NFKC (compatibility) normalization folds to a path delimiter — in either its raw
-/// UTF-8 form (`／` = `EF BC 8F`, 3 bytes) or its percent-encoded form (`%EF%BC%8F`, 9
-/// bytes). Returns the folded ASCII byte and the number of input bytes the form spans,
-/// or `None`.
-///
-/// The set is the Fullwidth Forms members that decompose to a delimiter — U+FF0F→`/`,
-/// U+FF0E→`.`, U+FF1B→`;`, U+FF3C→`\` — all sharing the `EF BC` lead, so the third byte
-/// selects the target. A backend that NFKC-normalizes the path before routing resolves
-/// these to their ASCII class.
+/// Recognize raw UTF-8 fullwidth structural characters after percent decoding.
+/// Returns the folded ASCII byte and the number of bytes consumed.
 pub(crate) fn fullwidth_at(b: &[u8], i: usize) -> Option<(u8, usize)> {
     fn folded(third: u8) -> Option<u8> {
         match third {
@@ -95,19 +139,48 @@ pub(crate) fn fullwidth_at(b: &[u8], i: usize) -> Option<(u8, usize)> {
     {
         return folded(third).map(|a| (a, 3));
     }
-    // Percent-encoded `%EF %BC %xx`.
-    if byte_at(b, i) == Some(0xEF)
-        && byte_at(b, i + 3) == Some(0xBC)
-        && let Some(a) = byte_at(b, i + 6).and_then(folded)
-    {
-        return Some((a, 9));
-    }
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_interpretations_preserve_source_offsets_and_invalid_bytes() {
+        let path = b"/ab%25%32%66%FF";
+        let mut views = Vec::new();
+        interpretations(path, true, |view| {
+            views.push((
+                view.bytes.to_vec(),
+                (0..view.bytes.len())
+                    .map(|i| view.source_offset(i))
+                    .collect::<Vec<_>>(),
+            ));
+        });
+        assert_eq!(views.len(), 3);
+        assert_eq!(
+            views[1],
+            (b"/ab%2f\xff".to_vec(), vec![0, 1, 2, 3, 6, 9, 12])
+        );
+        assert_eq!(views[2], (b"/ab/\xff".to_vec(), vec![0, 1, 2, 3, 12]));
+        let mut count = 0;
+        interpretations(path, false, |_| count += 1);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn decoding_stops_at_a_fixed_point() {
+        for path in [b"/plain".as_slice(), b"/%", b"/%2", b"/%GG"] {
+            let mut count = 0;
+            interpretations(path, true, |view| {
+                assert_eq!(view.bytes.as_ref(), path);
+                assert!(view.is_original());
+                count += 1;
+            });
+            assert_eq!(count, 1);
+        }
+    }
 
     #[test]
     fn hex_val_decodes_both_cases() {
@@ -132,42 +205,26 @@ mod tests {
     }
 
     #[test]
-    fn double_byte_at_peels_one_layer() {
-        // `%25` + `2F` = a double-encoded `/`.
-        assert_eq!(double_byte_at(b"%252f", 0), Some(b'/'));
-        assert_eq!(double_byte_at(b"%253B", 0), Some(b';'));
-        assert_eq!(double_byte_at(b"%2500", 0), Some(0));
-        // `%2F` is a single `/`, not a `%25` wrapper → None.
-        assert_eq!(double_byte_at(b"%2f", 0), None);
-        // `%25` with no inner hex pair → None.
-        assert_eq!(double_byte_at(b"%25", 0), None);
-        assert_eq!(double_byte_at(b"%25gg", 0), None);
-    }
-
-    #[test]
     fn overlong_at_decodes_2_3_4_byte_forms() {
-        assert_eq!(overlong_at(b"%c0%af", 0), Some((b'/', 6)));
-        assert_eq!(overlong_at(b"%C0%AE", 0), Some((b'.', 6)));
-        assert_eq!(overlong_at(b"%e0%80%af", 0), Some((b'/', 9)));
-        assert_eq!(overlong_at(b"%f0%80%80%af", 0), Some((b'/', 12)));
+        assert_eq!(overlong_at(b"\xc0\xaf", 0), Some((b'/', 2)));
+        assert_eq!(overlong_at(b"\xc0\xae", 0), Some((b'.', 2)));
+        assert_eq!(overlong_at(b"\xe0\x80\xaf", 0), Some((b'/', 3)));
+        assert_eq!(overlong_at(b"\xf0\x80\x80\xaf", 0), Some((b'/', 4)));
         // ordinary single-byte escape is not overlong
         assert_eq!(overlong_at(b"%2f", 0), None);
         // non-target overlong (overlong 'A') is ignored
-        assert_eq!(overlong_at(b"%c1%81", 0), None);
+        assert_eq!(overlong_at(b"\xc1\x81", 0), None);
         // truncated continuation
-        assert_eq!(overlong_at(b"%c0%a", 0), None);
+        assert_eq!(overlong_at(b"\xc0", 0), None);
     }
 
     #[test]
-    fn fullwidth_at_decodes_raw_and_percent_forms() {
+    fn fullwidth_at_recognizes_structural_bytes() {
         // Raw UTF-8 fullwidth forms (3 bytes each).
         assert_eq!(fullwidth_at("／".as_bytes(), 0), Some((b'/', 3)));
         assert_eq!(fullwidth_at("．".as_bytes(), 0), Some((b'.', 3)));
         assert_eq!(fullwidth_at("；".as_bytes(), 0), Some((b';', 3)));
         assert_eq!(fullwidth_at("＼".as_bytes(), 0), Some((b'\\', 3)));
-        // Percent-encoded (9 bytes), case-insensitive hex.
-        assert_eq!(fullwidth_at(b"%EF%BC%8F", 0), Some((b'/', 9)));
-        assert_eq!(fullwidth_at(b"%ef%bc%8e", 0), Some((b'.', 9)));
         // A fullwidth *letter* (U+FF21 `Ａ`) is not a structural confusable.
         assert_eq!(fullwidth_at("Ａ".as_bytes(), 0), None);
         // Ordinary input.

@@ -187,13 +187,11 @@ impl CaseSensitivity {
 /// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)), double-encoded
 /// *separators* in opaque keys stay tolerated even under `UpToTwo`.
 ///
-/// Scope: this models the **canonical** double-encoding, where the `%` itself is
-/// encoded (`%25` + `2e` = `%252e`) — the form *any* double-decoder resolves. Apache
-/// **CVE-2021-42013** used a narrower variant, `%%32%65` (a bare `%` plus encoded
-/// *digits*), which resolves to `.` only on a decoder that also treats a malformed
-/// `%` as a literal and keeps going — a quirk beyond "decodes twice". That
-/// decoder-leniency form is a [`StructuralClasses::with_probe`] (custom detector)
-/// case, not something `UpToTwo` implies.
+/// Each permitted whole-path decode result receives structural analysis as well as
+/// rule comparison. This includes combinations with enabled fullwidth and overlong
+/// forms, and escapes whose hex digits are themselves encoded (`%25%32%65` →
+/// `%2e` → `.`). Incomplete or malformed escapes remain literal during a pass;
+/// a later permitted pass can decode an escape assembled by the earlier pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeDepth {
     /// At most one percent-decode pass happens behind this layer.
@@ -390,6 +388,11 @@ pub enum StructuralChar {
 ///
 /// # Contract
 ///
+/// Probes inspect the **original request path**, not decoded interpretations.
+/// A detector for a decoded character must also account for its percent-encoded
+/// spellings. For a conservative literal-ASCII restriction, see the example in
+/// [Supported path interpretations](crate::_docs::reference::coverage).
+///
 /// `matches` must be **pure, deterministic, and ~O(n)** — it runs on every request.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
 /// `exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
@@ -492,7 +495,9 @@ impl StructuralClasses {
     /// fullwidth *letters* that fold onto a different literal route (`/ＡＤＭＩＮ` →
     /// `/admin`, a content relocation), and visual look-alikes NFKC does not decompose
     /// (U+2044 fraction slash, U+2215 division slash). For either, use a
-    /// [`with_probe`](Self::with_probe) — e.g. one that denies non-ASCII paths.
+    /// [`with_probe`](Self::with_probe) — e.g. one that rejects both non-ASCII
+    /// characters and percent escapes, as shown in the
+    /// [coverage reference](crate::_docs::reference::coverage).
     #[must_use]
     pub fn with_fullwidth_structure(mut self) -> Self {
         self.unicode = true;

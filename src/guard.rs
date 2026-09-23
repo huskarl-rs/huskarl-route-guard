@@ -4,10 +4,11 @@ use std::{cell::LazyCell, sync::Arc};
 
 use crate::{
     config::{GuardConfig, GuardMode, ResolveError, StructuralProbe},
+    percent::{Interpretation, interpretations},
     route_tree::{Cover, DEFAULT_RULE, Router, RuleId},
     structural::{
         ClassSet, Encodings, ScanResult, classes_present, enabled_classes, enabled_encodings,
-        primary_class, scan,
+        primary_class, scan, scan_interpretation,
     },
 };
 
@@ -33,9 +34,10 @@ const MAX_PATH_LEN: usize = 8192;
 /// necessarily falls in a capture — the build-time canonicality check in
 /// `path_router` is load-bearing for that.
 ///
-/// Three checks compose under the default mode — the positional verdict above, then
-/// the precise case-fold and content-decode verdicts (apply the declared transform,
-/// re-route, deny only a rule change), then any break-glass probes. The full decision
+/// Every bounded percent interpretation runs through the same structural scan and
+/// precise rule comparison (with ASCII folding when configured). Structural facts
+/// retain original source offsets and combine before the positional verdict above.
+/// Custom break-glass probes then inspect the original request path. The full decision
 /// story, including why positional over-approximates (it treats every path extending
 /// the anchor as reachable, not just actual transform images) while the fold/decode
 /// checks are exact, is [`crate::_docs::explanation::decision`].
@@ -99,8 +101,8 @@ impl PathConfusionGuard {
         }
     }
 
-    /// Check interpretations and return the raw identity they agree with. Matching
-    /// is lazy so unconditional denials do not need to traverse the route tree.
+    /// Check interpretations and return the original identity they agree with.
+    /// The original match is lazy and shared by every interpretation.
     pub(crate) fn checked(
         &self,
         path: &str,
@@ -111,9 +113,7 @@ impl PathConfusionGuard {
         let denial = match self.mode {
             GuardMode::Disabled => None,
             GuardMode::RejectAmbiguous => self
-                .positional_deny(path, method, &raw_rule)
-                .or_else(|| self.case_fold_deny(path, method, &raw_rule))
-                .or_else(|| self.content_decode_deny(path, method, &raw_rule))
+                .interpretations_deny(path, method, &raw_rule)
                 .or_else(|| self.custom_probe_deny(path)),
             // Strict: every position live (opaque ignored) and any percent-escape is
             // itself non-canonical.
@@ -166,16 +166,16 @@ impl PathConfusionGuard {
     /// is not worth modeling.
     ///
     /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
-    /// [`case_fold_deny`](Self::case_fold_deny) instead, so an uppercase byte alone
+    /// [`interpretation_rule_deny`](Self::interpretation_rule_deny) instead, so an uppercase byte alone
     /// never denies positionally (only an actual fold relocation does).
     fn positional_deny(
         &self,
         path: &str,
+        scan: &ScanResult,
         method: &http::Method,
         raw_rule: &impl Fn() -> Option<RuleId>,
     ) -> Option<ResolveError> {
         let enabled = self.enabled.without(ClassSet::CASE);
-        let scan = scan(path, enabled, self.enc);
         let present = scan.classes.intersect(enabled);
         if present.is_empty() {
             return None;
@@ -191,7 +191,7 @@ impl PathConfusionGuard {
         let Some(offset) = scan.earliest else {
             return Some(ResolveError::Structural(primary_class(present)));
         };
-        let anchor = self.anchor_for(path, &scan, offset);
+        let anchor = self.anchor_for(path, scan, offset);
         let matched = raw_rule().unwrap_or(DEFAULT_RULE);
         if self.router.anchor_cover(anchor, method) == Cover::Uniform(matched) {
             None
@@ -211,7 +211,7 @@ impl PathConfusionGuard {
     ///   occurrence, which `offset` bounds.
     /// - A *content* transform rewrites bytes with no structural class — a
     ///   percent-escape decodes (`%61`→`a`, possibly to bytes that are not valid UTF-8,
-    ///   which [`content_decode_deny`](Self::content_decode_deny) routes as bytes rather
+    ///   which [`interpretation_rule_deny`](Self::interpretation_rule_deny) routes as bytes rather
     ///   than declining) and an uppercase
     ///   byte folds under a declared case-folding backend — so the anchor is cut
     ///   before the first such byte too. Everything ahead of it is a literal,
@@ -246,50 +246,93 @@ impl PathConfusionGuard {
     /// that drifted would make this return `Some` where production denies outright,
     /// which costs a stricter test, never a weaker one.
     pub(crate) fn structural_anchor<'p>(&self, path: &'p str) -> Option<&'p str> {
+        if path.len() > MAX_PATH_LEN {
+            return None;
+        }
         let enabled = self.enabled.without(ClassSet::CASE);
         let scan = scan(path, enabled, self.enc);
         let present = scan.classes.intersect(enabled);
-        if present.is_empty()
-            || path.len() > MAX_PATH_LEN
-            || present.contains_any(ClassSet::TRUNCATION)
-        {
+        if present.is_empty() || present.contains_any(ClassSet::TRUNCATION) {
             return None;
         }
         Some(self.anchor_for(path, &scan, scan.earliest?))
     }
 
-    /// Case-fold verdict: model a case-folding backend (declared via
-    /// [`CaseSensitivity::Insensitive`]) and deny iff lowercasing the path **relocates**
-    /// it to a different rule than the raw path matched. Precise, like the
-    /// content-decode check — `/files/ReadMe.TXT` folds within its own rule and keeps
-    /// flowing; `/ADMIN` folding onto a distinct `/admin` rule is denied.
-    ///
-    /// Sound on two build-time invariants: patterns are all-lowercase under
-    /// `Insensitive` (uppercase is a build error), so the folded path re-routes through
-    /// the very table the backend resolves against; and folding composed with
-    /// percent-decoding is covered by [`content_decode_deny`](Self::content_decode_deny),
-    /// which folds the decoded path before re-routing. Only ASCII case is modeled,
-    /// mirroring [`CaseSensitivity`].
-    fn case_fold_deny(
+    /// Every permitted interpretation uses the same byte scanner and rule comparison.
+    /// Structural facts are joined in ORIGINAL-input coordinates before computing
+    /// coverage, so transforms at different decode depths cannot hide each other.
+    /// Rule comparisons always use the original request identity, never the previous
+    /// pass's identity. Keep structural denials ahead of precise rule-change errors.
+    fn interpretations_deny(
         &self,
         path: &str,
         method: &http::Method,
         raw_rule: &impl Fn() -> Option<RuleId>,
     ) -> Option<ResolveError> {
-        if !self.case_insensitive || !path.bytes().any(|b| b.is_ascii_uppercase()) {
-            return None;
-        }
-        if path.len() > MAX_PATH_LEN {
+        if path.len() > MAX_PATH_LEN && path.contains('%') {
             return Some(ResolveError::TooLong);
         }
-        let folded = path.to_ascii_lowercase();
-        (self.router.resolve(&folded, method) != raw_rule())
-            .then_some(ResolveError::CaseFoldRuleChange)
+        let mut structural = ScanResult::empty();
+        let mut relocation = None;
+        interpretations(path.as_bytes(), self.enc.double_decode, |view| {
+            structural.include(scan_interpretation(
+                view,
+                self.enabled.without(ClassSet::CASE),
+                self.enc,
+            ));
+            // NUL and oversized structural paths deny independently of routing.
+            if structural.classes.contains_any(ClassSet::TRUNCATION)
+                || (path.len() > MAX_PATH_LEN
+                    && !structural
+                        .classes
+                        .intersect(self.enabled.without(ClassSet::CASE))
+                        .is_empty())
+            {
+                return;
+            }
+            if relocation.is_none() {
+                relocation = self.interpretation_rule_deny(view, path.len(), method, raw_rule);
+            }
+        });
+        self.positional_deny(path, &structural, method, raw_rule)
+            .or(relocation)
+    }
+
+    fn interpretation_rule_deny(
+        &self,
+        view: &Interpretation<'_>,
+        original_len: usize,
+        method: &http::Method,
+        raw_rule: &impl Fn() -> Option<RuleId>,
+    ) -> Option<ResolveError> {
+        let folds = self.case_insensitive && view.bytes.iter().any(u8::is_ascii_uppercase);
+        if view.is_original() && !folds {
+            return None;
+        }
+        if original_len > MAX_PATH_LEN {
+            return Some(ResolveError::TooLong);
+        }
+        let folded;
+        let bytes = if folds {
+            folded = view.bytes.to_ascii_lowercase();
+            folded.as_slice()
+        } else {
+            view.bytes.as_ref()
+        };
+        (self.router.resolve_bytes(bytes, method) != raw_rule()).then_some(if view.is_original() {
+            ResolveError::CaseFoldRuleChange
+        } else {
+            ResolveError::DecodeRuleChange
+        })
     }
 
     /// Positional verdict for [`GuardMode::RequireCanonical`]: every position live,
     /// opaque declarations ignored, so any enabled structural byte denies.
     fn noncanonical_deny(&self, path: &str) -> Option<ResolveError> {
+        // Bound decoded buffers before scanning an escape-bearing strict request.
+        if path.len() > MAX_PATH_LEN && escape_present(path) {
+            return Some(ResolveError::TooLong);
+        }
         let present = classes_present(path, self.enabled, self.enc).intersect(self.enabled);
         if present.is_empty() {
             return None;
@@ -298,43 +341,6 @@ impl PathConfusionGuard {
             return Some(ResolveError::TooLong);
         }
         Some(ResolveError::NonCanonical(primary_class(present)))
-    }
-
-    /// Content-decode verdict: model every possible complete-path result — one decode
-    /// pass, plus two under [`DecodeDepth::UpToTwo`] — and deny if any possible result
-    /// **relocates** the path to a different rule than the raw path matched. Precise —
-    /// results that all land on the same rule (`/foo%20bar`) are allowed, so opaque
-    /// content flows.
-    fn content_decode_deny(
-        &self,
-        path: &str,
-        method: &http::Method,
-        raw_rule: &impl Fn() -> Option<RuleId>,
-    ) -> Option<ResolveError> {
-        if !path.contains('%') {
-            return None;
-        }
-        if path.len() > MAX_PATH_LEN {
-            return Some(ResolveError::TooLong);
-        }
-        let passes = if self.enc.double_decode { 2 } else { 1 };
-        let raw = path.as_bytes();
-        let raw_rule = raw_rule();
-        let mut decoded = raw.to_vec();
-        for _ in 0..passes {
-            decoded = percent_decode_once(&decoded);
-            let decoded_rule = if self.case_insensitive {
-                let mut folded = decoded.clone();
-                folded.make_ascii_lowercase();
-                self.router.resolve_bytes(&folded, method)
-            } else {
-                self.router.resolve_bytes(&decoded, method)
-            };
-            if decoded_rule != raw_rule {
-                return Some(ResolveError::DecodeRuleChange);
-            }
-        }
-        None
     }
 }
 
@@ -387,31 +393,6 @@ fn raise(prefix: &str, k: usize) -> &str {
 fn escape_present(path: &str) -> bool {
     let b = path.as_bytes();
     (0..b.len()).any(|i| crate::percent::byte_at(b, i).is_some())
-}
-
-/// Percent-decode every complete `%XX` escape once (one pass: `%252F` → `%2F`).
-///
-/// Yields raw **bytes**, and is total. Decoding can produce sequences that are not valid
-/// UTF-8 (`%FF`, a lone surrogate, a truncated multi-byte form); a backend decodes to
-/// bytes and routes on bytes regardless, so refusing to model those inputs would leave
-/// the relocation check unevaluated on exactly the paths an attacker controls.
-fn percent_decode_once(path: &[u8]) -> Vec<u8> {
-    if !path.contains(&b'%') {
-        return path.to_vec();
-    }
-    let mut out = Vec::with_capacity(path.len());
-    let mut i = 0;
-    while i < path.len() {
-        let Some(&cur) = path.get(i) else { break };
-        if let Some(byte) = crate::percent::byte_at(path, i) {
-            out.push(byte);
-            i += 3;
-        } else {
-            out.push(cur);
-            i += 1;
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -929,8 +910,8 @@ mod tests {
     }
 
     /// The other half of the detection-table audit's CASE row: *encoded* uppercase is not a
-    /// positional concern (the byte scan flags only raw `A-Z`) — it is the content-decode
-    /// check's job under a case-folding backend. `/%41dmin` → `/Admin` → `/admin` relocates.
+    /// positional concern (runtime structural analysis masks CASE) — it is the precise
+    /// rule comparison's job under a case-folding backend. `/%41dmin` → `/Admin` → `/admin` relocates.
     #[test]
     fn content_decode_catches_encoded_uppercase() {
         let g = guard(

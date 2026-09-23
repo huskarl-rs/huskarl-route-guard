@@ -45,26 +45,38 @@ not seen at all:
   What remains uncovered: fullwidth *letters* that NFKC-fold onto a different literal
   route (`/ＡＤＭＩＮ` → `/ADMIN` → `/admin` — a content relocation with no built-in
   class), and visual look-alikes NFKC does **not** decompose (U+2044 fraction slash,
-  U+2215 division slash). For these, deny non-ASCII paths with a
-  [`StructuralProbe`](crate::config::StructuralProbe) — blunt but monotonic,
-  since a probe can only add denials:
+  U+2215 division slash). A conservative mitigation is to require literal ASCII
+  paths with a [`StructuralProbe`](crate::config::StructuralProbe). Probes receive
+  the **original path**, so checking only `is_ascii()` misses percent-encoded
+  Unicode such as `/%EF%BC%A1dmin`. This example rejects both non-ASCII characters
+  and every percent escape, including harmless encoded ASCII. Use it only where
+  that restriction is acceptable:
 
   ```
   use huskarl_route_guard::config::{StructuralClasses, StructuralProbe};
 
-  struct RejectNonAscii;
-  impl StructuralProbe for RejectNonAscii {
+  struct RequireLiteralAscii;
+  impl StructuralProbe for RequireLiteralAscii {
       fn name(&self) -> &'static str {
-          "reject-non-ascii"
+          "require-literal-ascii"
       }
-      // Whole-path presence check. Scope it tighter (the specific confusables your
-      // backend folds) if you must serve legitimate non-ASCII paths.
       fn matches(&self, path: &str) -> bool {
-          !path.is_ascii()
+          !path.is_ascii() || path.contains('%')
       }
   }
 
-  let classes = StructuralClasses::new().with_probe(RejectNonAscii);
+  let classes = StructuralClasses::new().with_probe(RequireLiteralAscii);
+  # use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, ResolveError, RuleRouter};
+  # for depth in [DecodeDepth::UpToOne, DecodeDepth::UpToTwo] {
+  #     let config = GuardConfig::new(CaseSensitivity::Insensitive, depth)
+  #         .with_structural_classes(classes.clone());
+  #     let router = RuleRouter::builder("public", config).subtree("/admin", "protected").build().unwrap();
+  #     for path in ["/Ａdmin", "/%EF%BC%A1dmin", "/%25EF%25BC%25A1dmin", "/files/a%20b"] {
+  #         assert_eq!(router.resolve(path, &http::Method::GET).unwrap_err(), ResolveError::Probe("require-literal-ascii"));
+  #     }
+  #     assert_eq!(*router.resolve("/files/readme", &http::Method::GET).unwrap().rule(), "public");
+  #     assert_eq!(*router.resolve("/admin", &http::Method::GET).unwrap().rule(), "protected");
+  # }
   ```
 - **Trailing-slash / segment-presence equivalence.** A backend that treats
   `/admin/` ≡ `/admin` is not caught — `/admin/` carries no recognized structural form — so an

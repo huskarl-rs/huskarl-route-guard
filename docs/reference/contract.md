@@ -42,7 +42,7 @@ method fall-through, and registration identity.
 |---|---|
 | Structural ambiguity | Every path in the conservatively analyzed region selects the raw path's rule identity for the request method |
 | ASCII case folding | Lowercasing selects the same rule for the request method |
-| Whole-path percent-decoding | Each configured complete decode result selects the same rule for the request method; results are also lowercased when configured |
+| Whole-path percent-decoding | Each configured complete decode result passes structural analysis and selects the same rule for the request method; results are also lowercased when configured |
 | NUL | Always rejected while the guard is active |
 | Custom probe | Rejected if any probe matches |
 
