@@ -48,6 +48,14 @@ rule there, register it explicitly at `/items/special`, or add an all-method
 `route` at that exact path. See [Routing behavior](crate::_docs::reference::routing)
 for the executable example and precedence rules.
 
+Backend method dispatch must agree with these registrations. The tested Express
+fixture falls through a GET-only child to a parent POST handler, requiring an
+explicit child POST registration in the guard. The tested Axum and `SvelteKit`
+fixtures reject that gap instead. Also include HEAD where the backend serves GET
+handlers for HEAD. See the
+[deployment method recommendations](crate::_docs::reference::deployments#method-specific-registrations)
+for the exact setups and Apache's static-file POST behavior.
+
 ### Inspect method gaps at startup
 
 Call [`diagnostics()`](crate::RuleRouter::diagnostics) after construction to find

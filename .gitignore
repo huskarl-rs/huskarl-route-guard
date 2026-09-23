@@ -3,3 +3,10 @@
 # bolero writes its fuzzing corpus here; a found crash should be promoted to an explicit
 # regression test (as with proptest-regressions/) rather than committed as a raw blob.
 /src/__fuzz__
+
+# Isolated downstream fixtures; lockfiles are intentionally committed.
+/.pnpm-store
+/tests/downstream/*/node_modules
+/tests/downstream/*/target
+/tests/downstream/sveltekit/.svelte-kit
+/tests/downstream/sveltekit/build

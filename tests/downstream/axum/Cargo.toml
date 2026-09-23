@@ -1,0 +1,12 @@
+[package]
+name = "route-guard-axum-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Isolated from the library's dependency graph and ordinary test build.
+[workspace]
+
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

@@ -26,6 +26,9 @@ pub mod tutorial {}
 
 /// Exact statements to consult while configuring or reviewing the guard.
 pub mod reference {
+    #[doc = include_str!("../docs/reference/deployments.md")]
+    pub mod deployments {}
+
     #[doc = include_str!("../docs/reference/routing.md")]
     pub mod routing {}
 

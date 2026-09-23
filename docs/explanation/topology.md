@@ -13,21 +13,63 @@ Colocation only helps if the authorization decision and the request dispatch sha
 framework routes the decoded one has reintroduced the very same differential inside a
 single process. The guarantee is "one parser," not "one binary."
 
+## Topologies covered by the deployment tests
+
+The direct profiles place the guard before one backend:
+
+```text
+client -> guard / authorization -> Apache, Express, Axum, or SvelteKit
+```
+
+There is no intermediate proxy after the guard in these profiles. The harness
+evaluates the original path and method, then sends only accepted requests unchanged
+to the server. The backend independently identifies the selected handler or file.
+These fixtures validate the guard/backend pairing; they do not exercise a complete
+production gateway or prove that its request extraction and forwarding preserve
+the tested bytes.
+
+The chain profile adds a specific normalization step after authorization:
+
+```text
+client -> guard / authorization -> NGINX normalized $uri -> Apache static files
+```
+
+NGINX forwards `/%2561dmin/probe.txt` as `/%61dmin/probe.txt`, and Apache serves
+`/admin/probe.txt`. For this configuration, declaring `UpToOne` permits a request
+authorized as public to reach admin. Declaring `UpToTwo` removes the observed
+confusion. The requirement comes from that measured path transformation, not simply
+from counting proxy processes. Other NGINX forwarding configurations need their
+own validation.
+
+Topology also includes method dispatch. In the tested fixtures, HEAD reaches GET
+handlers, Apache serves static files for POST, and Express can fall through a
+GET-only child to its parent's POST handler. Guard registrations must represent
+those behaviors as well as the parsing settings. A decode-depth change cannot
+repair a missing method-policy registration.
+
+The [deployment reference](crate::_docs::reference::deployments) records the exact
+versions, configurations, method-registration requirements, and removal-test
+counterexamples. The [testing explanation](crate::_docs::explanation::testing)
+describes how accepted requests supply the evidence. A new intermediary, middleware
+rewrite, or dispatch configuration changes the deployment being evaluated.
+
 ## One configuration, because this layer cannot see the upstream
 
 The structural configuration is set once, for the whole guard, and that is a
-consequence of *where this layer sits*, not a missing knob. The guard runs at
-authorization time — **before** upstream selection, which happens lower down (the inner
-proxy's peer choice) and may key on the host, headers, or its own routing, not just the
-path. So this layer has an authorization route table; it does **not** have, and cannot verify,
-the binding from a request to the backend that will actually serve it.
+consequence of what the library knows. It has an authorization route table, but no
+verified binding from a request to the backend that will serve it. In a gateway
+where authorization runs **before** upstream selection, that choice happens lower
+down and may depend on the host, headers, or other routing. The library does not
+require that ordering, but it cannot verify the application's backend selection
+even when selection occurs first.
 
 That is why the configuration is global: it must include the relevant behavior of
 **every** upstream a request might reach. When it does, the union is conservative no
 matter where the request is routed. The required
 [`CaseSensitivity`](crate::config::CaseSensitivity) declaration and the
+[`DecodeDepth`](crate::config::DecodeDepth) declaration, together with the
 [`StructuralClasses`](crate::config::StructuralClasses) toggles are facts you
-assert about *the backends behind you, collectively*; the guard then applies them
+assert about *all reachable downstream chains, collectively*; the guard applies them
 everywhere because it cannot tell which one any given request will hit.
 
 It is tempting to want per-route (≈ per-upstream) profiles — "stop applying IIS rules to
@@ -51,6 +93,12 @@ tightening and relaxing, and it is drawn by this layer's blindness to the upstre
 So a global profile should conservatively combine the behavior of all reachable
 upstreams. Add per-rule denials if needed; do not remove a global interpretation on
 the strength of an upstream binding this layer cannot verify.
+
+The independent test profiles do not implement automatic per-backend configuration
+selection. If one guard can reach both a direct origin and the tested two-decode
+chain, its decode declaration must cover both. Combining supported behaviors is
+conservative within the model; passing separate profiles does not itself validate
+a production gateway's selection or forwarding logic.
 
 Whether you register a rule with `subtree`, `exclusive_subtree`, or `route` is a related
 security decision, documented on the route-registration builders of the consuming

@@ -14,8 +14,37 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Rust comes from rust-toolchain; these tasks do not need the optional Cargo tools.
+  MISE_AUTO_INSTALL: "false"
 
 jobs:
+  downstream:
+    name: Downstream (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [apache, express, axum, sveltekit, nginx-apache]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
+      - name: Run downstream parsing profiles
+        env:
+          DOWNSTREAM_BACKEND: ${{ matrix.backend }}
+        run: mise run test-downstream "$DOWNSTREAM_BACKEND"
+      - name: Save downstream observations and server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downstream-${{ matrix.backend }}
+          path: target/downstream/
+          if-no-files-found: ignore
+
   quality:
     name: quality (stable)
     runs-on: ubuntu-latest
@@ -30,6 +59,9 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
 
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
@@ -37,11 +69,10 @@ jobs:
       - name: Run Clippy
         run: cargo +stable clippy --locked --all-targets -- -D warnings
 
-      - name: Run tests
-        run: cargo +stable test --locked --all-targets
-
-      - name: Run documentation tests
-        run: cargo +stable test --locked --doc
+      - name: Run tests and documentation tests
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: mise run test
 
       - name: Build documentation without warnings
         env:

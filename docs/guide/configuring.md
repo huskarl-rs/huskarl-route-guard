@@ -4,6 +4,13 @@ Configure the parsing behaviors that may occur after your application forwards a
 request. Include every downstream component, not just the final server. The library
 cannot infer these behaviors from a framework name or inspect the deployment.
 
+For a direct connection to a tested backend, start with
+[Tested deployments](crate::_docs::reference::deployments). It lists exact
+versions, server configurations, guard settings, and the evidence supporting each
+recommendation, including a separately specified proxy-chain profile.
+The [topology explanation](crate::_docs::explanation::topology) shows where the guard
+sits in those tests and what changes when several downstream chains are reachable.
+
 ## Before you configure
 
 Identify every component that can parse or rewrite the path between this guard and

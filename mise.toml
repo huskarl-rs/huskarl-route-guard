@@ -14,6 +14,34 @@ description = "Generate README.md from crate-level documentation"
 run = "cargo bench --bench route_guard"
 description = "Benchmark request resolution and route-table construction"
 
+[tasks.test]
+run = ["cargo test --locked --all-targets", "cargo test --locked --doc"]
+description = "Run ordinary tests, benchmark smoke checks, and documentation tests (no Docker)"
+
+[tasks.test-apache]
+run = "bash scripts/test-downstream.sh apache"
+description = "Differential baseline against Linux Apache in Docker (macOS/Linux)"
+
+[tasks.test-downstream]
+run = "bash scripts/test-downstream.sh"
+description = "Differential baselines in Docker; optionally pass apache, express, axum, sveltekit, or nginx-apache"
+
+[tasks.test-express]
+run = "bash scripts/test-downstream.sh express"
+description = "Differential baseline against Express in Docker"
+
+[tasks.test-axum]
+run = "bash scripts/test-downstream.sh axum"
+description = "Differential baseline against Axum in Docker"
+
+[tasks.test-sveltekit]
+run = "bash scripts/test-downstream.sh sveltekit"
+description = "Differential baseline against SvelteKit adapter-node in Docker"
+
+[tasks.test-nginx-apache]
+run = "bash scripts/test-downstream.sh nginx-apache"
+description = "Two-decode NGINX normalized-URI proxy to Apache baseline"
+
 # Coverage-guided fuzzing of a bolero target (needs nightly for libFuzzer). Primes the live
 # corpus from the committed seeds in `fuzz-corpus/` so a run starts warm, then fuzzes.
 # Targets are addressed by their fully-qualified name (see `cargo bolero list`); extra args

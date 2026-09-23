@@ -62,6 +62,44 @@ These layers support one bounded conclusion: the implementation has strong evide
 for its stated contract over the supported model. Platform behavior outside that model
 requires separate evidence and remains outside the guarantee.
 
+## Real downstream baselines
+
+See [Tested deployments](crate::_docs::reference::deployments) for the
+versioned configuration recommendations supported by these tests.
+
+These tests challenge deployment assumptions behind configuration recommendations.
+`mise run test-downstream` runs the ignored `tests/downstream.rs` integration test
+against pinned Linux Apache, Express, Axum, and `SvelteKit` adapter-node fixtures,
+plus a NGINX normalized-URI proxy to Apache chain.
+The same command works on macOS and Linux with a local Docker daemon; an Ubuntu
+GitHub Actions matrix runs it in CI. Ordinary tests use `mise run test` without Docker.
+
+The same input corpus is evaluated against each recommended guard configuration
+and four policy layouts. Only accepted requests are sent downstream, preserving
+request-target bytes over TCP. Responses identify selected routes (static resources
+for Apache), which the harness independently maps to authorization policies.
+A forwarded request reaching a different policy invalidates the recommendation.
+Denied requests are recorded as not forwarded and provide no downstream evidence.
+
+Additional runs remove individual recommended settings. They must produce actual
+accepted-request confusion to justify retaining the setting. Case folding for
+default/insensitive Express, backslash handling for `SvelteKit`, and method
+registration choices each have such counterexamples. The NGINX–Apache profile
+requires `UpToTwo`; removing its second decode declaration also reproduces confusion.
+The corpus combines content escapes, separator transformations, and case variants. GET and HEAD run across all
+layouts; POST exercises a layout with method-specific registrations and gaps.
+Route-ID headers identify HEAD handlers without relying on response bodies. If
+removal reveals no confusion, the test fails for review and removal of that unsupported recommendation from the tested profile. The minimum
+available decode setting and mandatory built-in structural classes are not
+individually removable and have no necessity claim from these tests.
+
+Canonical route probes and a minimum served-request count prevent vacuous passes.
+Redirects and backend rejections establish no policy agreement. Reports separate
+recommended and weakened configurations, including every accepted-request
+counterexample. These are bounded GET/HEAD/POST routing and static-file baselines, not proof
+for arbitrary deployments or all inputs. Setup, configuration advice, and report
+format are documented in `tests/downstream/README.md` in the repository.
+
 ## Performance regression suite
 
 `mise run bench` runs the Criterion suite in `benches/route_guard.rs`. It measures the

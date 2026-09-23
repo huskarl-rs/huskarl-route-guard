@@ -80,6 +80,7 @@ The guard compares those identities.
 - **Look up:** [Routing behavior](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/routing/),
   [security contract](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/contract/),
   [supported parsing behaviors](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/coverage/),
+  [tested deployments](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/deployments/),
   and [glossary](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/glossary/).
 
 This framework-independent crate powers `huskarl-pingora`'s `Guard` and

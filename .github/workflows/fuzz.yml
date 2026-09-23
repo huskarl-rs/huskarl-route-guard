@@ -26,6 +26,9 @@ on:
 permissions:
   contents: read
 
+env:
+  MISE_AUTO_INSTALL: "false"
+
 concurrency:
   # Never cancel an in-flight fuzz campaign; let pushes coalesce the regression job.
   group: fuzz-${{ github.workflow }}-${{ github.ref }}
@@ -40,9 +43,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
       # Runs the bolero harnesses (replay mode) + every proptest property + the unit/CVE
       # corpus. This is the per-PR safety net for the path-confusion guard.
-      - run: cargo test
+      - run: mise run test
 
   discovery:
     name: discovery (${{ matrix.id }})
@@ -64,6 +70,9 @@ jobs:
       # libFuzzer + AddressSanitizer require a nightly toolchain.
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v4
+        with:
+          install: false
       - name: Install cargo-bolero
         run: cargo install cargo-bolero --locked
       - name: Restore corpus
@@ -79,7 +88,7 @@ jobs:
         # scripts/fuzz.sh primes the live corpus from the committed seeds (so the run starts
         # warm even when the cache is cold) on top of whatever the cache restored, then runs.
         run: >
-          bash scripts/fuzz.sh '${{ matrix.target }}'
+          mise run fuzz '${{ matrix.target }}'
           -T ${{ github.event.inputs.duration || matrix.time }}s
       - name: Upload crash reproducer
         # Only on failure — i.e. the fuzzer found a crash. The corpus is gitignored and
