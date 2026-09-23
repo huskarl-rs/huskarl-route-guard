@@ -1,9 +1,10 @@
 name: fuzz
 
 # Two layers, per the path-confusion fuzzing setup:
-#   - `regression` (push / PR): fast, deterministic. Runs the test suite, which includes
-#     the three bolero harnesses in replay mode — they re-run any committed regression
-#     tests and seed corpus, so a previously-found bug can never silently come back.
+#   - `regression` (push / PR): runs unit/CVE regressions, proptest properties, and
+#     the three bolero harnesses with generated inputs and any available live corpus.
+#     This job does not copy fuzz-corpus seeds; promote discovered bugs to explicit
+#     regression tests so fresh checkouts exercise them.
 #   - `discovery` (nightly / manual): the actual coverage-guided fuzzing. A fresh crash is
 #     captured as an artifact (the gitignored corpus is ephemeral on the runner); the
 #     corpus is cached so runs compound instead of starting cold each night.
@@ -46,8 +47,8 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           install: false
-      # Runs the bolero harnesses (replay mode) + every proptest property + the unit/CVE
-      # corpus. This is the per-PR safety net for the path-confusion guard.
+      # Runs Bolero under cargo test, proptest properties, and unit/CVE regressions.
+      # Seed priming is performed separately by scripts/fuzz.sh in discovery.
       - run: mise run test
 
   discovery:

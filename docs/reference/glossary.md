@@ -27,9 +27,9 @@ request method and no all-method rule.
 
 **Route table** — the registrations and the default rule.
 
-**Single-rule subtree / uniform coverage** — a region where every path and every
-HTTP method selects the same rule identity. Gaps that select the default count
-toward this check. A lone catch-all registration does not cover its bare prefix
+**Single-rule subtree / uniform coverage** — a region where every path selects
+the same rule identity for the request method. Other methods have their own coverage.
+Gaps that select the default count toward this check. A lone catch-all registration does not cover its bare prefix
 or empty remainder.
 
 ## Path parsing

@@ -14,7 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Rust comes from rust-toolchain; these tasks do not need the optional Cargo tools.
+  # Rust comes from the dtolnay/rust-toolchain actions; optional Cargo tools are not needed.
   MISE_AUTO_INSTALL: "false"
 
 jobs:

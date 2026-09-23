@@ -37,9 +37,9 @@ because the library cannot determine them:
    downstream routing distinguishes ASCII case.
 2. **Declare [`DecodeDepth`](crate::config::DecodeDepth)** — required, no
    default. Pick [`UpToTwo`](crate::config::DecodeDepth::UpToTwo) when the
-   whole path may be decoded either once or twice before it is finally routed — a
-   CDN or WAF in front of an origin, proxy-in-front-of-proxy (the CVE-2025-0108
-   shape), or uncertainty between those two decode depths. Pick
+   whole path may be decoded up to twice before it is finally routed, or the
+   depth is uncertain between one and two. Count actual decode passes after
+   this guard, not proxy processes. Pick
    [`UpToOne`](crate::config::DecodeDepth::UpToOne) only when no more than one
    decode pass can happen.
 3. **Enable the [`StructuralClasses`](crate::config::StructuralClasses)
@@ -49,7 +49,9 @@ because the library cannot determine them:
    [`with_overlong`](crate::config::StructuralClasses::with_overlong) for a
    decoder that accepts non-shortest-form UTF-8, and
    [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure)
-   for a backend you have **confirmed** Unicode-normalizes the path before routing.
+   for a backend that folds the supported fullwidth structural characters.
+   This does not cover general Unicode normalization or fullwidth letters; see
+   [coverage limits](crate::_docs::reference::coverage).
    Leave a toggle off only when you are sure the backend does not do it. (NUL
    truncation needs no toggle — it is always-on because this library does not support
    NUL as path content.)
@@ -61,8 +63,8 @@ because the library cannot determine them:
    areas for encoded keys;
    [`RequireCanonical`](crate::config::GuardMode::RequireCanonical)
    is strict defense-in-depth that denies every form it recognizes as non-canonical —
-   **including opaque blob keys and any percent-escape** — so opt in only where you
-   serve no such content;
+   **including recognized forms inside opaque keys and every complete percent escape**
+   — so opt in only where those restrictions are acceptable;
    [`Disabled`](crate::config::GuardMode::Disabled) disables the guard. Use it only
    when route agreement is enforced elsewhere or this route result is not an
    authorization boundary.
@@ -96,10 +98,11 @@ model, every knob has a conservative direction: the stricter setting can only de
 behavior therefore costs false-positive `400`s rather than creating a new allowed
 request. If you cannot confirm the case behaviour, declare
 [`Insensitive`](crate::config::CaseSensitivity::Insensitive) (it catches
-more — the cost is that route patterns must then be lowercase). If there is *any*
-chance a CDN, WAF, or second proxy fronts the origin — or you do not know whether
-the backend decodes once or twice — declare
-[`UpToTwo`](crate::config::DecodeDepth::UpToTwo). And if you can't
+more — the cost is that route literals must then be lowercase). If the path may
+receive two decode passes after this guard, or you cannot distinguish one pass
+from two, declare
+[`UpToTwo`](crate::config::DecodeDepth::UpToTwo). More than two passes are outside
+the supported model. And if you can't
 characterise the backend at all *and* serve no opaque or deliberately-encoded path
 content,
 [`RequireCanonical`](crate::config::GuardMode::RequireCanonical)

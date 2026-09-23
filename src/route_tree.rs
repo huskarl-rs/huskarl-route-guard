@@ -3,8 +3,9 @@
 //! This is the keystone of the path-confusion redesign: a matcher we **own**, so the
 //! scoped structural verdict can read the route structure directly — per-node
 //! coverage summaries, the anchor walk — instead of reverse-engineering `matchit`'s
-//! opaque parse tree. The grammar is a deliberately small, whole-segment, anonymous
-//! subset of `matchit` syntax:
+//! opaque parse tree. The deliberately small, whole-segment, anonymous grammar
+//! accepts public `matchit`-style syntax through `lower_matchit`. The
+//! test-only `parse_pattern` helper uses the following anonymous `*` notation:
 //!
 //! - a segment is a **literal** (matched byte-for-byte) or a lone `*` **wildcard**;
 //! - `*` matches exactly one non-empty segment, **except** the final `*` in a pattern,
@@ -501,7 +502,7 @@ impl Router {
         route_skipping(&self.root, body, Some(claimed))?.get(method)
     }
 
-    /// Build a router from `(pattern, rule_id, opaque)` entries.
+    /// Build a router from `(pattern, rule_id, opaque, method)` entries.
     ///
     /// `opaque` declares a pattern's trailing catch-all an opaque blob — a build-time
     /// guarantee that no more-specific path takes over beneath it ([`validate_opaque`]);
@@ -1155,8 +1156,9 @@ mod tests {
 
     #[test]
     fn build_accepts_lone_opaque_blob() {
-        // The opaque flag is a build-time guarantee (sibling-free, hence uniform);
-        // it no longer has a runtime span — matching is identical either way.
+        // The opaque flag forbids overriding paths in the catch-all tail;
+        // matching is identical either way. A lone catch-all still leaves gaps
+        // at the bare prefix and its trailing slash.
         let entries = vec![(
             parse_pattern("/files/*").expect("blob"),
             0,

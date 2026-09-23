@@ -20,8 +20,8 @@ modes use this model.
 | fullwidth/NFKC structural confusables (`／`→`/`, …) | opt-in | [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure) |
 | a novel structural form (fresh CVE, vendor quirk) | custom detector | [`with_probe`](crate::config::StructuralClasses::with_probe) |
 
-“Default” interpretations are always considered. “Required” values must be supplied
-to the builder. “Opt-in” interpretations are absent until enabled. A custom detector
+“Default” interpretations are considered whenever the guard is active. “Required”
+values must be supplied to the builder. “Opt-in” interpretations are absent until enabled. A custom detector
 can add a platform-specific denial, but cannot teach the guard how that platform
 routes the resulting path.
 
@@ -94,16 +94,19 @@ not seen at all:
   rule. Use registrations that cover the equivalent paths or a custom probe
   accounting for raw and encoded whitespace if your backend has this behavior.
 - **Strip-style "sanitizers".** The built-in model includes decoding, slash merging,
-  parameter stripping, and dot-segment resolution. Every supported member rewrites
-  the path at or after the form that triggers it, which is what lets the scoped check
-  bound its reach. A backend that instead **deletes patterns and rescans** (the
+  parameter stripping, and dot-segment resolution. Boundary changes act at or after
+  their triggers; dot-segments can remove earlier segments, so the scoped check
+  also accounts for their maximum climb count. A backend that instead **deletes
+  patterns and rescans** (the
   `path.replace("../", "")` anti-pattern) is outside the family: it can *manufacture*
   a traversal from bytes the model considers inert — `....//` becomes `../` after one
   deletion pass — including inside a single-rule subtree the scoped check tolerates.
   If you must front such a backend, add a
   [`StructuralProbe`](crate::config::StructuralProbe) for the shapes its
-  sanitizer reacts to (e.g. any `../` substring after one deletion pass), or run
-  [`RequireCanonical`](crate::config::GuardMode::RequireCanonical).
+  sanitizer reacts to, including encoded spellings it consumes.
+  [`RequireCanonical`](crate::config::GuardMode::RequireCanonical) rejects the
+  `....//` example because of `//`, but does not generally model strip-and-rescan
+  sanitizers.
 - **Forms with no class and no probe.** A structural form outside the built-in
   alphabet — including a future CVE — is invisible until you add a
   [`with_probe`](crate::config::StructuralClasses::with_probe) for it or a

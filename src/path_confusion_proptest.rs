@@ -1,7 +1,8 @@
 //! Property-based bypass fuzzing for the path-confusion guard.
 //!
 //! This tests the guard's *security claim* directly, not its parsing: the guard
-//! forwards the **raw** path or denies, so a bypass is a parser differential —
+//! returns a checked rule or a denial; the caller forwards allowed paths unchanged.
+//! A bypass is a parser differential —
 //! the proxy authorizes a request as one rule while a backend, after normalizing
 //! the path, would route it to a *different* rule. The soundness invariant:
 //!
@@ -16,9 +17,10 @@
 //! The oracle's value is that the reference backend ([`normalize`]) is a
 //! **concrete, executable** model — it actually decodes `%2F`→`/`, resolves
 //! `..`, strips `;`-params, folds case, etc., then re-routes through the same
-//! table — whereas the guard is an *abstract positional analysis that never
-//! transforms a byte*. Two independent implementations of "what could happen to
-//! this path"; when they disagree it means something.
+//! table. The guard instead bounds structural rewrites with positional analysis,
+//! while decoding and case-folding internal copies for exact rule comparisons.
+//! The structural algorithms are independent; both use the same route table and
+//! declared interpretation vocabulary.
 //!
 //! The one rule that keeps it honest: the reference backend's transforms are
 //! **gated by the same [`StructuralClasses`]/[`DecodeDepth`]/[`CaseSensitivity`]**
@@ -256,8 +258,8 @@ fn modeled_backends(classes: &StructuralClasses, case: CaseSensitivity) -> Vec<B
             resolve_dots: mask & (1 << 4) != 0,
             case_fold,
             truncate_nul,
-            // Generic content-decode is always available — every backend percent-
-            // decodes the path (the always-on case for the guard's content check).
+            // Content decoding is always available in the family, but each
+            // backend mask selects whether to perform it.
             decode_unreserved: mask & (1 << 7) != 0,
             fold_unicode,
         });
@@ -306,10 +308,10 @@ fn apply(
     }
 }
 
-/// The steps `backend` performs, in the reference order — decode, then fold, then
-/// the structural rewrites, then case. This is the *canonical* member of the
-/// backend's ordering family, and [`normalize`] is exactly this order; the
-/// properties permute it.
+/// The steps `backend` performs, in the reference order — NUL truncation, decode,
+/// Unicode folding, structural rewrites, then ASCII case folding. This is the
+/// *canonical* member of the backend's ordering family, and [`normalize`] uses
+/// exactly this order; the properties permute it.
 fn canonical_order(backend: Backend) -> Vec<Step> {
     let mut steps = Vec::with_capacity(8);
     if backend.truncate_nul {
@@ -376,7 +378,8 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
 /// region a path lands; it cannot move it outside.
 ///
 /// Sampling the axis anyway is cheap insurance on that premise, which is a
-/// property of today's transform set and is asserted nowhere else. A future
+/// property of today's transform set, also checked directly by
+/// `no_modeled_transform_rewrites_inside_the_anchor`. A future
 /// class that rewrites *before* its trigger — the strip-and-rescan sanitizers
 /// [coverage](crate::_docs::reference::coverage) puts out of family, where
 /// `....//` collapses to `../` — would break the anchor argument silently under a
@@ -1460,7 +1463,7 @@ mod over_approximation_tests {
     /// The scoped verdict's *win*, stated as a contrast — the same structural bytes
     /// deny outside a uniform subtree and flow inside one, so the tolerance is earned
     /// from the table's shape rather than from relaxing a class. NUL is the deliberate
-    /// exception: always denied, uniform anchor or not (axiom 3).
+    /// exception: always denied in active guard modes, uniform anchor or not.
     #[test]
     fn uniformity_is_what_buys_the_tolerance_and_nul_is_exempt() {
         let classes = StructuralClasses::new();

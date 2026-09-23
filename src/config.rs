@@ -162,30 +162,32 @@ impl CaseSensitivity {
 /// path is finally routed — a declaration consuming builders **require**, with no
 /// default.
 ///
-/// Decode depth is a *topology* fact, not a backend implementation detail, and the
-/// library will not guess it (the same posture as [`CaseSensitivity`]). With a
-/// decoding layer in front of the origin — a CDN, a WAF, a proxy chained before
-/// another proxy — the path is percent-decoded more than once, and a double-encoded
+/// Decode depth describes the actual decoding performed after this guard, including
+/// intermediaries and the origin; it cannot be inferred from the number of processes.
+/// The library will not guess it (the same posture as [`CaseSensitivity`]). When both
+/// an intermediary and the origin decode the path, a double-encoded
 /// structural form (`%252F` → `%2F` → `/`) reaches the final router as path
 /// *structure*. That layering is exactly **CVE-2025-0108** (Palo Alto PAN-OS): nginx
 /// decoded `%252e%252e` once to `%2e%2e` and let it past a no-auth prefix, then
 /// Apache decoded *again* to `..` and traversed into a protected script.
 ///
 /// - [`UpToOne`](Self::UpToOne) — no more than one decode pass happens behind this layer.
-///   `%252F` reaches the application as the literal
-///   content `%2F`, so double-encoded forms are not treated as structure.
-/// - [`UpToTwo`](Self::UpToTwo) — the whole path may receive one or two decode
+///   `%252F` remains `%252F` without decoding or becomes the literal content `%2F`
+///   after one pass; it does not become a slash within this depth.
+/// - [`UpToTwo`](Self::UpToTwo) — the whole path may receive zero, one, or two decode
 ///   passes; the exact backend depth is not assumed. The guard recognises
 ///   double-percent-encoded structural forms (`%252F`, `%252E`, `%253B`, …) as
 ///   their class, and checks both possible complete-path results.
 ///
 /// **When unsure, declare [`UpToTwo`](Self::UpToTwo)** — within the supported model it
-/// can only deny more, and its over-denial surface is small: paths carrying a
-/// literal `%25XX` sequence as genuine content (e.g. a percent-encoded URL embedded
-/// in a path segment). Inside a uniform single-rule subtree
+/// can only deny more. Additional denials can affect nested escapes, including
+/// escapes assembled from encoded hex digits. More than two decode passes are outside
+/// the model. Inside a subtree with uniform coverage for the request method
 /// ([`subtree`](crate::RuleRouterBuilder::subtree) /
 /// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)), double-encoded
-/// *separators* in opaque keys stay tolerated even under `UpToTwo`.
+/// *separators* in keys can stay tolerated even under `UpToTwo` in
+/// [`RejectAmbiguous`](GuardMode::RejectAmbiguous). Exclusivity alone does not
+/// establish uniform coverage, and other checks can still deny the request.
 ///
 /// Each permitted whole-path decode result receives structural analysis as well as
 /// rule comparison. This includes combinations with enabled fullwidth and overlong
@@ -196,7 +198,7 @@ impl CaseSensitivity {
 pub enum DecodeDepth {
     /// At most one percent-decode pass happens behind this layer.
     UpToOne,
-    /// The whole path may receive one or two decode passes — for example because
+    /// The whole path may receive zero, one, or two decode passes — for example because
     /// the exact behaviour of a CDN, WAF, proxy chain, or origin is uncertain.
     /// Both possible complete-path results are checked.
     UpToTwo,
@@ -289,30 +291,35 @@ pub enum ResolveError {
     /// The precise case-fold check: lowercasing the path relocates it to a
     /// *different* rule than the raw path matched (backend declared
     /// [`CaseSensitivity::Insensitive`]). Not an over-approximation — a fold that
-    /// stays within its own rule is allowed.
+    /// stays within its own rule passes this check; other checks may still deny it.
     CaseFoldRuleChange,
     /// The precise content-decode check: one of the possible completely decoded
     /// forms (one pass, plus two under [`DecodeDepth::UpToTwo`], lowercased under
     /// a case-folding backend) relocates the path to a *different* rule. Not an
-    /// over-approximation — same-rule decodes (`/foo%20bar`) are allowed.
+    /// over-approximation — same-rule decodes pass this comparison, but structural
+    /// analysis, length limits, and custom probes may still deny them.
     DecodeRuleChange,
     /// The strict [`RequireCanonical`](GuardMode::RequireCanonical) mode's
     /// presence deny: a structural form of this class, anywhere in the path.
     NonCanonical(StructuralClass),
-    /// The strict mode's escape rule: the path carries a percent-escape at all.
+    /// The strict mode's escape rule: the path carries a complete `%XX` escape.
     NonCanonicalEscape,
     /// A registered [`StructuralProbe`] matched; carries the probe's
     /// [`name`](StructuralProbe::name).
     Probe(&'static str),
-    /// A path already flagged as suspicious exceeds the length cap (defense in
-    /// depth; clean paths are never length-checked).
+    /// A path requiring structural, decode, case-fold, or custom-probe checks
+    /// exceeds 8,192 bytes. In [`RejectAmbiguous`](GuardMode::RejectAmbiguous), any
+    /// `%` triggers the cap, even if malformed. In strict mode, complete escapes
+    /// and recognized non-canonical forms trigger it. Paths requiring no checks
+    /// bypass this cap; the caller must enforce an overall request-size limit.
     TooLong,
 }
 
 impl ResolveError {
     /// The short, static denial message for the HTTP response body. Deliberately
-    /// coarse — it does not vary with the attribution, so a response leaks nothing
-    /// about the route table; put [`Display`](std::fmt::Display) in the *log* instead.
+    /// coarse — it reports a broad error category without rule IDs or structural
+    /// class details. Acceptance and denial can still reveal routing behavior; put
+    /// [`Display`](std::fmt::Display) in the *log* for the detailed attribution.
     #[must_use]
     pub fn message(&self) -> &'static str {
         match self {
@@ -384,7 +391,8 @@ pub enum StructuralChar {
 /// A backend that treats some *other* byte or encoding as path structure — a fresh
 /// path-confusion CVE, a vendor quirk — is invisible to the structural modes until a
 /// release adds the form. Wrap a detector in [`StructuralClasses::with_probe`] and it
-/// is consulted on every request: return `true` and the request is denied.
+/// is consulted in active guard modes if earlier checks have not already denied
+/// the request: return `true` and the request is denied.
 ///
 /// # Contract
 ///
@@ -393,7 +401,9 @@ pub enum StructuralChar {
 /// spellings. For a conservative literal-ASCII restriction, see the example in
 /// [Supported path interpretations](crate::_docs::reference::coverage).
 ///
-/// `matches` must be **pure, deterministic, and ~O(n)** — it runs on every request.
+/// `matches` must be **pure, deterministic, and ~O(n)**. Checks short-circuit on
+/// denial, and `Disabled` skips probes; do not rely on a probe being called for
+/// logging or other side effects.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
 /// `exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
 /// monotonic, blunt semantics of a custom detector — by construction it can only

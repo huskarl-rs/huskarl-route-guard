@@ -12,9 +12,10 @@ use crate::{
     },
 };
 
-/// Length cap for a *suspicious* path: once a structural byte is flagged, a path over
-/// this length is denied. Clean paths bypass it (they cannot be ambiguous). Defense in
-/// depth — Pingora bounds the request line well below this.
+/// Length cap for paths requiring structural, decode, case-fold, or custom-probe
+/// checks. In `RejectAmbiguous`, any `%` triggers this cap, even if malformed;
+/// `RequireCanonical` caps complete escapes and recognized non-canonical forms.
+/// Paths requiring none of these checks bypass the cap; callers set overall limits.
 const MAX_PATH_LEN: usize = 8192;
 
 /// The runtime path-confusion verdict, driven by the owned [`Router`].
@@ -30,9 +31,10 @@ const MAX_PATH_LEN: usize = 8192;
 /// the default rule). Dot-segments climb — each `..`-capable segment pops at most one
 /// level — so they raise the anchor toward the root before the same check; NUL
 /// truncation denies unconditionally (its legitimate-use rate is ~nil). Because
-/// registered patterns are canonical, any structural byte in a matched path
-/// necessarily falls in a capture — the build-time canonicality check in
-/// `path_router` is load-bearing for that.
+/// registered literal segments exclude enabled structural forms, such forms cannot
+/// be consumed by a literal match of the raw path; they occur in captures or
+/// unmatched paths. The
+/// build-time canonicality check in `path_router` is load-bearing for that.
 ///
 /// Every bounded percent interpretation runs through the same structural scan and
 /// precise rule comparison (with ASCII folding when configured). Structural facts
@@ -228,7 +230,7 @@ impl PathConfusionGuard {
     /// a class that rewrote **before** its own trigger would break it silently. So it
     /// is also asserted directly, against the executable backend model — see
     /// `path_confusion_proptest`'s anchor-invariance property, which reaches this
-    /// function through `structural_anchor` (test-only).
+    /// function through `structural_anchor`, which also supports diagnostics.
     fn anchor_for<'p>(&self, path: &'p str, scan: &ScanResult, offset: usize) -> &'p str {
         let bound = first_content_byte(path, self.case_insensitive)
             .map_or(offset, |content| offset.min(content));
@@ -345,8 +347,8 @@ impl PathConfusionGuard {
 }
 
 /// Offset of the first byte a modeled **content** transform could rewrite: any `%`
-/// (a percent-escape — counted even when malformed, since a lenient decoder may
-/// still consume it) and, under a case-folding backend, any ASCII uppercase.
+/// (conservatively counted even when malformed; the modeled decoder leaves
+/// malformed escapes literal) and, under a case-folding backend, any ASCII uppercase.
 /// `None` when the path carries neither. Bounds the positional verdict's anchor
 /// alongside the earliest enabled structural occurrence.
 fn first_content_byte(path: &str, case_insensitive: bool) -> Option<usize> {
@@ -525,7 +527,7 @@ mod tests {
 
     /// An *encoded* matrix param that reveals a dot-segment (`..%3bx` — a `;`-stripping
     /// servlet backend climbs out of the blob) is denied just like the literal `..;x`.
-    /// The blob tolerates a `;` as a boundary-shift byte, but never the traversal it hides.
+    /// This subtree tolerates a `;` in its tail, but denies the hidden climb out of it.
     #[test]
     fn opaque_blob_denies_encoded_param_traversal() {
         let g = guard(
@@ -798,8 +800,8 @@ mod tests {
         assert!(g.ambiguous("/a\u{0}b"), "raw NUL truncates to /a");
         assert!(g.ambiguous("/a%00b"), "encoded NUL truncates to /a");
         assert!(!g.ambiguous("/a"), "clean path allowed");
-        // Denied even inside an opaque blob — truncation, like a dot-segment,
-        // escapes any span.
+        // NUL is denied even when truncation would remain inside the same rule.
+        // Unlike dot-segments, it receives no uniform-subtree tolerance.
         let blob = guard(
             &[("/files/*", 0, true)],
             GuardMode::RejectAmbiguous,
@@ -959,10 +961,10 @@ mod tests {
 
     // ── metamorphic laws ──────────────────────────────────────────────────────
     //
-    // The matcher has an oracle (matchit); the liveness verdict has none, so these are
-    // invariants the verdict must satisfy for *all* inputs, plus a CVE ground-truth
-    // corpus. The generators are constructive (a vocabulary mixing clean segments and
-    // structural payloads, biased to hit the route prefixes) — random strings would pass
+    // These metamorphic laws complement the matchit matcher oracle and the
+    // executable transform oracle in `path_confusion_proptest`, plus the CVE
+    // regression corpus. The generators mix clean segments and structural payloads,
+    // biased to hit the route prefixes — random strings would pass
     // every law vacuously by never being denied.
 
     use proptest::prelude::*;
@@ -1168,9 +1170,9 @@ mod tests {
         }
 
         /// L3: the opaque flag is **runtime-irrelevant** — scoped denial derives the
-        /// relaxation from subtree uniformity, which a validated blob has by
-        /// construction, so declaring it changes no verdict. (Its value is the
-        /// build-time sibling guarantee, pinned by L6.) And the relaxation is
+        /// relaxation from per-method subtree uniformity, which these complete
+        /// all-method fixtures provide. Declaring exclusivity changes no verdict.
+        /// Its value is the build-time exclusivity check, pinned by L6. The relaxation is
         /// class-bounded: boundary-shift bytes are scoped to their anchor,
         /// dot-segments to their climb radius — but NUL truncation is **never**
         /// relaxed on any allowed path.
@@ -1196,8 +1198,9 @@ mod tests {
             }
         }
 
-        /// L4: a dot-segment is denied under RejectAmbiguous regardless of placement —
-        /// opaque cannot reopen traversal.
+        /// L4: these generated paths can climb out of the `/files` rule and are
+        /// denied with or without exclusivity. Climbs confined to a uniform region
+        /// can be accepted; this property does not claim a blanket traversal denial.
         #[test]
         fn l4_dot_segment_inviolable(path in arb_dotty_path()) {
             let cfg = Cfg::structural();

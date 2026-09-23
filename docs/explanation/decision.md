@@ -148,7 +148,8 @@ and the permitted boundaries of exclusivity.
 
 When case-insensitive parsing is configured, the guard lowercases ASCII letters
 and compares the resulting rule with the raw path's rule. A change within one
-rule, such as `/files/ReadMe.TXT` to `/files/readme.txt`, is accepted.
+rule, such as `/files/ReadMe.TXT` to `/files/readme.txt`, passes this comparison;
+other checks can still deny the request.
 
 The percent-decoding check compares the raw rule against the result after one
 complete decode pass, and also after two passes under

@@ -169,11 +169,10 @@ impl Encodings {
 /// The result of structural analysis: the classes present, plus the two positional
 /// facts the scoped structural verdict anchors on.
 ///
-/// `classes` keeps [`classes_present`]'s contract (every single-byte class is always
-/// scanned; the caller gates by intersecting with the enabled set). `earliest` and
-/// `dot_pops` are **gated by `enabled`** instead: they exist to place the verdict's
-/// anchor, so an occurrence of a class the configuration does not treat as structure
-/// must not move it.
+/// `classes` keeps [`classes_present`]'s contract: recognized classes are recorded
+/// before the caller intersects with the enabled set. `earliest` only records enabled
+/// classes. `dot_pops` counts potential dot-segments using the enabled separators
+/// and parameter handling; dot-segment detection is mandatory in production.
 #[derive(Clone, Copy)]
 pub(crate) struct ScanResult {
     /// The classes present — identical to [`classes_present`].
@@ -184,7 +183,7 @@ pub(crate) struct ScanResult {
     /// **second** slash (a merge always keeps the first, so the first is stable).
     pub(crate) earliest: Option<usize>,
     /// Conservative count of dot-segment-capable segments (`k`): each segment whose
-    /// bare prefix is a literal `.`/`..`, or that carries any enabled encoded-dot
+    /// bare content before parameters is exactly `.`/`..`, or that carries an encoded-dot
     /// form anywhere (`%2E`, `%252E`, overlong, fullwidth), counts as one `..` — one
     /// level of climb. Overcounting only widens the verdict's anchor (denies more);
     /// an undercount would be a traversal bypass. Invariant: `dot_pops >= 1` iff
@@ -493,8 +492,9 @@ pub(crate) mod properties {
     /// This is the property [`check_total`]/[`check_monotone`] deliberately do **not** give:
     /// a scanner that returns `ClassSet::empty()` unconditionally passes both (it never
     /// panics, and `∅ ⊆ ∅` is monotone), yet detects nothing. For an authorization boundary
-    /// the floor must be *fail-closed* — so the drivers anchor this at the always-on trio
-    /// config, and [`check_monotone`] lifts it to every richer config (which detects ≥ as
+    /// the floor must be *fail-closed* — the drivers use the separator/dot/parameter
+    /// subset of the mandatory classes, and [`check_monotone`] lifts it to richer
+    /// configurations (which detect ≥ as
     /// much). Floor-detection ∘ monotonicity ⟹ every real config detects at least the core
     /// dot-segment forms.
     ///
@@ -1126,7 +1126,7 @@ mod tests {
         }
     }
 
-    /// Core dot-segment forms the always-on **trio** config detects with no encodings:
+    /// Core dot-segment forms the default configuration detects without opt-in encodings:
     /// literal, single-percent dot, and the param/separator-revealed forms. The driver
     /// sweeps the whole set against random neighbourhoods, so detection cannot depend on a
     /// particular adjacent byte.

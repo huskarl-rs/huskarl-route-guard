@@ -5,7 +5,7 @@
 //!
 //! - **Rule identity** — every pattern produced by one `route`/`subtree` call shares a
 //!   rule id, so the structural guard reasons at rule granularity (movement *within* a
-//!   subtree is not a relocation).
+//!   registration is not a relocation; nested registrations have distinct IDs).
 //! - **The structural verdict** — deny a request whose path could be routed differently
 //!   by a normalizing backend than the rule the raw path matched.
 //!
@@ -31,7 +31,8 @@ use crate::{
 };
 
 /// The outcome of matching a path: which rule applies, and whether it came from a
-/// registration or is the default rule (no registration covered the path and method).
+/// registration or is the default rule (no path matched, or the selected path has
+/// no rule for this method).
 ///
 /// The distinction is the route table's coverage made visible — an authorization
 /// layer typically logs *which* registration authorized a request, and treats a
@@ -73,7 +74,8 @@ impl<'a, R> RuleMatch<'a, R> {
         }
     }
 
-    /// Whether the default rule applied (no registration covers the path).
+    /// Whether the default rule applied because no path matched or the selected
+    /// path has neither this method nor an all-method rule.
     #[must_use]
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default { .. })
@@ -94,7 +96,7 @@ pub enum RuleRouterError {
     },
     /// A registered pattern is itself non-canonical — it carries a recognized structural form
     /// (`%2F`, `..`, `//`, `;`, or an enabled opt-in form) that the guard treats as
-    /// route structure, so a normalizing backend would never present it canonically.
+    /// route structure. Active guard modes forbid these forms in registered literals.
     NonCanonical {
         /// The offending pattern.
         pattern: String,
@@ -346,10 +348,9 @@ impl<R> RuleRouter<R> {
                 })?;
                 // Build-time canonical-pattern check: a registered pattern that itself
                 // carries a structural byte in a literal segment (or, under a
-                // case-folding backend, uppercase) is non-canonical — the backend would
-                // never present it as written. Parameter names are route metadata, not
-                // request-path bytes, so inspect the lowered literals rather than the
-                // source pattern.
+                // case-folding backend, uppercase) is non-canonical under the configured
+                // model. Parameter names are route metadata, not request-path bytes,
+                // so inspect the lowered literals rather than the source pattern.
                 if mode != GuardMode::Disabled {
                     let literals = lowered.segments.iter().filter_map(|segment| match segment {
                         Segment::Literal(literal) => Some(literal.as_str()),

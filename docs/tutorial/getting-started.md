@@ -33,8 +33,9 @@ let matched = router
 assert_eq!(*matched.rule(), "admin");
 ```
 
-`default("public")` is also a rule. Moving from an unmatched path to `/admin`, or
-from `/admin` to an unmatched path, crosses a rule boundary.
+The `"public"` default passed to `RuleRouter::builder` is also a rule. Moving from
+an unmatched path to `/admin`, or from `/admin` to an unmatched path, crosses a
+rule boundary.
 
 ## 2. Observe a parser disagreement
 

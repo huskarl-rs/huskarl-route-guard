@@ -14,7 +14,7 @@ operational procedure.*
 
 Every deny carries a [`ResolveError`](crate::ResolveError). Log its `Display` form —
 that is the attributed line naming the check and byte class; the response body
-(`message()`) is deliberately coarse and tells you nothing. Do not proceed on the
+(`message()`) identifies only a broad error category. Do not proceed on the
 response body alone.
 
 An `InvalidPathInput` attribution means the caller supplied a complete request-target,
@@ -34,7 +34,7 @@ triaging structural classes.
 | `DecodeRuleChange` | Percent-decoding the path lands on a *different* rule | Same shape: `/%61dmin` vs a registered `/admin`. Client fix, or rethink why two rules disagree about one resource. |
 | `NonCanonical(_)` / `NonCanonicalEscape` | The strict [`RequireCanonical`](crate::config::GuardMode::RequireCanonical) mode: presence-deny, table never consulted | Working as declared. If you serve opaque keys or encoded content, this deployment wants [`RejectAmbiguous`](crate::config::GuardMode::RejectAmbiguous) instead. |
 | `Probe(name)` | Your own [`StructuralProbe`](crate::config::StructuralProbe) matched | Your predicate, your call — scope it to the dangerous sequence if it over-fires. |
-| `TooLong` | A path already flagged as suspicious exceeds the length cap | Hostile or broken client; clean paths are never length-checked. |
+| `TooLong` | A path requiring checks exceeds 8,192 bytes; in `RejectAmbiguous`, even a malformed `%` triggers this limit | Check client input and request-size limits. This is not an overall path-length limit; paths requiring no checks bypass it. |
 
 Never respond to a `Structural(_)` denial by loosening a
 [`StructuralClasses`](crate::config::StructuralClasses) toggle or turning
@@ -114,7 +114,7 @@ participate in GET coverage. Adding a POST rule at the same subtree patterns als
 leaves GET coverage unchanged; adding a new, more-specific POST-only terminal does
 not.
 
-**Declare blobs when you want the guarantee.**
+**Declare exclusivity to prevent nested paths.**
 [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) behaves like `subtree` at
 runtime but rejects configurations with nested paths at build time. Use it to
 prevent a later nested registration from making encoded keys start failing.
@@ -122,8 +122,8 @@ It does not remove method restrictions.
 
 **Know what redesign cannot fix.** A recognized structural form in the *first* segment
 requires analysis from the root, where the whole table must select one rule for the request method
-— so on any real multi-rule table, `/%2fadmin`-style spellings deny regardless of
-shape. Earlier escapes or uppercase under case folding can also expand the
+— so `/%2fadmin`-style spellings deny when that region contains multiple
+identities for the request method. Earlier escapes or uppercase under case folding can also expand the
 analyzed region, but only as far as the earlier stable prefix requires; they do
 not always expand it to the root. When the region crosses a necessary policy
 boundary, keep the denial and ask the client to use an unambiguous spelling.
