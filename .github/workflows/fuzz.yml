@@ -1,6 +1,6 @@
 name: fuzz
 
-# Two layers, per the path-confusion fuzzing setup:
+# Regression, coverage-guided discovery, and scheduled mutation audits:
 #   - `regression` (push / PR): runs unit/CVE regressions, proptest properties, and
 #     the three bolero harnesses with generated inputs and any available live corpus.
 #     This job does not copy fuzz-corpus seeds; promote discovered bugs to explicit
@@ -41,10 +41,12 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: jdx/mise-action@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
         with:
           install: false
       # Runs Bolero under cargo test, proptest properties, and unit/CVE regressions.
@@ -67,11 +69,13 @@ jobs:
           - { id: matcher, target: "route_tree::tests::matcher_differential", time: 300 }
           - { id: guard, target: "path_confusion_proptest::guard_relocation", time: 600 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       # libFuzzer + AddressSanitizer require a nightly toolchain.
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - uses: jdx/mise-action@v4
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
         with:
           install: false
       - name: Install cargo-bolero
@@ -79,7 +83,7 @@ jobs:
       - name: Restore corpus
         # Run-id key (cache entries are immutable) + prefix restore-keys to pull the most
         # recent. Saved post-job even on failure, so a crash run still grows the corpus.
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: src/__fuzz__
           key: fuzz-corpus-${{ matrix.id }}-${{ github.run_id }}
@@ -88,16 +92,55 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         # scripts/fuzz.sh primes the live corpus from the committed seeds (so the run starts
         # warm even when the cache is cold) on top of whatever the cache restored, then runs.
-        run: >
-          mise run fuzz '${{ matrix.target }}'
-          -T ${{ github.event.inputs.duration || matrix.time }}s
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_DURATION: ${{ github.event.inputs.duration || matrix.time }}
+        run: mise run fuzz "$FUZZ_TARGET" -T "${FUZZ_DURATION}s"
       - name: Upload crash reproducer
         # Only on failure — i.e. the fuzzer found a crash. The corpus is gitignored and
         # dies with the runner, so this is the only way to get the reproducing input.
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-crash-${{ matrix.id }}
           path: src/__fuzz__/**/crashes/**
           if-no-files-found: warn
           retention-days: 90
+
+  mutation-full:
+    name: mutation (full audit)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Changes each scheduled run; reruns keep the same seed for reproduction.
+      PROPTEST_RNG_SEED: ${{ github.run_id }}
+      PROPTEST_CASES: "2048"
+      MUTATION_OUTPUT: target/mutation-audit/full-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: false
+      - name: Install pinned cargo-mutants
+        run: mise install cargo:cargo-mutants
+      - name: Audit guard and scanner mutations
+        # Known survivors and detected hangs make cargo-mutants exit nonzero.
+        # Validate completion below; retain all outcomes for review, without an
+        # exclusion list that could hide changes to a previously explained mutant.
+        continue-on-error: true
+        run: mise run mutation
+      - name: Validate and summarize the completed audit
+        run: python3 scripts/check-mutation-outcomes.py full "$MUTATION_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save mutation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutation-full-${{ github.run_id }}
+          path: ${{ env.MUTATION_OUTPUT }}/
+          if-no-files-found: warn
+          retention-days: 30

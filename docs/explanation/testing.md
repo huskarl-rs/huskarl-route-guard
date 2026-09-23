@@ -75,27 +75,56 @@ requires separate evidence and remains outside the guarantee.
 `guard_denies_every_modeled_relocation`. This checks that its assertion detects
 broken enforcement independently of other tests. `mise run mutation` audits all
 mutants generated in `guard.rs` and `structural.rs` against the unit and integration
-suite. Both use the pinned cargo-mutants version and a fixed proptest seed; ordinary
-Bolero smoke tests in the full suite remain randomized.
+suite. Both use the pinned cargo-mutants version; ordinary Bolero smoke tests in
+the full suite remain randomized.
 
-These are on-demand audits. Survivors produce a nonzero exit status and require
-triage: a mutation can be equivalent, affect only diagnostics, or make the guard
-more conservative. Soundness alone cannot reject an always-deny implementation.
+PR CI runs the four property controls with seed `20260923` and 2,048 cases. It
+requires exactly four caught mutants, a passing baseline, and a `BYPASS` witness
+from the flagship assertion for each mutation. Missing controls, compilation
+failures, unrelated panics, and timeouts cannot satisfy that gate.
+
+The full audit runs alongside scheduled/manual fuzz discovery, with
+`github.run_id` as its proptest seed. Each nightly run explores a different seed;
+reruns retain it. It is a reporting job: known survivors and detected hangs make
+cargo-mutants exit nonzero, so CI validates that the entire campaign completed and
+publishes the outcome lists in the job summary. It does not impose a zero-survivor
+threshold or hide explained mutations. Both jobs upload logs, diffs, outcomes, and
+seed metadata even on failure, retaining artifacts for 30 days.
+
+The tasks remain available locally. Survivors require triage: a mutation can be
+equivalent, affect only diagnostics, or make the guard more conservative.
+Soundness alone cannot reject an always-deny implementation. Timeouts are reported
+separately from survivors: in the scanner, mutating `i += width` to `i *= width`
+leaves its zero cursor stationary, and the timeout detects that hang.
 Raw diffs and outcomes are disposable artifacts under `target/mutation-audit/`.
-A second property seed is supported through `PROPTEST_RNG_SEED`;
-`MUTATION_OUTPUT` preserves separate runs.
+`PROPTEST_RNG_SEED` selects a seed, `PROPTEST_CASES` overrides the default 2,048
+cases in the guard properties, and `MUTATION_OUTPUT` preserves separate runs.
+
+For the short-structural-path experiment, select the inner length comparison,
+not the initial oversized-percent-path rejection. Inspect `cargo mutants --list`
+for its current coordinates, then run (coordinates below match the experiment):
+
+```sh
+PROPTEST_CASES=100000 PROPTEST_RNG_SEED=20260923 PROPTEST_MAX_SHRINK_ITERS=0 \
+  cargo mutants --file src/guard.rs \
+  --re 'src/guard.rs:270:32: replace > with <' \
+  --timeout 600 --build-timeout 120 \
+  --output target/mutation-audit/short-structural-20260923 \
+  -- --locked --lib path_confusion_proptest::guard_denies_every_modeled_relocation -- --exact
+```
 
 ### Known survivor rationale
 
-The September 2026 audit left six explained survivors after adding tests for
-inclusive analysis budgets, structural explanations at the budget, and overlapping
-set unions. These are triage notes, not permanent mutation exclusions:
+A fresh full run on September 23, 2026, after adding the boundary and set-union
+tests, tested 167 mutants with seed `20260923`: 143 were caught by tests,
+six survived, seventeen did not compile, and one scanner hang was detected by
+timeout. These are triage notes, not permanent mutation exclusions:
 
 | Mutation | Rationale |
 | --- | --- |
 | `interpretations_deny` early-return condition: `||` → `&&` | Changes which precise checks are skipped; the final structural denial still applies. |
 | Same condition's length comparison: `>` → `==` | Verdict-redundant under the check ordering described below. |
-| Same length comparison: `>` → `<` | Same ordering rationale. |
+| Same length comparison: `>` → `<` | Skips precise comparisons for short structural paths. Two 100,000-case trials found no relocation; see the [content-prefix argument](crate::_docs::explanation::decision#when-uniform-coverage-subsumes-precise-comparisons). |
 | Same length comparison: `>` → `>=` | Same ordering rationale. |
 | `ClassSet::SEPARATOR`: `1 << 0` → `1 >> 0` | Equivalent: both expressions are one. |
 | Internal `ClassSet::fmt`: return `Ok(())` without output | Untested diagnostic formatting, not equivalent behavior or an enforcement check. No exact debug-format contract is required. |

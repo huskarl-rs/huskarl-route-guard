@@ -121,6 +121,41 @@ same view, preserving fallback semantics without copying rule values. This trade
 additional tree storage for a simple request-time lookup; storage scales with the
 number of nodes times the number of distinct registered methods.
 
+## When uniform coverage subsumes precise comparisons
+
+For a request with an enabled structural hit, passing the uniform-anchor check
+also establishes agreement for whole-path percent decoding and configured ASCII
+case folding. This narrower implication follows from how those two operations act:
+
+1. The anchor ends before the first `%`, and before the first uppercase ASCII byte
+   when case folding is enabled. Its bytes contain neither input that these
+   operations can change. Raising the anchor for traversal only shortens it.
+2. Each permitted decode pass therefore preserves the anchor byte-for-byte. A
+   second pass cannot change that: the prefix has no escape from which the first
+   pass could produce a new `%`. ASCII folding likewise preserves the prefix.
+   This remains true when bytes after the prefix decode to invalid UTF-8.
+3. Uniform coverage requires every byte path extending that anchor to select the
+   original identity for the same method. Every precise interpretation is such an
+   extension, so none can select a different identity.
+
+This relies on the matcher's coverage contract and the content bound on the anchor.
+It does not infer correctness from a silent mutation run, nor require that decoding
+perform dot-segment resolution or other structural normalization. Those transforms
+still require the separate anchor-invariance argument. The implication does **not**
+apply to the structural check's early acceptance of a path with no enabled
+structural hit: `/%61dmin`, for example, still needs precise rule comparison.
+
+A September 2026 mutation experiment changed the **inner** length comparison in
+`interpretations_deny` from `>` to `<`. This skips precise comparisons on short
+paths once scanning has accumulated an enabled structural hit; it leaves scanning,
+NUL denial, and the final uniform-anchor check intact. The flagship soundness
+property found no relocation in 100,000 generated cases with seed `20260923`, nor
+in another 100,000 with seed `20260924`. Each mutated run followed a passing
+unmutated baseline at the same case count. These counts include generated cases
+that skip invalid route tables or deny requests; they are not 200,000 accepted
+structural paths. This is bounded experimental support for the argument above,
+not a proof over all inputs or a reason to remove the production comparisons.
+
 ## Why exclusivity is checked across overlapping patterns
 
 An ordinary subtree allows exceptions. Adding `/files/private` beneath a `/files`

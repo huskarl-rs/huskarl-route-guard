@@ -873,8 +873,16 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
 
 // ── Properties ──────────────────────────────────────────────────────────────
 
+fn guard_proptest_config() -> ProptestConfig {
+    let mut config = ProptestConfig::default();
+    if std::env::var_os("PROPTEST_CASES").is_none() {
+        config.cases = 2048;
+    }
+    config
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+    #![proptest_config(guard_proptest_config())]
 
     /// Soundness: if the guard *allows* a path, no modeled backend may relocate
     /// it to a different rule.
