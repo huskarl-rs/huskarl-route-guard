@@ -250,6 +250,7 @@ pub struct RuleRouter<R> {
     rules: Vec<R>,
     default: R,
     guard: PathConfusionGuard,
+    diagnostic_patterns: Vec<crate::diagnostics::DiagnosticPattern>,
 }
 
 impl<R> std::fmt::Debug for RuleRouter<R> {
@@ -377,13 +378,41 @@ impl<R> RuleRouter<R> {
         }
 
         let router = Router::build(&tree_entries).map_err(|e| map_build_err(e, &patterns))?;
+        let diagnostic_patterns = tree_entries
+            .into_iter()
+            .zip(patterns)
+            .map(
+                |((parsed, id, _, methods), source)| crate::diagnostics::DiagnosticPattern {
+                    parsed,
+                    source,
+                    id,
+                    methods,
+                },
+            )
+            .collect();
         let guard = PathConfusionGuard::new(router, config);
 
         Ok(Self {
             rules,
             default,
             guard,
+            diagnostic_patterns,
         })
+    }
+
+    /// Reports method gaps that hide a less-specific path's rule.
+    ///
+    /// This opt-in lint does not affect construction or request handling. It checks
+    /// standard HTTP methods and explicitly registered extension methods against
+    /// representative paths at pairwise pattern overlaps. Every report includes a
+    /// concrete witness; an empty result is not proof that no gaps exist.
+    ///
+    /// Patterns are retained for this analysis. Calling this method allocates and
+    /// examines pattern pairs; use it during startup, not for each request.
+    /// Results follow registration order and do not depend on guard mode.
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<crate::MethodGapDiagnostic> {
+        crate::diagnostics::method_gaps(&self.diagnostic_patterns, &self.guard)
     }
 
     /// Resolves `path` in one call: the path-confusion verdict first, then the rule
@@ -423,10 +452,8 @@ impl<R> RuleRouter<R> {
         if !is_request_path(path) {
             return Err(ResolveError::InvalidPathInput);
         }
-        match self.guard.verdict(path, method) {
-            Some(reason) => Err(reason),
-            None => self.matched_rule(path, method),
-        }
+        let id = self.guard.checked(path, method)?;
+        self.rule_for_id(id)
     }
 
     /// Inspects raw path matching for diagnostics, without checking ambiguity.
@@ -443,27 +470,58 @@ impl<R> RuleRouter<R> {
         &self,
         path: &str,
         method: &http::Method,
-    ) -> Result<RuleMatch<'_, R>, ResolveError> {
+    ) -> Result<crate::RawMatch, ResolveError> {
         if !is_request_path(path) {
             return Err(ResolveError::InvalidPathInput);
         }
-        self.matched_rule(path, method)
+        let matched = self.rule_for_id(self.guard.resolve(path, method))?;
+        Ok(matched
+            .id()
+            .map_or(crate::RawMatch::Default, |id| crate::RawMatch::Matched {
+                id,
+            }))
+    }
+
+    /// Explains guard checks without returning an authorization rule.
+    ///
+    /// Scoped structural denials include their anchor and the rule identities
+    /// contributing to its conservative coverage. Other denials carry their usual
+    /// reason. This runs checks (including custom probes) once and allocates extra
+    /// diagnostic data; use [`resolve`](Self::resolve) for request handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns input-validation or internal rule-ID errors. Ordinary guard denials
+    /// appear in [`ResolutionExplanation::denial`](crate::ResolutionExplanation::denial).
+    pub fn explain(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Result<crate::ResolutionExplanation, ResolveError> {
+        let raw_match = self.inspect_raw(path, method)?;
+        let denial = self.guard.checked(path, method).err();
+        let structural = if matches!(denial, Some(ResolveError::Structural(_))) {
+            self.guard.structural_explanation(path, method)
+        } else {
+            None
+        };
+        Ok(crate::ResolutionExplanation {
+            raw_match,
+            denial,
+            structural,
+        })
     }
 
     // The reference backend needs to route transformed inputs even when they are
     // outside the public request-path boundary.
     #[cfg(test)]
     pub(crate) fn raw_match_for_test(&self, path: &str, method: &http::Method) -> RuleMatch<'_, R> {
-        self.matched_rule(path, method)
+        self.rule_for_id(self.guard.resolve(path, method))
             .expect("valid test rule table")
     }
 
-    fn matched_rule(
-        &self,
-        path: &str,
-        method: &http::Method,
-    ) -> Result<RuleMatch<'_, R>, ResolveError> {
-        match self.guard.resolve(path, method) {
+    fn rule_for_id(&self, id: Option<u32>) -> Result<RuleMatch<'_, R>, ResolveError> {
+        match id {
             Some(id) => self
                 .rules
                 .get(id as usize)

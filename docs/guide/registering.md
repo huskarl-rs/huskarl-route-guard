@@ -48,6 +48,54 @@ rule there, register it explicitly at `/items/special`, or add an all-method
 `route` at that exact path. See [Routing behavior](crate::_docs::reference::routing)
 for the executable example and precedence rules.
 
+### Inspect method gaps at startup
+
+Call [`diagnostics()`](crate::RuleRouter::diagnostics) after construction to find
+method gaps that hide a less-specific rule. Construction still succeeds, and the
+lint does not change routing. Applications can log the structured reports or treat
+them as configuration errors:
+
+```rust
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+
+let router = RuleRouter::builder("default",
+    GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .subtree("/files", "files")
+    .register(Registration::route("/files/special", "write").for_methods(http::Method::POST))
+    .build().expect("valid routes");
+let diagnostics = router.diagnostics();
+assert_eq!(diagnostics[0].example_path, "/files/special");
+assert!(diagnostics[0].methods.contains(&http::Method::GET));
+assert_eq!(diagnostics[0].shadowed_registration, 0);
+for diagnostic in diagnostics {
+    eprintln!("{diagnostic}");
+}
+```
+
+The lint checks standard HTTP methods and explicitly registered extension methods
+at representative pairwise pattern overlaps. Each report has a concrete raw-routing
+witness; this is not an exhaustive analysis of all paths or extension methods.
+An empty list does not prove there are no gaps. Analysis runs only when called and
+examines pattern pairs; the router retains pattern metadata for this purpose.
+
+Adding a same-path all-method rule repairs the default gap. To also preserve the
+surrounding rule's identity for GET encoded keys, include that path in the existing
+registration instead of creating a separate rule:
+
+```rust
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter, subtree_patterns};
+
+let patterns = subtree_patterns("/files").into_iter()
+    .chain(["/files/special".to_owned()]);
+let router = RuleRouter::builder("default",
+    GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .register(Registration::patterns(patterns, "files"))
+    .register(Registration::route("/files/special", "write").for_methods(http::Method::POST))
+    .build().expect("valid routes");
+assert!(router.diagnostics().is_empty());
+assert!(router.resolve("/files/hello%2fworld", &http::Method::GET).is_ok());
+```
+
 ## Register areas that accept encoded keys
 
 If one rule applies to an entire file-key prefix for the methods it serves, use

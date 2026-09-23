@@ -94,6 +94,7 @@
 
 pub mod _docs;
 pub mod config;
+mod diagnostics;
 mod guard;
 #[cfg(test)]
 mod path_confusion_proptest;
@@ -105,6 +106,9 @@ mod structural;
 pub use config::{
     CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, StructuralChar,
     StructuralClass, StructuralClasses, StructuralProbe,
+};
+pub use diagnostics::{
+    MethodGapDiagnostic, RawMatch, ResolutionExplanation, StructuralExplanation,
 };
 pub use path_router::{Registration, RuleMatch, RuleRouter, RuleRouterBuilder, RuleRouterError};
 pub use route_tree::MethodMatch;

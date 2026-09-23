@@ -44,6 +44,36 @@ is no longer checked (see
 route-table fix below makes an existing single-rule area visible to the guard rather
 than switching a check off.
 
+### Inspect the structural region
+
+[`inspect_raw`](crate::RuleRouter::inspect_raw) returns only a [`RawMatch`](crate::RawMatch)
+identity, with no policy reference. For more detail, call
+[`explain`](crate::RuleRouter::explain). Its `denial` field uses the same check order
+as `resolve`. A scoped structural denial also includes the stable anchor, the
+registration IDs contributing to its coverage, and whether the default contributes.
+These are conservative coverage results, not proof of particular backend rewrites.
+
+```rust
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
+
+let router = RuleRouter::builder("default",
+    GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .subtree("/files", "files")
+    .route("/files/private", "private")
+    .build().expect("valid routes");
+let explanation = router.explain("/files/a%2fb", &http::Method::GET).unwrap();
+assert!(explanation.denial.is_some());
+let region = explanation.structural.unwrap();
+assert_eq!(region.anchor, "/files/");
+assert_eq!(region.registrations, [0, 1]);
+assert!(!region.includes_default);
+```
+
+Unconditional NUL denials, strict-mode denials, and case/decode checks have no
+structural anchor. Explanation reruns configured checks, including custom probes,
+and may traverse the region to collect details. Keep request handling on `resolve`;
+use these APIs for diagnostics. Neither diagnostic API returns an authorization rule.
+
 ## 3. Can the routes be redesigned to handle it?
 
 For a structural denial, check whether the affected area should select one rule

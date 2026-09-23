@@ -9,6 +9,166 @@ fn config() -> GuardConfig {
 }
 
 #[test]
+fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
+    let router = RuleRouter::builder("default", config())
+        .subtree("/files", "files")
+        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .build()
+        .unwrap();
+    let diagnostics = router.diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    let gap = &diagnostics[0];
+    assert_eq!(gap.pattern, "/files/special");
+    assert_eq!(gap.example_path, "/files/special");
+    assert_eq!(gap.shadowed_registration, 0);
+    assert!(gap.methods.contains(&Method::GET));
+    assert!(!gap.methods.contains(&Method::POST));
+    for method in &gap.methods {
+        assert!(
+            router
+                .resolve(&gap.example_path, method)
+                .unwrap()
+                .is_default()
+        );
+    }
+    assert!(gap.to_string().contains("encoded paths"));
+    assert!(
+        router
+            .resolve("/files/hello%2fworld", &Method::GET)
+            .is_err()
+    );
+    assert_eq!(router.diagnostics(), diagnostics);
+}
+
+#[test]
+fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
+    let patterns = huskarl_route_guard::subtree_patterns("/files")
+        .into_iter()
+        .chain(["/files/special".to_owned()]);
+    let repaired = RuleRouter::builder("default", config())
+        .register(Registration::patterns(patterns, "files"))
+        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .build()
+        .unwrap();
+    assert!(repaired.diagnostics().is_empty());
+    assert!(
+        repaired
+            .resolve("/files/hello%2fworld", &Method::GET)
+            .is_ok()
+    );
+
+    let get_only = RuleRouter::builder("default", config())
+        .register(Registration::subtree("/files", "files").for_methods(Method::GET))
+        .build()
+        .unwrap();
+    assert!(get_only.diagnostics().is_empty());
+    assert!(
+        get_only
+            .resolve("/files/hello%2fworld", &Method::GET)
+            .is_ok()
+    );
+}
+
+#[test]
+fn method_gap_diagnostics_follow_overlapping_branches_and_extension_methods() {
+    let custom = Method::from_bytes(b"PURGE").unwrap();
+    let registrations = [
+        Registration::route("/{tenant}/special", "fallback").for_methods(custom.clone()),
+        Registration::route("/files/{name}", "post").for_methods(Method::POST),
+        Registration::route("/files/{other}", "get").for_methods(Method::GET),
+    ];
+    for mode in [GuardMode::RejectAmbiguous, GuardMode::Disabled] {
+        let router = RuleRouter::from_registrations(
+            "default",
+            config().with_mode(mode),
+            registrations.clone(),
+        )
+        .unwrap();
+        let gaps = router.diagnostics();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].pattern, "/files/{name}");
+        assert_eq!(gaps[0].example_path, "/files/special");
+        assert_eq!(gaps[0].methods, std::slice::from_ref(&custom));
+        assert_eq!(gaps[0].shadowed_registration, 0);
+    }
+}
+
+#[test]
+fn method_gap_diagnostics_ignore_unrelated_and_fully_shadowed_patterns() {
+    let router = RuleRouter::builder("default", config())
+        .route("/{tenant}/special", "fallback")
+        .register(Registration::route("/files/{name}", "post").for_methods(Method::POST))
+        .route("/files/special", "override")
+        .register(Registration::route("/unrelated", "post").for_methods(Method::POST))
+        .build()
+        .unwrap();
+    assert!(router.diagnostics().is_empty());
+}
+
+#[test]
+fn raw_inspection_exposes_only_identity_and_explanations_attribute_method_gaps() {
+    let router = RuleRouter::builder("default", config())
+        .subtree("/files", "files")
+        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .build()
+        .unwrap();
+    let path = "/files/hello%2fworld";
+    assert_eq!(
+        router.inspect_raw(path, &Method::GET).unwrap(),
+        huskarl_route_guard::RawMatch::Matched { id: 0 }
+    );
+    let explanation = router.explain(path, &Method::GET).unwrap();
+    assert_eq!(explanation.denial, router.resolve(path, &Method::GET).err());
+    assert_eq!(explanation.raw_match.id(), Some(0));
+    let structural = explanation.structural.unwrap();
+    assert_eq!(structural.anchor, "/files/");
+    assert_eq!(structural.registrations, [0]);
+    assert!(structural.includes_default);
+
+    let post = router
+        .explain(path, &Method::POST)
+        .unwrap()
+        .structural
+        .unwrap();
+    assert_eq!(post.registrations, [0, 1]);
+    assert!(!post.includes_default);
+}
+
+#[test]
+fn explanations_preserve_denial_order_and_omit_inapplicable_anchors() {
+    for mode in [
+        GuardMode::RejectAmbiguous,
+        GuardMode::RequireCanonical,
+        GuardMode::Disabled,
+    ] {
+        let router = RuleRouter::builder("default", config().with_mode(mode))
+            .subtree("/files", "files")
+            .route("/admin", "admin")
+            .build()
+            .unwrap();
+        for path in ["/files/key", "/files/a%2fb", "/files/%00", "/%61dmin"] {
+            let explanation = router.explain(path, &Method::GET).unwrap();
+            assert_eq!(explanation.denial, router.resolve(path, &Method::GET).err());
+            assert!(explanation.structural.is_none(), "{mode:?}: {path}");
+        }
+        assert_eq!(
+            router.explain("/files?query", &Method::GET),
+            Err(ResolveError::InvalidPathInput)
+        );
+    }
+    let router = RuleRouter::builder(
+        "default",
+        GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
+    )
+    .route("/admin", "admin")
+    .build()
+    .unwrap();
+    let explanation = router.explain("/ADMIN", &Method::GET).unwrap();
+    assert_eq!(explanation.denial, Some(ResolveError::CaseFoldRuleChange));
+    assert!(explanation.structural.is_none());
+}
+
+#[test]
 fn grouped_patterns_share_identity_but_equal_values_do_not() {
     let grouped = RuleRouter::builder("default", config())
         .register(Registration::patterns(["/a", "/%61"], "same-value"))

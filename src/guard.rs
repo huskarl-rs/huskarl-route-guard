@@ -1,6 +1,6 @@
 //! Path-confusion checks over the route tree's coverage summaries.
 
-use std::sync::Arc;
+use std::{cell::LazyCell, sync::Arc};
 
 use crate::{
     config::{GuardConfig, GuardMode, ResolveError, StructuralProbe},
@@ -55,6 +55,28 @@ pub(crate) struct PathConfusionGuard {
 }
 
 impl PathConfusionGuard {
+    pub(crate) fn structural_explanation(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Option<crate::StructuralExplanation> {
+        let anchor = self.structural_anchor(path)?;
+        let mut registrations = self.router.anchor_identities(anchor, method);
+        let includes_default = registrations.last() == Some(&DEFAULT_RULE);
+        if includes_default {
+            registrations.pop();
+        }
+        Some(crate::StructuralExplanation {
+            anchor: anchor.to_owned(),
+            registrations,
+            includes_default,
+        })
+    }
+
+    pub(crate) fn method_gap(&self, path: &str, method: &http::Method) -> Option<RuleId> {
+        self.router.method_gap(path, method)
+    }
+
     /// Build a guard over `router` for the given mode and structural configuration.
     pub(crate) fn new(router: Router, config: GuardConfig) -> Self {
         let GuardConfig {
@@ -77,16 +99,21 @@ impl PathConfusionGuard {
         }
     }
 
-    /// The deny reason for `path`, or `None` to allow — the attributed core used by
-    /// the router. [`ResolveError::message`] gives the static response-body string;
-    /// its `Display` gives the attributed log line.
-    pub(crate) fn verdict(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
-        match self.mode {
+    /// Check interpretations and return the raw identity they agree with. Matching
+    /// is lazy so unconditional denials do not need to traverse the route tree.
+    pub(crate) fn checked(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Result<Option<RuleId>, ResolveError> {
+        let raw = LazyCell::new(|| self.router.resolve(path, method));
+        let raw_rule = || *raw;
+        let denial = match self.mode {
             GuardMode::Disabled => None,
             GuardMode::RejectAmbiguous => self
-                .positional_deny(path, method)
-                .or_else(|| self.case_fold_deny(path, method))
-                .or_else(|| self.content_decode_deny(path, method))
+                .positional_deny(path, method, &raw_rule)
+                .or_else(|| self.case_fold_deny(path, method, &raw_rule))
+                .or_else(|| self.content_decode_deny(path, method, &raw_rule))
                 .or_else(|| self.custom_probe_deny(path)),
             // Strict: every position live (opaque ignored) and any percent-escape is
             // itself non-canonical.
@@ -94,6 +121,10 @@ impl PathConfusionGuard {
                 .noncanonical_deny(path)
                 .or_else(|| escape_present(path).then_some(ResolveError::NonCanonicalEscape))
                 .or_else(|| self.custom_probe_deny(path)),
+        };
+        match denial {
+            Some(reason) => Err(reason),
+            None => Ok(*raw),
         }
     }
 
@@ -110,10 +141,10 @@ impl PathConfusionGuard {
     }
 
     /// Whether `path` must be denied for GET. Test-only convenience for method-agnostic
-    /// route tables; production calls `verdict` with the request's actual method.
+    /// route tables; production calls `checked` with the request's actual method.
     #[cfg(test)]
     pub(crate) fn ambiguous(&self, path: &str) -> bool {
-        self.verdict(path, &http::Method::GET).is_some()
+        self.checked(path, &http::Method::GET).is_err()
     }
 
     /// The method-resolved rule id — for the router's unchecked match operation.
@@ -137,7 +168,12 @@ impl PathConfusionGuard {
     /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
     /// [`case_fold_deny`](Self::case_fold_deny) instead, so an uppercase byte alone
     /// never denies positionally (only an actual fold relocation does).
-    fn positional_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
+    fn positional_deny(
+        &self,
+        path: &str,
+        method: &http::Method,
+        raw_rule: &impl Fn() -> Option<RuleId>,
+    ) -> Option<ResolveError> {
         let enabled = self.enabled.without(ClassSet::CASE);
         let scan = scan(path, enabled, self.enc);
         let present = scan.classes.intersect(enabled);
@@ -156,7 +192,7 @@ impl PathConfusionGuard {
             return Some(ResolveError::Structural(primary_class(present)));
         };
         let anchor = self.anchor_for(path, &scan, offset);
-        let matched = self.router.resolve(path, method).unwrap_or(DEFAULT_RULE);
+        let matched = raw_rule().unwrap_or(DEFAULT_RULE);
         if self.router.anchor_cover(anchor, method) == Cover::Uniform(matched) {
             None
         } else {
@@ -201,7 +237,7 @@ impl PathConfusionGuard {
 
     /// The anchor [`positional_deny`](Self::positional_deny) would reason over for
     /// `path`, or `None` where it never reaches the anchor check — a clean path, an
-    /// over-length one, or an unconditional truncation deny. Test-only window onto
+    /// over-length one, or an unconditional truncation deny. Diagnostic window onto
     /// [`anchor_for`](Self::anchor_for), so the premise above can be asserted against
     /// the reference backend rather than trusted.
     ///
@@ -209,7 +245,6 @@ impl PathConfusionGuard {
     /// *computation* is shared, so only the reachability guard is restated); a mirror
     /// that drifted would make this return `Some` where production denies outright,
     /// which costs a stricter test, never a weaker one.
-    #[cfg(test)]
     pub(crate) fn structural_anchor<'p>(&self, path: &'p str) -> Option<&'p str> {
         let enabled = self.enabled.without(ClassSet::CASE);
         let scan = scan(path, enabled, self.enc);
@@ -235,7 +270,12 @@ impl PathConfusionGuard {
     /// percent-decoding is covered by [`content_decode_deny`](Self::content_decode_deny),
     /// which folds the decoded path before re-routing. Only ASCII case is modeled,
     /// mirroring [`CaseSensitivity`].
-    fn case_fold_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
+    fn case_fold_deny(
+        &self,
+        path: &str,
+        method: &http::Method,
+        raw_rule: &impl Fn() -> Option<RuleId>,
+    ) -> Option<ResolveError> {
         if !self.case_insensitive || !path.bytes().any(|b| b.is_ascii_uppercase()) {
             return None;
         }
@@ -243,7 +283,7 @@ impl PathConfusionGuard {
             return Some(ResolveError::TooLong);
         }
         let folded = path.to_ascii_lowercase();
-        (self.router.resolve(&folded, method) != self.router.resolve(path, method))
+        (self.router.resolve(&folded, method) != raw_rule())
             .then_some(ResolveError::CaseFoldRuleChange)
     }
 
@@ -265,7 +305,12 @@ impl PathConfusionGuard {
     /// **relocates** the path to a different rule than the raw path matched. Precise —
     /// results that all land on the same rule (`/foo%20bar`) are allowed, so opaque
     /// content flows.
-    fn content_decode_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
+    fn content_decode_deny(
+        &self,
+        path: &str,
+        method: &http::Method,
+        raw_rule: &impl Fn() -> Option<RuleId>,
+    ) -> Option<ResolveError> {
         if !path.contains('%') {
             return None;
         }
@@ -274,7 +319,7 @@ impl PathConfusionGuard {
         }
         let passes = if self.enc.double_decode { 2 } else { 1 };
         let raw = path.as_bytes();
-        let raw_rule = self.router.resolve_bytes(raw, method);
+        let raw_rule = raw_rule();
         let mut decoded = raw.to_vec();
         for _ in 0..passes {
             decoded = percent_decode_once(&decoded);

@@ -470,6 +470,37 @@ pub(crate) struct Router {
 }
 
 impl Router {
+    /// Expand the same conservative coverage used by `anchor_cover` for diagnostics.
+    pub(crate) fn anchor_identities(&self, anchor: &str, method: &http::Method) -> Vec<RuleId> {
+        let segments: Vec<_> = anchor.split('/').filter(|s| !s.is_empty()).collect();
+        let mut ids = Vec::new();
+        let complete = if let Some((first, rest)) = segments.split_first() {
+            walk_identities(&self.root, first, rest, method, &mut ids)
+        } else {
+            collect_identities(&self.root, method, true, &mut ids);
+            !self.root.leaf.is_empty() && !self.root.catchall.is_empty()
+        };
+        if !complete {
+            ids.push(DEFAULT_RULE);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Find a method gap and the rule hidden by the claimed path terminal.
+    pub(crate) fn method_gap(&self, path: &str, method: &http::Method) -> Option<RuleId> {
+        let body = path.as_bytes().strip_prefix(b"/")?;
+        if body.is_empty() {
+            return None;
+        }
+        let claimed = route(&self.root, body)?;
+        if claimed.get(method).is_some() {
+            return None;
+        }
+        route_skipping(&self.root, body, Some(claimed))?.get(method)
+    }
+
     /// Build a router from `(pattern, rule_id, opaque)` entries.
     ///
     /// `opaque` declares a pattern's trailing catch-all an opaque blob — a build-time
@@ -673,6 +704,51 @@ fn walk_cover(
     )
 }
 
+/// Expand cached summaries only on the optional explanation path. This follows
+/// `summarize` and `walk_cover`, including their conservative completeness rules.
+fn collect_identities(node: &Node, method: &http::Method, leaf: bool, ids: &mut Vec<RuleId>) {
+    let slots = [&node.leaf_slash, &node.catchall];
+    for slot in slots.into_iter().chain(leaf.then_some(&node.leaf)) {
+        if !slot.is_empty() {
+            ids.push(slot.get(method).unwrap_or(DEFAULT_RULE));
+        }
+    }
+    for child in node.literals.values().chain(node.wildcard.as_deref()) {
+        collect_identities(child, method, true, ids);
+    }
+}
+
+fn walk_identities(
+    node: &Node,
+    segment: &str,
+    rest: &[&str],
+    method: &http::Method,
+    ids: &mut Vec<RuleId>,
+) -> bool {
+    for child in node
+        .literals
+        .get(segment)
+        .into_iter()
+        .chain(node.wildcard.as_deref())
+    {
+        let complete = if let Some((next, tail)) = rest.split_first() {
+            walk_identities(child, next, tail, method, ids)
+        } else {
+            collect_identities(child, method, false, ids);
+            !child.catchall.is_empty() && !child.leaf_slash.is_empty()
+        };
+        if complete {
+            return true;
+        }
+    }
+    if node.catchall.is_empty() {
+        false
+    } else {
+        ids.push(node.catchall.get(method).unwrap_or(DEFAULT_RULE));
+        true
+    }
+}
+
 /// Recursive insert. `matchit`-style catch-all is always the final segment (guaranteed
 /// by `parse_pattern` / `lower_matchit`), so its `rest` is empty.
 fn insert(
@@ -777,6 +853,15 @@ fn overrides_tail(prefix: &[Segment], mut candidate: &[Segment]) -> bool {
 /// backtracking. Precedence is literal > wildcard > catch-all, **with backtracking**: a
 /// higher-priority branch that dead-ends falls through to the next.
 fn route<'a>(node: &'a Node, s: &[u8]) -> Option<&'a MethodSlot> {
+    route_skipping(node, s, None)
+}
+
+/// Diagnostic matching can ignore one terminal to expose its path fallback.
+fn route_skipping<'a>(
+    node: &'a Node,
+    s: &[u8],
+    ignored: Option<&MethodSlot>,
+) -> Option<&'a MethodSlot> {
     let (seg, after) = match s.iter().position(|&b| b == b'/') {
         // `i` came from `position`, so both slices exist; the `get` form keeps a bad
         // offset from panicking, degrading to "one whole segment" instead.
@@ -788,44 +873,79 @@ fn route<'a>(node: &'a Node, s: &[u8]) -> Option<&'a MethodSlot> {
     //    equal a registered literal (patterns arrive as `&str`), so it simply has no
     //    literal child and falls through — exactly how a byte-routing backend behaves.
     if let Some(child) = str::from_utf8(seg).ok().and_then(|t| node.literals.get(t))
-        && let Some(slot) = descend(child, after)
+        && let Some(slot) = descend(child, after, ignored)
     {
         return Some(slot);
     }
     // 2. single-segment wildcard — requires a non-empty segment.
     if !seg.is_empty()
         && let Some(child) = node.wildcard.as_deref()
-        && let Some(slot) = descend(child, after)
+        && let Some(slot) = descend(child, after, ignored)
     {
         return Some(slot);
     }
     // 3. catch-all — lowest priority; consumes the whole raw remainder `s` (>= 1 char).
-    (!node.catchall.is_empty()).then_some(&node.catchall)
+    available(&node.catchall, ignored)
+}
+
+fn available<'a>(slot: &'a MethodSlot, ignored: Option<&MethodSlot>) -> Option<&'a MethodSlot> {
+    (!slot.is_empty() && !ignored.is_some_and(|other| std::ptr::eq(slot, other))).then_some(slot)
 }
 
 /// After matching a segment against `child`, either terminate (leaf / leaf-with-trailing-
 /// slash, by method-blind presence) or recurse on the remaining body.
-fn descend<'a>(child: &'a Node, after: Option<&[u8]>) -> Option<&'a MethodSlot> {
+fn descend<'a>(
+    child: &'a Node,
+    after: Option<&[u8]>,
+    ignored: Option<&MethodSlot>,
+) -> Option<&'a MethodSlot> {
     match after {
         // No `/` followed the segment: path ended here → a leaf match.
-        None => (!child.leaf.is_empty()).then_some(&child.leaf),
+        None => available(&child.leaf, ignored),
         // A `/` followed, with nothing after it: a trailing-slash match.
-        Some([]) => (!child.leaf_slash.is_empty()).then_some(&child.leaf_slash),
+        Some([]) => available(&child.leaf_slash, ignored),
         // More path remains after the `/`.
-        Some(rest) => route(child, rest),
+        Some(rest) => route_skipping(child, rest, ignored),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Test-only conveniences: small rule-id casts, by-value helpers, and a wide config
-    // struct don't warrant the production-grade pedantic lints.
     #![allow(
         clippy::cast_possible_truncation,
         clippy::needless_pass_by_value,
         clippy::struct_excessive_bools
     )]
 
+    proptest::proptest! {
+        #[test]
+        fn expanded_diagnostic_coverage_agrees_with_cached_summaries(
+            selections in proptest::collection::vec(0u8..4, 9),
+            anchor in proptest::sample::select(vec!["/", "/files/", "/files/special/", "/other/", "/other/deep/"]),
+        ) {
+            let patterns = ["/", "/{*rest}", "/files", "/files/", "/files/{*rest}",
+                "/files/special", "/{tenant}/deep", "/other/", "/other/{*rest}"];
+            let entries: Vec<_> = patterns.into_iter().zip(selections).enumerate()
+                .filter_map(|(index, (pattern, selection))| {
+                    let methods = match selection {
+                        0 => return None,
+                        1 => MethodMatch::Any,
+                        2 => MethodMatch::from(http::Method::GET),
+                        _ => MethodMatch::from(http::Method::POST),
+                    };
+                    Some((lower_matchit(pattern).unwrap(), u32::try_from(index % 3).unwrap(), false, methods))
+                }).collect();
+            let router = Router::build(&entries).unwrap();
+            for method in [http::Method::GET, http::Method::POST, http::Method::from_bytes(b"PURGE").unwrap()] {
+                let expanded = router.anchor_identities(anchor, &method).into_iter()
+                    .fold(Cover::Empty, Cover::with);
+                proptest::prop_assert_eq!(expanded, router.anchor_cover(anchor, &method));
+            }
+        }
+    }
+
+    // Test-only conveniences: small rule-id casts, by-value helpers, and a wide config
+    // struct don't warrant the production-grade pedantic lints.
     use super::*;
 
     /// Lower a [`Pattern`] to the equivalent `matchit` pattern string (oracle side only).
