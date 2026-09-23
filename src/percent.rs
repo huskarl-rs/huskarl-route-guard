@@ -23,6 +23,8 @@ impl<'a> Interpretation<'a> {
     }
 
     pub(crate) fn source_offset(&self, offset: usize) -> usize {
+        // Missing decoded provenance conservatively maps to the root anchor (0),
+        // rather than narrowing the reachable region or panicking.
         self.origins
             .as_ref()
             .map_or(offset, |origins| origins.get(offset).copied().unwrap_or(0))

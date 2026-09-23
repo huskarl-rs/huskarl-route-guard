@@ -12,40 +12,14 @@ use crate::{
     },
 };
 
-/// Length cap for paths requiring structural, decode, case-fold, or custom-probe
-/// checks. In `RejectAmbiguous`, any `%` triggers this cap, even if malformed;
-/// `RequireCanonical` caps complete escapes and recognized non-canonical forms.
-/// Paths requiring none of these checks bypass the cap; callers set overall limits.
-const MAX_PATH_LEN: usize = 8192;
-
-/// The runtime path-confusion verdict, driven by the owned [`Router`].
-///
-/// This is the liveness runtime built on the **scoped-denial** model. Every modeled
-/// boundary-shift transform (`%2F` decode, `//` merge, `;` strip, `\`-as-separator,
-/// and the enabled alternate encodings) rewrites the path only *at or after* the byte
-/// that triggers it, so the paths a backend could reinterpret a request into all
-/// extend the **stable prefix** — the path up to the last clean separator before the
-/// earliest structural occurrence. A boundary-shift byte therefore denies only when
-/// the route table makes some *other* rule reachable past that anchor
-/// ([`Router::anchor_cover`] ≠ uniformly the matched rule, counting fall-through to
-/// the default rule). Dot-segments climb — each `..`-capable segment pops at most one
-/// level — so they raise the anchor toward the root before the same check; NUL
-/// truncation denies unconditionally (its legitimate-use rate is ~nil). Because
-/// registered literal segments exclude enabled structural forms, such forms cannot
-/// be consumed by a literal match of the raw path; they occur in captures or
-/// unmatched paths. The
-/// build-time canonicality check in `path_router` is load-bearing for that.
-///
-/// Every bounded percent interpretation runs through the same structural scan and
-/// precise rule comparison (with ASCII folding when configured). Structural facts
-/// retain original source offsets and combine before the positional verdict above.
-/// Custom break-glass probes then inspect the original request path. The full decision
-/// story, including why positional over-approximates (it treats every path extending
-/// the anchor as reachable, not just actual transform images) while the fold/decode
-/// checks are exact, is [`crate::_docs::explanation::decision`].
+/// The runtime path-confusion verdict over route coverage summaries.
+/// Structural checks use the stable anchor from [`Self::anchor_for`]; decoded and
+/// case-folded interpretations also receive precise rule comparisons. See
+/// [`crate::_docs::explanation::decision`] for the full decision procedure.
 pub(crate) struct PathConfusionGuard {
     router: Router,
     mode: GuardMode,
+    max_path_len: usize,
     /// Byte classes that deny, derived from the configured classes plus (when the backend
     /// folds case) [`ClassSet::CASE`].
     enabled: ClassSet,
@@ -96,6 +70,7 @@ impl PathConfusionGuard {
             structural_classes: classes,
             decode_depth: layers,
             case_sensitivity: case,
+            max_path_len,
         } = config;
         let mut enabled = enabled_classes(&classes);
         if case.is_insensitive() {
@@ -104,6 +79,7 @@ impl PathConfusionGuard {
         Self {
             router,
             mode,
+            max_path_len,
             enabled,
             enc: enabled_encodings(&classes, layers),
             case_insensitive: case.is_insensitive(),
@@ -143,12 +119,16 @@ impl PathConfusionGuard {
     /// anywhere in `path`, attributing the probe by name. A no-op (one `is_empty`)
     /// when no probe is registered.
     fn custom_probe_deny(&self, path: &str) -> Option<ResolveError> {
-        let probe = self.probes.iter().find(|p| p.matches(path))?;
-        if path.len() > MAX_PATH_LEN {
-            Some(ResolveError::TooLong)
-        } else {
-            Some(ResolveError::Probe(probe.name()))
+        if self.probes.is_empty() {
+            return None;
         }
+        if path.len() > self.max_path_len {
+            return Some(ResolveError::TooLong);
+        }
+        self.probes
+            .iter()
+            .find(|probe| probe.matches(path))
+            .map(|probe| ResolveError::Probe(probe.name()))
     }
 
     /// Whether `path` must be denied for GET. Test-only convenience for method-agnostic
@@ -168,13 +148,8 @@ impl PathConfusionGuard {
     /// walks the tree; a flagged path is denied unless every rule reachable past its
     /// anchor is the very rule it matched (see [`Router::anchor_cover`]).
     ///
-    /// The anchor: boundary-shift bytes cannot rewrite anything before the last clean
-    /// separator preceding the earliest structural occurrence, so that stable prefix
-    /// bounds their reach. Dot-segments raise the anchor one level per capable
-    /// segment, stopping at the root. A table that routes uniformly even at the
-    /// root cannot be traversed between rules. NUL truncation keeps its
-    /// unconditional deny: it has essentially no legitimate use, so the scoping win
-    /// is not worth modeling.
+    /// See [`Self::anchor_for`] for the invariance argument. NUL truncation denies
+    /// unconditionally rather than using an anchor.
     ///
     /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
     /// [`interpretation_rule_deny`](Self::interpretation_rule_deny) instead, so an uppercase byte alone
@@ -191,7 +166,7 @@ impl PathConfusionGuard {
         if present.is_empty() {
             return None;
         }
-        if path.len() > MAX_PATH_LEN {
+        if path.len() > self.max_path_len {
             return Some(ResolveError::TooLong);
         }
         if present.contains_any(ClassSet::TRUNCATION) {
@@ -257,7 +232,7 @@ impl PathConfusionGuard {
     /// that drifted would make this return `Some` where production denies outright,
     /// which costs a stricter test, never a weaker one.
     pub(crate) fn structural_anchor<'p>(&self, path: &'p str) -> Option<&'p str> {
-        if path.len() > MAX_PATH_LEN {
+        if path.len() > self.max_path_len {
             return None;
         }
         let enabled = self.enabled.without(ClassSet::CASE);
@@ -280,7 +255,7 @@ impl PathConfusionGuard {
         method: &http::Method,
         raw_rule: &impl Fn() -> Option<RuleId>,
     ) -> Option<ResolveError> {
-        if path.len() > MAX_PATH_LEN && path.contains('%') {
+        if path.len() > self.max_path_len && path.contains('%') {
             return Some(ResolveError::TooLong);
         }
         let mut structural = ScanResult::empty();
@@ -293,7 +268,7 @@ impl PathConfusionGuard {
             ));
             // NUL and oversized structural paths deny independently of routing.
             if structural.classes.contains_any(ClassSet::TRUNCATION)
-                || (path.len() > MAX_PATH_LEN
+                || (path.len() > self.max_path_len
                     && !structural
                         .classes
                         .intersect(self.enabled.without(ClassSet::CASE))
@@ -320,7 +295,7 @@ impl PathConfusionGuard {
         if view.is_original() && !folds {
             return None;
         }
-        if original_len > MAX_PATH_LEN {
+        if original_len > self.max_path_len {
             return Some(ResolveError::TooLong);
         }
         let folded;
@@ -341,14 +316,14 @@ impl PathConfusionGuard {
     /// opaque declarations ignored, so any enabled structural byte denies.
     fn noncanonical_deny(&self, path: &str) -> Option<ResolveError> {
         // Bound decoded buffers before scanning an escape-bearing strict request.
-        if path.len() > MAX_PATH_LEN && escape_present(path) {
+        if path.len() > self.max_path_len && escape_present(path) {
             return Some(ResolveError::TooLong);
         }
         let present = classes_present(path, self.enabled, self.enc).intersect(self.enabled);
         if present.is_empty() {
             return None;
         }
-        if path.len() > MAX_PATH_LEN {
+        if path.len() > self.max_path_len {
             return Some(ResolveError::TooLong);
         }
         Some(ResolveError::NonCanonical(primary_class(present)))
@@ -443,12 +418,9 @@ mod tests {
             .collect();
         PathConfusionGuard::new(
             Router::build(&entries).expect("build"),
-            GuardConfig {
-                mode,
-                structural_classes: classes,
-                decode_depth: layers,
-                case_sensitivity: case,
-            },
+            GuardConfig::new(case, layers)
+                .with_mode(mode)
+                .with_structural_classes(classes),
         )
     }
 

@@ -40,10 +40,7 @@ impl ClassSet {
     /// a literal empty segment (`//`) that slash-merging collapses — both shift
     /// segment boundaries the same way and are live in the same positions. A
     /// *single* literal `/` is not here: the router already saw it. Backslash
-    /// (`\`/`%5C`) is deliberately **not** in this class — treating `\` as a
-    /// separator is Windows/IIS-specific, so it gets its own opt-in class (mirroring
-    /// [`StructuralClasses::with_backslash`](crate::config::StructuralClasses::with_backslash),
-    /// excluded from the default) rather than riding on this default-on class.
+    /// belongs to the opt-in [`Self::BACKSLASH`] class.
     pub(crate) const SEPARATOR: ClassSet = ClassSet(1 << 0);
     /// A `.`/`..` segment (literal) or an encoded dot (`%2E`) that could form one —
     /// feeds RFC 3986 §5.2.4 resolution, which removes or climbs segments.
@@ -57,10 +54,8 @@ impl ClassSet {
     pub(crate) const TRUNCATION: ClassSet = ClassSet(1 << 3);
     /// ASCII uppercase — a case-folding backend. Opt-in.
     pub(crate) const CASE: ClassSet = ClassSet(1 << 4);
-    /// A `\` or `%5C` — a Windows/IIS backend treats it as a path separator, so it
-    /// shifts segment boundaries exactly as [`SEPARATOR`](Self::SEPARATOR) does. Its
-    /// own class (not folded into `SEPARATOR`) so the default `/` separator never
-    /// silently turns on Windows-specific `\` handling. Opt-in, mirroring
+    /// A backslash or `%5C` separator. Kept separate from [`Self::SEPARATOR`] so
+    /// backslash handling requires an explicit deployment declaration through
     /// [`StructuralClasses::with_backslash`](crate::config::StructuralClasses::with_backslash).
     pub(crate) const BACKSLASH: ClassSet = ClassSet(1 << 5);
 

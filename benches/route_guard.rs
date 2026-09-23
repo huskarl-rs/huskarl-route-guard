@@ -13,7 +13,7 @@ use criterion::{
 use http::Method;
 use huskarl_route_guard::{
     GuardConfig, PathRegistration, RuleRouter,
-    config::{CaseSensitivity, DecodeDepth, GuardMode, StructuralClasses},
+    config::{CaseSensitivity, DecodeDepth, GuardMode},
 };
 
 const DEFAULT_RULE: u32 = u32::MAX;
@@ -32,12 +32,7 @@ fn registrations() -> Vec<PathRegistration<u32>> {
 fn router(mode: GuardMode, layers: DecodeDepth, case: CaseSensitivity) -> RuleRouter<u32> {
     RuleRouter::from_registrations(
         DEFAULT_RULE,
-        GuardConfig {
-            mode,
-            structural_classes: StructuralClasses::new(),
-            decode_depth: layers,
-            case_sensitivity: case,
-        },
+        GuardConfig::new(case, layers).with_mode(mode),
         registrations(),
     )
     .expect("benchmark route table is valid")
@@ -280,12 +275,8 @@ fn subtree_registrations(count: usize) -> Vec<PathRegistration<u32>> {
 fn build_router(registrations: Vec<PathRegistration<u32>>) -> RuleRouter<u32> {
     RuleRouter::from_registrations(
         DEFAULT_RULE,
-        GuardConfig {
-            mode: GuardMode::RejectAmbiguous,
-            structural_classes: StructuralClasses::new(),
-            decode_depth: DecodeDepth::UpToOne,
-            case_sensitivity: CaseSensitivity::Sensitive,
-        },
+        GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+            .with_mode(GuardMode::RejectAmbiguous),
         registrations,
     )
     .expect("generated benchmark route table is valid")

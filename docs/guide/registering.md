@@ -15,9 +15,22 @@ Check trailing slashes deliberately. `register_subtree("/admin/", |path| path.al
 registration. The guard does not detect trailing-slash equivalence for you.
 
 Keep patterns that should share an identity in one registration. Two calls with
-equal rule values still create different identities. If the helper methods cannot
-express your group of patterns, assemble a [`PathRegistration`](crate::PathRegistration)
-and use [`from_registrations`](crate::RuleRouter::from_registrations).
+equal rule values still create different identities. Compose exact paths and subtrees
+with [`with_path`](crate::PathRegistration::with_path) and
+[`with_subtree`](crate::PathRegistration::with_subtree):
+
+```rust
+use huskarl_route_guard::PathRegistration;
+
+let registration = PathRegistration::subtree("/files")
+    .with_path("/files/special")
+    .with_subtree("/archive")
+    .all("files-policy");
+```
+
+Pass the registration to `builder.register(...)` or `from_registrations`. All its
+patterns share the method table, each concrete rule's identity, and the inheritance
+and exclusivity settings. Duplicate or conflicting patterns remain build errors.
 
 ## Set the default policy explicitly
 

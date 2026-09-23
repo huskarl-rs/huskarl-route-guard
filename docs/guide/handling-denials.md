@@ -4,7 +4,22 @@ Use this guide when `resolve` returns a denial. First identify the reason, then
 decide whether to fix the caller, reject the client input, or adjust the route
 registrations. Your application sends the response; the crate does not send HTTP
 responses itself. Most path denials map to `400`; `InvalidRuleId` is an internal
-failure and should map to `500`.
+failure and should map to `500`. Use `kind()` to classify responses without
+matching every attributed error variant:
+
+```rust
+use huskarl_route_guard::{ResolveError, ResolveErrorKind};
+
+fn status(error: &ResolveError) -> http::StatusCode {
+    match error.kind() {
+        ResolveErrorKind::InvalidInput => http::StatusCode::BAD_REQUEST,
+        ResolveErrorKind::PolicyDenied => http::StatusCode::FORBIDDEN,
+        ResolveErrorKind::Internal => http::StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+```
+
+Every category denies authorization; never substitute the default rule on error.
 
 *Background on why each verdict exists is in
 [How the guard decides](crate::_docs::explanation::decision); this page is the
@@ -35,7 +50,7 @@ triaging structural classes.
 | `DecodeRuleChange` | Percent-decoding the path lands on a *different* rule | Same shape: `/%61dmin` vs a registered `/admin`. Client fix, or rethink why two rules disagree about one resource. |
 | `NonCanonical(_)` / `NonCanonicalEscape` | The strict [`RequireCanonical`](crate::config::GuardMode::RequireCanonical) mode: presence-deny, table never consulted | Working as declared. If you serve opaque keys or encoded content, this deployment wants [`RejectAmbiguous`](crate::config::GuardMode::RejectAmbiguous) instead. |
 | `Probe(name)` | Your own [`StructuralProbe`](crate::config::StructuralProbe) matched | Your predicate, your call — scope it to the dangerous sequence if it over-fires. |
-| `TooLong` | A path requiring checks exceeds 8,192 bytes; in `RejectAmbiguous`, even a malformed `%` triggers this limit | Check client input and request-size limits. This is not an overall path-length limit; paths requiring no checks bypass it. |
+| `TooLong` | A path requiring checks exceeds `GuardConfig::max_path_len` (default 8,192 original path bytes); in `RejectAmbiguous`, even a malformed `%` triggers this limit | Check client input and request-size limits. This is not an overall path-length limit; paths requiring no checks bypass it unless custom probes are registered. With probes, oversized paths deny before any probe runs. Adjust the analysis budget with `with_max_path_len` if legitimate keys require it. |
 
 Never respond to a `Structural(_)` denial by loosening a
 [`StructuralClasses`](crate::config::StructuralClasses) toggle or turning

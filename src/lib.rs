@@ -101,6 +101,7 @@ pub mod config;
 mod diagnostics;
 mod guard;
 #[cfg(test)]
+#[path = "tests/path_confusion_proptest.rs"]
 mod path_confusion_proptest;
 mod path_router;
 mod percent;
@@ -108,8 +109,8 @@ mod route_tree;
 mod structural;
 
 pub use config::{
-    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, StructuralChar,
-    StructuralClass, StructuralClasses, StructuralProbe,
+    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, ResolveErrorKind,
+    StructuralChar, StructuralClass, StructuralClasses, StructuralProbe,
 };
 pub use diagnostics::{
     MethodGapDiagnostic, RawMatch, ResolutionExplanation, StructuralExplanation,
@@ -117,59 +118,3 @@ pub use diagnostics::{
 pub use path_router::{
     PathRegistration, RuleMatch, RuleRouter, RuleRouterBuilder, RuleRouterError,
 };
-
-/// Expands a path into the `matchit` patterns that cover that path
-/// and everything beneath it — the expansion behind
-/// [`RuleRouterBuilder::register_subtree`] and subtree builder methods downstream.
-///
-/// - `/blah`  → `/blah`, `/blah/`, `/blah/{*rest}`
-/// - `/blah/` → `/blah/`, `/blah/{*rest}` (the bare `/blah` is *not* included)
-/// - `/`      → `/`, `/{*rest}` (the whole tree)
-///
-/// A trailing slash on the input therefore means "this directory and its
-/// contents, but not the bare name". `matchit`'s catch-all matches neither the
-/// empty remainder nor the bare path, so the literal and trailing-slash
-/// patterns must be inserted explicitly alongside it.
-#[must_use]
-pub fn subtree_patterns(path: &str) -> Vec<String> {
-    if path.ends_with('/') {
-        vec![path.to_owned(), format!("{path}{{*rest}}")]
-    } else {
-        vec![
-            path.to_owned(),
-            format!("{path}/"),
-            format!("{path}/{{*rest}}"),
-        ]
-    }
-}
-
-#[cfg(test)]
-mod subtree_patterns_tests {
-    use super::subtree_patterns;
-
-    #[test]
-    fn no_trailing_slash_expands_to_three() {
-        assert_eq!(
-            subtree_patterns("/blah"),
-            vec!["/blah", "/blah/", "/blah/{*rest}"]
-        );
-    }
-
-    #[test]
-    fn trailing_slash_omits_bare_path() {
-        assert_eq!(subtree_patterns("/blah/"), vec!["/blah/", "/blah/{*rest}"]);
-    }
-
-    #[test]
-    fn root_covers_whole_tree() {
-        assert_eq!(subtree_patterns("/"), vec!["/", "/{*rest}"]);
-    }
-
-    #[test]
-    fn nested_path() {
-        assert_eq!(
-            subtree_patterns("/a/b"),
-            vec!["/a/b", "/a/b/", "/a/b/{*rest}"]
-        );
-    }
-}

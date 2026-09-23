@@ -48,13 +48,12 @@ use crate::{
         CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, StructuralChar, StructuralClasses,
     },
     path_router::{PathRegistration, RuleRouter, RuleRouterError},
-    subtree_patterns,
 };
 
 // ── Route-table catalog ────────────────────────────────────────────────────
 
 /// `(kind, path)` route specs the generator samples from. `kind` is `'s'` for a
-/// `subtree` (expanded via [`subtree_patterns`]) or `'e'` for an exact route.
+/// `subtree` (registered via [`PathRegistration::subtree`]) or `'e'` for an exact route.
 /// All lowercase, all canonical, and chosen to mostly coexist in `matchit` — a
 /// subset that conflicts just fails to build and is skipped.
 const CATALOG: &[(char, &str)] = &[
@@ -173,22 +172,19 @@ fn build_router(
         .iter()
         .enumerate()
         .map(|(id, (kind, path))| {
-            PathRegistration::patterns(if *kind == 's' {
-                subtree_patterns(path)
+            (if *kind == 's' {
+                PathRegistration::subtree(path)
             } else {
-                vec![(*path).to_owned()]
+                PathRegistration::path(*path)
             })
             .all(u32::try_from(id).expect("catalog is small"))
         })
         .collect();
     RuleRouter::from_registrations(
         u32::MAX,
-        GuardConfig {
-            mode: GuardMode::RejectAmbiguous,
-            structural_classes: classes,
-            decode_depth: layers,
-            case_sensitivity: case,
-        },
+        GuardConfig::new(case, layers)
+            .with_mode(GuardMode::RejectAmbiguous)
+            .with_structural_classes(classes),
         registrations,
     )
 }
@@ -995,7 +991,7 @@ proptest! {
             PathRegistration::path(wildcard).method(actual.clone(), 1),
             PathRegistration::path(literal.clone()).method(actual.clone(), 2),
         ];
-        let router = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: transform.layers, case_sensitivity: transform.case }, registrations)?;
+        let router = RuleRouter::from_registrations(u32::MAX, GuardConfig::new(transform.case, transform.layers).with_mode(GuardMode::RejectAmbiguous), registrations)?;
 
         let normalized = normalize(
             &raw,
@@ -1090,7 +1086,7 @@ proptest! {
     /// is `deny(clippy::panic)`, but that cannot see runtime slicing/UTF-8 edges).
     #[test]
     fn never_panics_on_arbitrary_input(pattern in ".*", path in ".*") {
-        let _ = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: DecodeDepth::UpToOne, case_sensitivity: CaseSensitivity::Sensitive }, vec![PathRegistration::path(pattern).all(0u32)]);
+        let _ = RuleRouter::from_registrations(u32::MAX, GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne).with_mode(GuardMode::RejectAmbiguous), vec![PathRegistration::path(pattern).all(0u32)]);
 
         let router = build_router(
             &[('s', "/admin"), ('e', "/users/{id}")],

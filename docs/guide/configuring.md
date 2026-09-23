@@ -116,3 +116,17 @@ After deployment, log the `Display` form of every [`ResolveError`](crate::Resolv
 before changing configuration. For the reason-by-reason procedure, including when a
 route redesign is appropriate, use
 [Handling a denial](crate::_docs::guide::handling_denials).
+
+## Set the analysis budget
+
+[`GuardConfig::with_max_path_len`](crate::GuardConfig::with_max_path_len) sets the
+maximum original path length in bytes for analysis (default: 8,192). Increase it
+if legitimate encoded keys need more room, accounting for the added analysis cost.
+This resource budget is separate from the downstream parsing declarations.
+
+Paths requiring no checks bypass the budget, except when custom probes are
+registered: then every oversized path is denied before probes run, even if none
+would match. Disabled mode bypasses the budget. Zero rejects every nonempty path
+requiring analysis; it does not mean unlimited. `usize::MAX` effectively removes
+the analysis length cap. Enforce an overall request-size
+limit in the caller as well.

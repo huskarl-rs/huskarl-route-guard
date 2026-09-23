@@ -40,11 +40,12 @@ fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
 
 #[test]
 fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
-    let patterns = huskarl_route_guard::subtree_patterns("/files")
-        .into_iter()
-        .chain(["/files/special".to_owned()]);
     let repaired = RuleRouter::builder("default", config())
-        .register(PathRegistration::patterns(patterns).all("files"))
+        .register(
+            PathRegistration::subtree("/files")
+                .with_path("/files/special")
+                .all("files"),
+        )
         .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
         .build()
         .unwrap();
@@ -488,4 +489,44 @@ fn structural_coverage_respects_method_gaps_in_a_shadowing_branch() {
         ResolveError::MethodNotConfigured
     );
     assert!(incomplete.resolve("/files/a%2fb", &Method::GET).is_err());
+}
+
+#[test]
+fn composed_paths_share_method_identities_and_subtree_boundaries() {
+    let router = RuleRouter::builder("default", config())
+        .register(
+            PathRegistration::path("/health")
+                .method(Method::GET, "read")
+                .with_subtree("/files")
+                .with_subtree("/archive/")
+                .with_path("/ready")
+                .method(Method::POST, "write"),
+        )
+        .build()
+        .unwrap();
+    for method in [Method::GET, Method::POST] {
+        let expected = router.resolve("/health", &method).unwrap();
+        for path in [
+            "/ready",
+            "/files",
+            "/files/",
+            "/files/a%2fb",
+            "/archive/",
+            "/archive/a%2fb",
+        ] {
+            assert_eq!(router.resolve(path, &method).unwrap(), expected, "{path}");
+        }
+        assert_eq!(
+            *router.resolve("/archive", &method).unwrap().rule(),
+            "default"
+        );
+    }
+    assert_ne!(
+        router.resolve("/health", &Method::GET).unwrap().id(),
+        router.resolve("/health", &Method::POST).unwrap().id()
+    );
+    assert_eq!(
+        router.resolve("/ready", &Method::DELETE).unwrap_err(),
+        ResolveError::MethodNotConfigured
+    );
 }

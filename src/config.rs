@@ -9,9 +9,10 @@
 //! | [`CaseSensitivity`] | Declare whether downstream routing folds ASCII case | Required |
 //! | [`DecodeDepth`] | Declare the maximum supported percent-decode depth | Required |
 //! | [`StructuralClasses`] | Enable additional structural forms and custom detectors | Built-in classes only |
+//! | [`max_path_len`](GuardConfig::max_path_len) | Limit analysis in original path bytes | 8,192 |
 //!
-//! These settings describe possible downstream behaviors; the crate does not detect
-//! them from your deployment. The default mode permits some structural forms when
+//! Parsing declarations describe possible downstream behaviors; the crate does not
+//! detect them from your deployment. The length budget controls resource use. The default mode permits some structural forms when
 //! the checks establish that they cannot change the rule.
 //!
 //! For practical choices, follow [Choosing a configuration](crate::_docs::guide::configuring).
@@ -32,6 +33,8 @@ use std::sync::Arc;
 /// Case sensitivity and decode depth are required; there is deliberately no
 /// `Default` implementation. The mode and structural classes start with their
 /// conservative built-in defaults and can be customized before construction.
+/// Construct with [`new`](Self::new) and customize with the `with_*` methods;
+/// additional settings may be added in future releases.
 /// Use with [`RuleRouter::from_registrations`](crate::RuleRouter::from_registrations).
 ///
 /// ```
@@ -54,6 +57,7 @@ use std::sync::Arc;
 /// );
 /// ```
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct GuardConfig {
     /// Enforcement mode; defaults to checking for possible rule changes.
     pub mode: GuardMode,
@@ -63,6 +67,11 @@ pub struct GuardConfig {
     pub decode_depth: DecodeDepth,
     /// Whether downstream path interpretation folds ASCII case.
     pub case_sensitivity: CaseSensitivity,
+    /// Maximum original path length in bytes for paths requiring analysis.
+    /// Defaults to 8,192. This is a resource budget, not a parsing assumption or
+    /// an overall request-size limit. With custom probes, every path is subject
+    /// to this limit before any probe runs. Disabled mode bypasses this limit.
+    pub max_path_len: usize,
 }
 
 impl GuardConfig {
@@ -74,7 +83,18 @@ impl GuardConfig {
             structural_classes: StructuralClasses::default(),
             decode_depth,
             case_sensitivity,
+            max_path_len: 8192,
         }
+    }
+
+    /// Sets the analysis budget in original path bytes (default: 8,192).
+    /// Zero rejects every nonempty path requiring analysis; it does not disable
+    /// the limit. `usize::MAX` effectively removes the length cap. Larger budgets
+    /// permit longer encoded keys at greater analysis cost.
+    #[must_use]
+    pub fn with_max_path_len(mut self, max_path_len: usize) -> Self {
+        self.max_path_len = max_path_len;
+        self
     }
 
     /// Selects enforcement without changing the declared parsing assumptions.
@@ -312,14 +332,45 @@ pub enum ResolveError {
     /// [`name`](StructuralProbe::name).
     Probe(&'static str),
     /// A path requiring structural, decode, case-fold, or custom-probe checks
-    /// exceeds 8,192 bytes. In [`RejectAmbiguous`](GuardMode::RejectAmbiguous), any
-    /// `%` triggers the cap, even if malformed. In strict mode, complete escapes
+    /// exceeds [`GuardConfig::max_path_len`] (8,192 bytes by default). In
+    /// [`RejectAmbiguous`](GuardMode::RejectAmbiguous), any `%` triggers the cap,
+    /// even if malformed. In strict mode, complete escapes
     /// and recognized non-canonical forms trigger it. Paths requiring no checks
-    /// bypass this cap; the caller must enforce an overall request-size limit.
+    /// bypass this cap unless custom probes are registered: then every path is
+    /// capped before probes run. The caller must enforce an overall request-size limit.
     TooLong,
 }
 
+/// Broad denial category for response handling. Every category denies authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveErrorKind {
+    /// Invalid or ambiguous input; normally HTTP 400.
+    InvalidInput,
+    /// The method has no configured policy; normally HTTP 403.
+    PolicyDenied,
+    /// An internal routing invariant failed; normally HTTP 500.
+    Internal,
+}
+
 impl ResolveError {
+    /// Classifies the denial for response handling. Never substitute a default
+    /// authorization rule for an error, regardless of its category.
+    #[must_use]
+    pub const fn kind(&self) -> ResolveErrorKind {
+        match self {
+            Self::InvalidRuleId => ResolveErrorKind::Internal,
+            Self::MethodNotConfigured => ResolveErrorKind::PolicyDenied,
+            Self::InvalidPathInput
+            | Self::Structural(_)
+            | Self::CaseFoldRuleChange
+            | Self::DecodeRuleChange
+            | Self::NonCanonical(_)
+            | Self::NonCanonicalEscape
+            | Self::Probe(_)
+            | Self::TooLong => ResolveErrorKind::InvalidInput,
+        }
+    }
+
     /// The short, static denial message for the HTTP response body. Deliberately
     /// coarse — it reports a broad error category without rule IDs or structural
     /// class details. Acceptance and denial can still reveal routing behavior; put
@@ -412,6 +463,8 @@ pub enum StructuralChar {
 /// `matches` must be **pure, deterministic, and ~O(n)**. Checks short-circuit on
 /// denial, and `Disabled` skips probes; do not rely on a probe being called for
 /// logging or other side effects.
+/// With probes registered, paths exceeding [`GuardConfig::max_path_len`] are
+/// denied before invoking any probe, even if no probe would match.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
 /// `register_exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
 /// monotonic, blunt semantics of a custom detector — by construction it can only

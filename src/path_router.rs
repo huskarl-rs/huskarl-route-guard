@@ -11,9 +11,9 @@
 //!
 //! [`RuleRouter`] owns the `id → rule` table, the default rule, and a
 //! [`PathConfusionGuard`] over the
-//! [owned segment-tree router](crate::route_tree). Public matchit-style pattern strings
-//! are lowered into the owned grammar at build time; whatever the grammar cannot express
-//! (in-segment prefix/suffix params) is a build-time error.
+//! [owned segment-tree router](crate::route_tree). The public pattern syntax
+//! supports whole-segment `{id}` captures and terminal `{*rest}` catch-alls. Patterns
+//! are validated at build time; in-segment prefix/suffix parameters are unsupported.
 //!
 //! [`RuleRouter::builder`] constructs path tables with
 //! [`register_path`](RuleRouterBuilder::register_path),
@@ -170,6 +170,7 @@ pub struct PathRegistration<R> {
 
 impl<R> PathRegistration<R> {
     /// Register one exact path or whole-segment pattern. Initially all methods deny.
+    /// See [Routing behavior](crate::_docs::reference::routing) for the pattern syntax.
     pub fn path(pattern: impl Into<String>) -> Self {
         Self::patterns([pattern.into()])
     }
@@ -188,7 +189,25 @@ impl<R> PathRegistration<R> {
     /// Register a prefix, its trailing slash, and descendants with one method table.
     #[must_use]
     pub fn subtree(path: &str) -> Self {
-        Self::patterns(crate::subtree_patterns(path))
+        Self::patterns(subtree_patterns(path))
+    }
+
+    /// Add an exact path or whole-segment pattern to this registration.
+    /// It shares the existing method table, rule identities, inheritance, and
+    /// exclusivity settings. Validation happens when the router is built.
+    #[must_use]
+    pub fn with_path(mut self, pattern: impl Into<String>) -> Self {
+        self.patterns.push(pattern.into());
+        self
+    }
+
+    /// Add a subtree to this registration, sharing its method table and rule identities.
+    /// Trailing-slash semantics are the same as [`subtree`](Self::subtree).
+    /// Inheritance and exclusivity settings apply to all added patterns too.
+    #[must_use]
+    pub fn with_subtree(mut self, path: &str) -> Self {
+        self.patterns.extend(subtree_patterns(path));
+        self
     }
 
     /// Register a subtree and forbid overriding paths in its catch-all tail.
@@ -422,7 +441,8 @@ impl<R> RuleRouter<R> {
     /// response body; its `Display` is the attributed line for the *log*, so an
     /// operator can trace a `400` to the configuration knob or registration that
     /// governs it. See [Handling a denial](crate::_docs::guide::handling_denials)
-    /// for the response to each reason.
+    /// for the response to each reason. [`ResolveError::kind`] provides the broad
+    /// input, policy, or internal category for response mapping.
     ///
     /// [`ResolveError::InvalidRuleId`] indicates an internal invariant violation
     /// and should be reported as a server error, not a client `400`.
@@ -741,9 +761,7 @@ fn map_build_err(e: BuildError, patterns: &[String]) -> RuleRouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CaseSensitivity, DecodeDepth, ResolveError, StructuralClass, StructuralClasses,
-    };
+    use crate::config::{CaseSensitivity, DecodeDepth, ResolveError, StructuralClass};
 
     /// Build a router from `(pattern, rule)` rows, grouping consecutive rows with the
     /// same rule value into one [`PathRegistration`] (rule ids are then positional, so a
@@ -758,12 +776,7 @@ mod tests {
         }
         RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: pc,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne).with_mode(pc),
             regs,
         )
     }
@@ -1036,12 +1049,8 @@ mod tests {
         // denies.
         let r = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![PathRegistration::exclusive_subtree("/files").all(0)],
         )
         .expect("build");
@@ -1054,12 +1063,8 @@ mod tests {
     fn opaque_blob_with_sibling_is_build_error() {
         let err = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![
                 PathRegistration::exclusive_subtree("/files").all(0),
                 PathRegistration::path("/files/secret").all(1),
@@ -1092,12 +1097,8 @@ mod tests {
         // and there is no id for a caller to get wrong.
         let r = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![
                 PathRegistration::subtree("/admin").all(10),
                 PathRegistration::path("/health").all(20),
@@ -1120,12 +1121,8 @@ mod tests {
         // fall to the default rule.
         let err = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![PathRegistration::path("/x").methods(Vec::new(), 0)],
         )
         .expect_err("empty method set rejected");
@@ -1137,12 +1134,8 @@ mod tests {
     fn rejects_empty_pattern_set() {
         let err = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![PathRegistration::patterns(Vec::<String>::new()).all(0)],
         )
         .expect_err("empty pattern set rejected");
@@ -1153,12 +1146,8 @@ mod tests {
     fn duplicate_method_in_set_is_conflict() {
         let err = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             vec![PathRegistration::path("/x").methods([http::Method::GET, http::Method::GET], 0)],
         )
         .expect_err("duplicate method in one set rejected");
@@ -1296,12 +1285,8 @@ mod tests {
 
         let decoded = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Sensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             registrations(),
         )
         .expect("build");
@@ -1320,12 +1305,8 @@ mod tests {
 
         let folded = RuleRouter::from_registrations(
             u32::MAX,
-            GuardConfig {
-                mode: GuardMode::RejectAmbiguous,
-                structural_classes: StructuralClasses::new(),
-                decode_depth: DecodeDepth::UpToOne,
-                case_sensitivity: CaseSensitivity::Insensitive,
-            },
+            GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne)
+                .with_mode(GuardMode::RejectAmbiguous),
             registrations(),
         )
         .expect("build");
@@ -1353,12 +1334,8 @@ mod tests {
         let build = |layers| {
             RuleRouter::from_registrations(
                 u32::MAX,
-                GuardConfig {
-                    mode: GuardMode::RejectAmbiguous,
-                    structural_classes: StructuralClasses::new(),
-                    decode_depth: layers,
-                    case_sensitivity: CaseSensitivity::Sensitive,
-                },
+                GuardConfig::new(CaseSensitivity::Sensitive, layers)
+                    .with_mode(GuardMode::RejectAmbiguous),
                 registrations(),
             )
             .expect("build")
@@ -1469,6 +1446,53 @@ mod tests {
         assert_eq!(
             r.resolve("/api/v1", &http::Method::DELETE).unwrap_err(),
             ResolveError::MethodNotConfigured
+        );
+    }
+}
+
+/// Expand a subtree into this router's patterns. Catch-alls require a nonempty
+/// remainder, so the prefix and trailing slash need explicit entries. A trailing
+/// slash in the supplied prefix excludes the bare path.
+#[must_use]
+fn subtree_patterns(path: &str) -> Vec<String> {
+    if path.ends_with('/') {
+        vec![path.to_owned(), format!("{path}{{*rest}}")]
+    } else {
+        vec![
+            path.to_owned(),
+            format!("{path}/"),
+            format!("{path}/{{*rest}}"),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod subtree_patterns_tests {
+    use super::subtree_patterns;
+
+    #[test]
+    fn no_trailing_slash_expands_to_three() {
+        assert_eq!(
+            subtree_patterns("/blah"),
+            vec!["/blah", "/blah/", "/blah/{*rest}"]
+        );
+    }
+
+    #[test]
+    fn trailing_slash_omits_bare_path() {
+        assert_eq!(subtree_patterns("/blah/"), vec!["/blah/", "/blah/{*rest}"]);
+    }
+
+    #[test]
+    fn root_covers_whole_tree() {
+        assert_eq!(subtree_patterns("/"), vec!["/", "/{*rest}"]);
+    }
+
+    #[test]
+    fn nested_path() {
+        assert_eq!(
+            subtree_patterns("/a/b"),
+            vec!["/a/b", "/a/b/", "/a/b/{*rest}"]
         );
     }
 }
