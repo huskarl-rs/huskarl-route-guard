@@ -1,14 +1,16 @@
 # Supported path interpretations
 
 This page is a reference for the built-in model. A row marked “default” means the
-guard considers that interpretation without an opt-in; it does **not** mean that the
-library has detected the behavior in your deployment.
+active guard considers that interpretation without an opt-in; it does **not** mean
+that the library has detected the behavior in your deployment. `Off` disables these
+checks. See the [security contract](crate::_docs::reference::contract) for how the
+modes use this model.
 
 | Path interpretation | Status | Enable with |
 |---|---|---|
 | encoded slash `%2F`, empty segment `//` | **default** | — |
 | dot-segments `.`/`..`, encoded `%2E` | **default** | — |
-| matrix params `;` / `%3B` (servlet strip) | **default** | — |
+| path parameters (matrix parameters), such as `;version=2`, or encoded `%3B` | **default** | — |
 | `%00` / raw-NUL truncation (C-string backends) | **default** | — (always-on; NUL is unsupported path content) |
 | percent-decoding to a different literal (`/%61dmin`) | **default** | — |
 | double percent-decoding `%252F` (CDN/WAF → origin) | **required** declaration | [`DecodeLayers::UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo) |
@@ -93,9 +95,9 @@ not seen at all:
   with `/` (or be the special `*` request target) and contain no `?` or `#`. A full
   request-target such as `/admin?x=1`, or an absolute URI, is denied with
   [`InvalidPathInput`](crate::DenyReason::InvalidPathInput) rather than being routed.
-- **Detection, not sanitisation.** The guard denies or forwards the **raw** bytes; it
-  never normalises the path it sends upstream. This is deliberate and load-bearing,
-  not a gap — see
+- **Detection, not sanitisation.** The guard returns a rule or a denial. The caller
+  forwards allowed requests with their paths unchanged. This is a condition of
+  the contract — see
   [The guard never rewrites the path](crate::_docs::explanation::no_rewrite).
 - **Not a WAF.** Within the declared interpretation set, the guard keeps the selected
   authorization rule stable. It does not inspect content for injection or repair a

@@ -4,11 +4,13 @@
 //!
 //! - **New to the crate?** Work through [Getting started](tutorial).
 //! - **Integrating it?** Use [Choosing a configuration](guide::configuring).
+//! - **Mapping policies to paths?** Use [Registering routes](guide::registering).
+//! - **Checking matching semantics?** Consult [Routing behavior](reference::routing).
 //! - **Investigating a `400`?** Use [Handling a denial](guide::handling_denials).
 //! - **Reviewing the security claim?** Read the [Security contract](reference::contract)
 //!   and [Supported interpretations](reference::coverage).
 //! - **Trying to understand the design?** Read [How the guard decides](explanation::decision),
-//!   [Why it forwards the raw path](explanation::no_rewrite), and
+//!   [Why the guard never rewrites paths](explanation::no_rewrite), and
 //!   [Where the parser disagreement lives](explanation::topology). For the testing
 //!   argument, read [How the security claim is tested](explanation::testing).
 //! - **Looking up a term?** Use the [Glossary](reference::glossary). It marks the
@@ -24,6 +26,9 @@ pub mod tutorial {}
 
 /// Exact statements to consult while configuring or reviewing the guard.
 pub mod reference {
+    #[doc = include_str!("../docs/reference/routing.md")]
+    pub mod routing {}
+
     #[doc = include_str!("../docs/reference/contract.md")]
     pub mod contract {}
 
@@ -51,6 +56,9 @@ pub mod explanation {
 
 /// Task-oriented guidance for configuring the guard and operating it.
 pub mod guide {
+    #[doc = include_str!("../docs/guide/registering.md")]
+    pub mod registering {}
+
     #[doc = include_str!("../docs/guide/configuring.md")]
     pub mod configuring {}
 

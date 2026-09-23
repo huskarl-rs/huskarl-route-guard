@@ -1,86 +1,94 @@
 # Glossary
 
-Most of this crate uses ordinary HTTP-routing terminology. Two terms are specific to
-this library: **relocation** and **anchor**. They are named here because they recur in
-the security contract and algorithm; operational use does not require memorizing the
-implementation vocabulary.
-
 ## Routes and rules
 
-**Pattern** — a registered path expression using `matchit` syntax: literal segments
-(`/admin`), one-segment parameters (`/users/{id}`), and a trailing catch-all
-(`/files/{*rest}`). A trailing slash is significant.
+**Pattern** — a path expression such as `/health`, `/users/{id}`, or
+`/files/{*rest}`. See [Routing behavior](crate::_docs::reference::routing) for
+the supported syntax.
 
-**Registration / rule** — one authorization identity created by a `route`, `subtree`,
-or `blob_subtree` call. A `subtree` expands to several patterns, but those patterns
-share one internal rule id. Two separate registrations remain different rules even
-when their policy values are equal.
+**Rule value** — the caller-provided value of type `R` returned by a successful
+match. It can be a policy, a policy identifier, or other application data. The
+crate does not interpret it.
 
-**Default rule** — the rule used when no registered pattern matches. It participates
-in the security check like any other rule: moving from an unmatched path onto a
-registered route, or the reverse, crosses a rule boundary.
+**Policy** — the authorization behavior the calling application enforces using
+the selected rule value. Returning a rule does not itself authorize the request.
 
-**Route table** — the registrations, their internal rule identities, and the default
-rule.
+**Registration** — a group of patterns, a method selection, and one rule value.
+Each `route`, `subtree`, or `blob_subtree` call creates a registration.
 
-**Single-rule subtree** — a path prefix for which every possible suffix, including
-otherwise-unmatched paths and every HTTP method, resolves to one rule. The algorithm
-calls this *uniform coverage*. A lone exact route or catch-all is not a single-rule
-subtree because gaps fall through to the default rule.
+**Rule identity / rule ID** — the identity assigned to a registration. All its
+patterns share that identity. Separate registrations have different identities
+even if their rule values are equal. “Same rule” in the guard's contract means
+the same identity.
 
-## Path interpretations
+**Default rule** — the caller-provided fallback value and its distinct identity.
+It applies when no path matches or when the selected path has no rule for the
+request method and no all-method rule.
 
-**Path interpretation** — the path a component routes after applying its own parsing
-behavior, such as percent-decoding, merging slashes, resolving dot-segments, stripping
-`;` parameters, folding case, or treating backslash as a separator.
+**Route table** — the registrations and the default rule.
 
-**Path confusion / parser disagreement** — two components assign different meanings
-to the same request path. In this crate's intended architecture, the authorization
-layer routes the raw path while another component later interprets and serves it.
+**Single-rule subtree / uniform coverage** — a region where every path and every
+HTTP method selects the same rule identity. Gaps that select the default count
+toward this check. A lone catch-all registration does not cover its bare prefix
+or empty remainder.
 
-**Declared interpretation set** — the route table combined with the
-path behaviors selected by `CaseSensitivity`, `DecodeLayers`, and
-`StructuralClasses`. The guard considers subsets and compositions of those selected
-behaviors. It cannot see behavior outside this declaration.
+## Path parsing
 
-**Relocation** *(library term)* — a path interpretation selects a different rule from
-the raw path. For example, `/public/../admin` may match the public rule as written but
-the admin rule after dot-segment resolution. A changed path that remains within the
-same rule is not a relocation.
+**Raw path** — the request path supplied to the router, before this crate applies
+any checks to alternative spellings. Supply `uri.path()`, without a query string
+or fragment. The caller must preserve this path when forwarding an allowed request.
 
-**Canonical path** — a path spelling unchanged by the configured built-in
-interpretations. In `reject_non_canonical` mode, the definition is deliberately
-stricter: any percent escape is rejected. “Canonical” is always relative to the
-configured model; it does not claim agreement with every possible downstream parser.
+**Path interpretation** — a path after a component's parsing behavior, such as
+percent-decoding, slash merging, removing `..` segments, stripping path parameters,
+or converting ASCII letters to lowercase.
 
-## Guard decisions
+**Path confusion / parser disagreement** — different components interpret the
+same request path differently. The guard is concerned with disagreement that
+could select a different rule.
 
-**Structural form / structural class** — syntax that a downstream parser may treat as
-path structure rather than segment content. Examples include encoded separators,
-empty segments, dot-segments, matrix parameters, NUL, and configured alternate forms
-such as backslash or fullwidth separators. `StructuralClass` identifies the family
-reported in a denial. A form may contain several bytes; the documentation therefore
-uses *form* rather than the older shorthand *structural byte*.
+**Configured downstream parsing behaviors** — the built-in behaviors and opt-ins
+selected by `CaseSensitivity`, `DecodeLayers`, and `StructuralClasses`.
+The contract calls their supported combinations the *declared interpretation set*.
+Behavior outside this set is not checked.
 
-**Anchor** *(library term)* — the earliest path prefix that the structural analysis
-can prove will remain unchanged. The guard checks all routes reachable beneath that
-prefix. Dot-segments move the anchor toward the root because they can remove preceding
-segments. See [How the guard decides](crate::_docs::explanation::decision) for the
-algorithm.
+**Rule change / relocation** — an interpretation selects a different rule identity
+from the raw path. “Relocation” appears in API names such as `DecodeRelocation`;
+it does not mean the guard redirects a request.
 
-**Scoped structural check** — for a recognized structural form, deny unless every
-route reachable beneath its anchor is the rule selected by the raw path. This is
-conservative: it may deny paths that a particular backend would keep within one rule.
+**Canonical path** — in this crate, a slash-prefixed path containing no recognized
+structural form, no percent escape, and no uppercase ASCII when case folding is
+configured. This is relative to the configured checks, not a universal URL format.
+The default mode also accepts some non-canonical paths when the checks establish
+that they cannot change the selected rule.
 
-**Exact relocation check** — apply a deterministic modeled interpretation, such as
-ASCII case folding or whole-path percent decoding, route the result, and deny only if
-the rule changes.
+## Guard checks
 
-**Opaque-key subtree** — a `blob_subtree` registration for a prefix whose keys may
-legitimately contain separator-like forms. It behaves like a single-rule `subtree` at
-runtime and additionally makes any nested registration a build error.
+**Structural form** — syntax that may affect path boundaries or traversal, such
+as `%2F`, `//`, `..`, or `;version=2`. NUL truncation is also classified here.
+A **structural class** is the family reported in a denial, such as
+`StructuralClass::Separator`.
 
-**Custom structural detector** — a user-provided `StructuralProbe`. It is a whole-path,
-deny-only predicate for a platform-specific form that the built-in model does not
-recognize. It can add denials but cannot establish that the rest of the model matches
-the deployment.
+**Path parameters / matrix parameters** — content starting with `;` in a path
+segment, such as `/users/4;version=2`. Some parsers strip this content before routing.
+
+**Stable prefix / anchor** — a prefix that remains unchanged under the supported
+transformations. The structural analysis calls its conservatively chosen prefix
+the *anchor*. See
+[How the guard decides](crate::_docs::explanation::decision) for its calculation.
+
+**Structural ambiguity check / scoped structural check** — reject a recognized
+structural form unless every path and method in the analyzed region selects the
+same rule. The analyzed region can be broader than actual parsing results, so
+this check can reject requests that would keep their rule.
+
+**Exact rule-change check** — apply a supported interpretation to a copy of the
+path and compare rule identities for the request's method. Case-folding and
+percent-decoding use this approach.
+
+**Blob subtree** — a `blob_subtree` registration. It behaves like `subtree` during
+requests and additionally forbids more-specific paths beneath it at build time.
+It does not disable checks or remove method restrictions.
+
+**Custom detector / probe** — a user-provided `StructuralProbe` that can reject
+a path. It cannot allow a path rejected by another check or extend the built-in
+model's guarantee.

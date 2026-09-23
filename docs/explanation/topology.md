@@ -1,4 +1,4 @@
-# Where the differential lives
+# Why downstream parsing matters
 
 The path-confusion gap exists only because **two systems parse the path** — the proxy
 hosting this crate makes the authorization decision, a separate backend serves the
@@ -19,7 +19,7 @@ The structural configuration is set once, for the whole guard, and that is a
 consequence of *where this layer sits*, not a missing knob. The guard runs at
 authorization time — **before** upstream selection, which happens lower down (the inner
 proxy's peer choice) and may key on the host, headers, or its own routing, not just the
-path. So this layer has an *authz* route table; it does **not** have, and cannot verify,
+path. So this layer has an authorization route table; it does **not** have, and cannot verify,
 the binding from a request to the backend that will actually serve it.
 
 That is why the configuration is global: it must include the relevant behavior of

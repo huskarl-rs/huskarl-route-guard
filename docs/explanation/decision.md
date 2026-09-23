@@ -1,202 +1,139 @@
 # How the guard decides
 
-*The property these checks enforce, and its assumptions, are stated in the
-[Security contract](crate::_docs::reference::contract). The few library-specific
-terms are defined in the [Glossary](crate::_docs::reference::glossary).*
+The guard asks whether downstream parsing could change the authorization rule
+selected from the raw request path. It compares rule identities, including the
+default; it does not compare the caller's rule values.
 
-For every request the guard matches the **raw** path to a rule, then runs the
-following checks against that raw path. Each can only ever *deny* (`400`); if none
-fires, the raw path is forwarded untouched.
+Consider a table with an `/admin` subtree and a public default. The raw path
+`/admin%2fusers` selects the default, while decoding the slash produces
+`/admin/users`, which selects the admin rule. The guard rejects the request.
+It does not choose which interpretation the backend will use.
 
-Two definitions matter. A *rule* here is one `route`/`subtree` registration —
-**identity, not policy**: two separate registrations are different rules even if
-their policies are identical, and movement *within* a single `subtree` is never a
-relocation (its patterns share one rule). And the checks run on
-**every** request, whatever rule the raw path matched — a `public` or `optional`
-route is guarded exactly like a protected one. That is the whole point: the danger
-is a path the proxy authorizes under a *permissive* rule but the backend serves
-under a *stricter* one (or the reverse). When a relocation is found the guard
-**denies** rather than re-routing to the other rule — it cannot know which rule the
-backend will actually resolve to, so this design refuses the request instead of
-guessing.
+Now consider a lone `/files` subtree. Both `/files/a%2fb` and `/files/a/b`
+select its rule. An encoded slash does not by itself require rejection: what
+matters is whether parsing could cross a rule boundary.
 
-1. **Scoped structural check** — deny a recognized *structural form* (encoded separator,
-   dot-segment, matrix-param, …) unless the route table proves it harmless: every
-   rule reachable past the byte's **anchor** (the last clean separator before it,
-   raised one level per dot-segment) must be the very rule the raw path matched.
-   Models **no particular backend** — only the shared shape of the supported structural
-   family: such transforms rewrite the path at or after their own position.
-2. **Case-fold reject** (under
-   [`CaseSensitivity::Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive)
-   only) — lowercase the path, re-route the folded form, and deny if it lands on a
-   *different* rule. Models the declared case-folding backend, precisely:
-   `/files/ReadMe.TXT` folds within its own rule and is allowed; `/ADMIN` folding
-   onto a distinct `/admin` rule is denied.
-3. **Content-decode check** — percent-decode the path (lowercasing the result when
-   the backend folds case), re-route every possible whole-path result, and deny if
-   any lands on a *different* rule. This models the possibility of consistent
-   whole-path percent decoding; selective decoders are outside the model.
-4. **Custom probes** — any
-   [`StructuralProbe`](crate::path_confusion::StructuralProbe) you registered,
-   denied on presence.
+This explanation describes the default
+[`RejectStructural`](crate::path_confusion::PathConfusion::RejectStructural)
+mode. Despite its name, it allows structural forms where the checks establish
+that the rule cannot change. The
+[security contract](crate::_docs::reference::contract) states the precise guarantee,
+and the [coverage reference](crate::_docs::reference::coverage) lists supported
+parsing behaviors and exclusions.
 
-The checks are complementary along a principled line. The scoped structural check covers
-relocations that **shift segment boundaries or climb** the tree. It cannot apply
-those transforms — slash-merging, `;`-strip, dot-resolution come in an open-ended
-*family* of backend-specific orders and compositions — but it exploits the one
-property every supported member shares: a structural form rewrites the path only **at or
-after its own position**. So the check scopes the danger instead of simulating it:
-everything before the byte's last clean separator is untouchable, the possible
-rewrites all land in that separator's subtree (widened one level per dot-segment,
-which pops at most one segment each), and if the table routes *everything* in that
-subtree — gaps to the default rule included — to the rule the raw path already
-matched, no member of the family can relocate the request. Case-fold and
-content-decode cover relocations that **change which literal matches** — each
-models a *deterministic declared transform* (fold, decode), so the guard simply
-applies it, re-routes, and compares rules: precise, never an over-approximation. No
-single check is sufficient; together they cover both axes of the declared model.
+## Why there are two kinds of check
 
-## Quick reference: deny on sight, or deny on reachability?
+Some parsing behaviors change the content of a segment predictably. For example,
+`/%61dmin` decodes to `/admin`, and ASCII case folding changes `/ADMIN` to
+`/admin`. The guard can apply these operations to a copy of the path and compare
+the selected rule with the raw path's rule.
 
-The practical question when reading a denied (or allowed) request: did this form
-deny because it was *present*, or because of what the rest of the route table looks
-like? Under the default mode
-([`reject_structural`](crate::path_confusion::PathConfusion::reject_structural)):
+Structural behavior is harder to simulate. Slash merging, path-parameter removal,
+and dot-segment resolution can interact in different orders. Instead of choosing
+one order, the guard calculates a region that contains the possible results.
+If every path and method in that region selects the same rule, the structural
+form cannot cross a rule boundary.
 
-| Found in the path | Verdict | Does the route table matter? |
-|---|---|---|
-| NUL — raw or `%00` (always-on) | deny on sight | no — denied everywhere, unconditionally |
-| anything a registered [`StructuralProbe`](crate::path_confusion::StructuralProbe) matches | deny on sight | no — whole-path, unconditionally |
-| dot-segment — `.`/`..` as a whole segment, encoded (`%2E`), or revealed by an enabled delimiter (`..%2Fx`, `..;x`) | deny unless **scoped**: the anchor, raised one level per dot-segment, still bounds a subtree the matched rule covers uniformly | yes — a climb that provably resolves *within* its own rule flows |
-| encoded/alternate separator — `%2F`, empty segment `//`, plus `\`/`%5C`, overlong, `%252F`, `／` as enabled | deny unless **scoped**: every rule reachable past the anchor is the matched rule | yes — tolerated under a fully-registered single-rule subtree (`subtree`/`blob_subtree`), or in unrouted space |
-| matrix param — `;`/`%3B` and enabled alternate forms | same scoped verdict | yes — same tolerance |
-| ASCII uppercase (backend declared [`Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive)) | deny **only on relocation** — fold, re-route, deny iff the matched rule changes | yes |
-| any other percent-escape (`%61`, `%20`, …) | deny **only on relocation** — decode, re-route, deny iff the matched rule changes | yes |
-| none of the above | allow | — |
+This distinction explains both the useful tolerance under a complete subtree
+and the extra denials under partially covered prefixes.
 
-The rule of thumb: **recognized structure denies on reachability; content denies on
-relocation.** A form that could move a segment boundary or climb the tree is denied
-wherever some *other* rule is reachable within its scope — the guard never asks
-*which* transform would get there, because the family is open-ended, only whether
-there is anywhere else to go. A form that only changes what a segment *says* is
-judged by actually applying the declared transform and comparing rules.
+## Structural ambiguity: find a stable prefix
 
-Concretely:
+For `/files/a%2fb`, the slash before `a` ends the prefix `/files/`.
+Decoding the escape can change what comes after that prefix, but cannot change
+the prefix itself. The algorithm calls this stable prefix the **anchor**.
 
-- `/files/a%2fb` under a lone `subtree("/files", …)` is **allowed** — every path
-  under `/files/` is that one rule, so no split, merge, or strip can leave it.
-  Register anything else under `/files` and it flips to denied.
-- `/users/4%2F2` with `route("/users/{id}", …)` is **denied**: an exact route covers
-  only its own shape, so a split segment falls through to the default rule — a
-  reachable *other* rule.
-- An **unmatched** path carrying a recognized structural form flows when the surrounding
-  unrouted space is itself uniform (everything reachable is the default rule), and
-  denies where it borders a registered rule — e.g. `..` that could climb to the
-  root of a multi-rule table.
-- `/%61dmin` is **allowed** on a table with no `/admin` route (the decode changes no
-  rule) — and flips to denied the moment an `/admin` registration is added.
-- Uppercase alone never denies under the default mode, even when the backend is
-  declared case-folding — only a fold that lands on a different rule does.
+The guard computes it conservatively:
 
-Two consequences worth naming. **Strictness is derived from the table, not
-remembered by an operator**: a trivial table (one root subtree, or nothing but the
-default rule) quiets the structural checks because there is nothing to relocate
-*to*, and protection appears automatically, exactly at the boundaries, as rules are
-registered. And **the table only ever tightens**: adding a registration can turn
-allows into denies but never the reverse (a new registration that completes a
-subtree's coverage brings its own rule id into the reachable set) — pinned as an
-executable law alongside the configuration-monotonicity one.
+1. Find the earliest recognized structural form. Also consider any earlier `%`,
+   or uppercase ASCII when case folding is configured: these can change the
+   path before the structural form.
+2. Keep the path through the last slash before that position. If there is no
+   earlier usable prefix, use the root `/`. For `//`, the second slash is the
+   structural occurrence, because merging preserves the first.
+3. Shorten the prefix by one segment for each dot-segment capable of traversal,
+   stopping at the root. Counting more possible climbs can only add denials.
 
-The strict mode
-([`reject_non_canonical`](crate::path_confusion::PathConfusion::reject_non_canonical))
-collapses the whole table to deny on sight: every enabled structural form anywhere,
-**any** percent-escape at all, and (under a case-folding backend) any uppercase
-byte — the route table is never consulted and `blob_subtree` exemptions are ignored.
+An escape in an earlier segment does **not** always force the anchor to the root.
+For `/files/%61/a%2fb`, the earlier escape shortens it to `/files/`.
+For `/%66iles/a%2fb`, it becomes `/`. The implementation keeps whatever earlier
+prefix it can establish as stable.
 
-## 1. Scoped structural check
+Registered literal segments cannot contain enabled structural forms while the
+guard is active. This build-time check prevents a literal route from depending
+on the very spelling the guard treats as ambiguous.
 
-Rather than model what a backend *does* to a path, this asks a weaker,
-backend-independent question: **where could the reinterpreted path possibly land,
-and does the table route everything there to the same rule?** Registered patterns
-are **canonical** — a pattern that itself carries a recognized structural form is a build
-error — so the literal parts of a matched path match the pattern byte-for-byte,
-which means any recognized structural form in the request necessarily lands inside a
-**wildcard or catch-all**, and the prefix before it was matched literally.
-That build-time guarantee is load-bearing for everything below.
+## Structural ambiguity: check every reachable rule
 
-The verdict, per flagged path:
+The route tree summarizes whether a region contains one rule identity or several.
+The structural check accepts only when the anchor's region contains one identity
+and it agrees with the raw path's rule.
 
-1. **Anchor.** Every supported separator-like transform rewrites the path at or after the
-   byte that triggers it, so the path up to the last clean separator before the
-   *earliest* structural occurrence — the **stable prefix** — is untouchable.
-   (For a `//` empty segment the occurrence is the *second* slash: a merge keeps
-   the first.) Dot-segments climb: each `.`/`..`-capable segment pops at most one
-   level, so `k` of them raise the anchor `k` segments toward the root. If the
-   stable prefix itself carries content a declared transform could rewrite (a
-   percent-escape, or uppercase under a case-folding backend), the anchor widens
-   to the root — the prefix can no longer be trusted to stay put.
-2. **Uniform coverage.** Walk the route tree under the anchor, following every
-   branch the matcher's backtracking could take (literal *and* wildcard, plus any
-   ancestor catch-all a dead-end would fall back to), and collect every reachable
-   rule id — counting **fall-through to the default rule** wherever coverage has a
-   gap: an uncovered remainder, a missing trailing-slash terminal, a
-   method-qualified slot that other methods pass through. Allow iff that whole set
-   is exactly the rule the raw path matched; otherwise deny.
+The region includes:
 
-Two classes opt out of the scoping. A raw or `%00` **NUL** denies unconditionally —
-truncation could be scoped the same way, but no legitimate path carries a NUL, so
-the library chooses not to support NUL as path content. ASCII **case** is not part of the scoped structural
-check at all: under a case-folding backend it is handled by the precise case-fold
-reject above, so uppercase content that folds within its own rule is never denied.
+- literal and wildcard branches that path matching could reach;
+- ancestor catch-alls used when a more-specific branch cannot finish matching;
+- gaps that select the default, including missing trailing-slash coverage; and
+- all HTTP methods, including methods without a registration.
 
-**Opaque key spaces.** A prefix that legitimately proxies opaque identifiers whose
-keys contain encoded separators (object-store keys, …) gets its tolerance from
-uniformity: a fully-registered single-rule subtree — which is exactly what
-`subtree` and `blob_subtree` register — has no other rule reachable beneath it, so
-`%2F`/`;`/`\` in keys flow, and even a `..` deep enough to resolve within the
-subtree flows, while one that could climb out is denied (as is any fold or decode
-that would relocate out — the precise checks still run). What `blob_subtree` adds
-is a **build-time guarantee**: registering a more-specific route under it is a
-build error, so its uniformity — and therefore its tolerance — cannot be silently
-broken later; under a plain `subtree`, a nested registration simply (and safely)
-flips the affected paths back to denied.
+This is called **uniform coverage**: every path and method selects the same rule.
+The [routing reference](crate::_docs::reference::routing) specifies matching
+precedence and method behavior.
 
-Within the declared structural family, the check is a **conservative
-over-approximation**: the anchor's subtree is *every*
-path under it, not just the ones actual transforms can produce. `/users/4;2` under
-a lone `/users/{id}` route is denied because the anchor's subtree contains
-default-rule gaps — even though param-strip, the only transform a `;` enables,
-resolves it to `/users/4` inside its own rule. And a lone catch-all pattern without
-its bare and trailing-slash companions still denies, because a `;`-strip could
-shorten its tail into the default rule.
+The region is deliberately broader than the actual parsing results. With only
+`route("/users/{id}", rule)`, `/users/4;2` is denied because the analyzed
+`/users/` region includes default-rule gaps. Stripping the path parameter would
+actually produce `/users/4` and keep the rule. This is an intentional extra
+denial, not evidence that a backend necessarily changes the rule.
 
-This coarseness is deliberate. Case folding and whole-path decoding are deterministic
-interpretations, so the guard can apply them exactly. Structural behavior is a family:
-slash merging, parameter stripping, and dot-segment resolution can occur in different
-orders and combinations. The anchor needs only their shared constraint—that a
-recognized form rewrites at or after its position, with each dot-segment removing at
-most one preceding segment.
+By contrast, a complete all-method `subtree("/files", rule)` covers
+`/files/a%2fb` and every result in its analyzed region. A `blob_subtree` has the
+same request-time behavior; its extra protection is a build-time error if someone
+adds more-specific paths beneath it. Method restrictions can still prevent
+uniform coverage.
 
-A finer simulation would put mistakes in the dangerous direction: an omitted
-composition could become a silent allow. The broader reachable region can instead
-produce only additional denials within the declared model. Single-rule subtrees keep
-that cost away from opaque-key spaces, while the exact content checks allow ordinary
-escapes such as `%20` when decoding stays within one rule.
+## Case folding and percent-decoding: compare the results
 
-## 2. Exact content-decode check
+When case-insensitive parsing is configured, the guard lowercases ASCII letters
+and compares the resulting rule with the raw path's rule. A change within one
+rule, such as `/files/ReadMe.TXT` to `/files/readme.txt`, is accepted.
 
-A backend that percent-decodes the path sees different *content* in a segment, so
-`/%61dmin` may be served as `/admin`. No boundary moved, so
-the scoped structural check cannot see it. The guard therefore decodes the path once
-(and, under a declared
-[`DecodeLayers::UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo)
-topology, also twice), re-routes both possible complete-path results, and lowercases
-each candidate when the backend is
-[`CaseSensitivity::Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive)
-(a decoded escape can reveal an uppercase byte — `/%41dmin` → `/Admin` → `/admin`),
-then denies **only if a matched rule changes**. Checking every pass matters: a route
-sequence A → B → A is unsafe when the backend might decode once, even though a
-twice-decoding backend would return to A. Each candidate decodes the whole path to
-one consistent depth; depths are not mixed within a request. This is **precise**,
-not an over-approximation: `/foo%20bar` decodes only to same-rule paths and is
-allowed, so opaque encoded content keeps flowing.
+The percent-decoding check compares the raw rule against the result after one
+complete decode pass, and also after two passes under
+[`DecodeLayers::UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo).
+Each candidate is lowercased too when case folding is configured. This catches
+escapes that reveal uppercase letters, such as `/%41dmin`.
+
+Each pass matters. A sequence of rule identities A → B → A is unsafe if a
+downstream component might stop after one pass. The check uses a consistent
+decode depth across the whole path; selective decoding is outside the model.
+
+These comparisons use the request's actual method. Structural coverage spans all
+methods instead, which can cause additional denials for method-qualified subtrees.
+The distinction is specified in the
+[routing reference](crate::_docs::reference::routing).
+
+## Unconditional checks and strict mode
+
+NUL is unsupported path content and is always rejected when the guard is active.
+Custom probes also reject on presence: they can add denials but cannot make a
+request pass another check.
+
+[`RejectNonCanonical`](crate::path_confusion::PathConfusion::RejectNonCanonical)
+rejects every enabled structural form and every complete percent escape, plus
+uppercase ASCII when case folding is configured. It does not use the route table
+to grant exceptions. A blob registration therefore provides no tolerance in this
+mode. `Off` disables these checks; public `resolve` still validates its path input
+and checks the returned rule ID.
+
+## Why route-table changes matter
+
+Adding a registration can introduce another identity into a previously uniform
+region, causing encoded paths there to be rejected. Even an equal rule value gets
+a new identity. Adding registrations can tighten the guard's decisions; it cannot
+turn an existing denial into an allow within the supported model.
+
+The guard returns a result, not a forwarded request. The calling application
+enforces the selected policy and forwards allowed paths unchanged. For the
+reason behind that boundary, see
+[Why the guard never rewrites paths](crate::_docs::explanation::no_rewrite).

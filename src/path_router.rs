@@ -35,7 +35,7 @@ use crate::{
 };
 
 /// The outcome of matching a path: which rule applies, and whether it came from a
-/// registration or is the default rule (no registration covered the path).
+/// registration or is the default rule (no registration covered the path and method).
 ///
 /// The distinction is the route table's coverage made visible — an authorization
 /// layer typically logs *which* registration authorized a request, and treats a
@@ -51,7 +51,8 @@ pub enum RuleMatch<'a, R> {
         /// The matched registration's rule.
         rule: &'a R,
     },
-    /// No registration covers the path; the default rule applies.
+    /// No path matches, or the selected path has no rule for this method and no
+    /// all-method rule; the default applies.
     Default {
         /// The default rule.
         rule: &'a R,
@@ -224,7 +225,7 @@ impl<R> Registration<R> {
     /// Structural coverage spans all methods: restricting a subtree (including a
     /// blob subtree) introduces default-rule gaps for other methods, so structural
     /// keys can be denied even for a listed method. See
-    /// [method-qualified subtrees](crate::_docs::guide::configuring).
+    /// [Registering routes](crate::_docs::guide::registering).
     #[must_use]
     pub fn for_methods(mut self, method: impl Into<MethodMatch>) -> Self {
         self.method = method.into();
@@ -412,9 +413,8 @@ impl<R> RuleRouter<R> {
     /// [`message`](DenyReason::message) is the short static string for the denial
     /// response body; its `Display` is the attributed line for the *log*, so an
     /// operator can trace a `400` to the configuration knob or registration that
-    /// governs it. Which forms deny on sight and which deny only when they would
-    /// relocate the path to a different rule is tabulated in
-    /// [How the guard decides](crate::_docs::explanation::decision).
+    /// governs it. See [Handling a denial](crate::_docs::guide::handling_denials)
+    /// for the response to each reason.
     ///
     /// [`DenyReason::InvalidRuleId`] indicates an internal invariant violation
     /// and should be reported as a server error, not a client `400`.

@@ -1,108 +1,93 @@
 # Security contract
 
-What the guard promises, the conditions the promise rests on, and how close it gets
-to the ideal of denying *only* genuinely ambiguous paths.
+## Guarantee
 
-*The few library-specific terms used below are defined in the
-[Glossary](crate::_docs::reference::glossary).*
+For every request accepted by the active guard, every interpretation in the
+configured downstream parsing model selects the **same rule identity** as the raw
+path, using this route table.
 
-## The property
+The default rule has a distinct identity. A change from the default to a
+registration, from a registration to the default, or between registrations is a
+rule change. The guard rejects such requests rather than choosing an alternative
+rule for authorization.
 
-**Rule-interpretation agreement.** The unit of meaning is the *rule* — one
-`route`/`subtree` registration, with "unmatched" (the default rule) a real rule like
-any other. The property the guard enforces:
+Acceptance does not authorize the request. The caller must enforce the returned
+rule's policy. The crate does not forward requests.
 
-> For every request it forwards, every path interpretation in the **declared set**
-> resolves to the **same rule** selected from the raw path.
+## Scope and assumptions
 
-Equivalently: a request authorized as rule A must never be servable as rule B. B may
-be the default rule (authorized under a policy, served as unmatched), and A may be
-the default rule (authorized as unmatched, served under a real route — `/Files/x`
-folding onto a `/files` subtree). Both directions are bypasses; both are denied.
+- **Input:** pass the request path alone, normally `uri.path()`. `resolve` rejects
+  inputs that do not start with `/` (except `*`) or contain `?` or `#`.
+- **Forwarding:** the caller forwards accepted requests with their paths unchanged.
+  The guard does not rewrite them.
+- **Identity:** patterns in one registration share an identity. Separate
+  registrations remain distinct even if their rule values are equal.
+- **Parsing model:** the *declared interpretation set* consists of the built-in
+  parsing behaviors, enabled options, and their supported combinations. See
+  [Supported path interpretations](crate::_docs::reference::coverage) for the exact
+  scope, including decode-depth limits and exclusions.
+- **Deployment:** the guarantee depends on the downstream behavior being represented
+  by that model and this authorization route table. The library does not inspect
+  or certify a deployment.
+- **Mode:** `Off` disables ambiguity checks. `resolve` still validates input and
+  rejects invalid internal rule IDs. Custom probes can add denials but cannot
+  establish agreement for behaviors outside the model.
 
-The implementation exercises this property with an executable reference backend and
-property-based tests. Those tests do not establish that a real deployment belongs to
-the declared interpretation set. See
-[How the security claim is tested](crate::_docs::explanation::testing) for the test
-strategy and its limits.
+See [Routing behavior](crate::_docs::reference::routing) for pattern precedence,
+method fall-through, and registration identity.
 
-## Conditions and invariants
+## Decision precision
 
-1. **Rule identity, not policy equality.** Two registrations are distinct rules
-   even if their policies are identical, movement *within* one registration's
-   patterns is never a relocation, and the default rule counts as a rule.
-2. **Raw forwarding.** The guard's only intervention is deny; it never rewrites what
-   it forwards (see
-   [The guard never rewrites the path](crate::_docs::explanation::no_rewrite)).
-3. **A declared interpretation set.** The model is *this route table plus the path
-   behaviors you declare* ([`CaseSensitivity`](crate::path_confusion::CaseSensitivity),
-   [`DecodeLayers`](crate::path_confusion::DecodeLayers),
-   [`StructuralClasses`](crate::path_confusion::StructuralClasses)). Behaviour outside
-   that set is invisible; the guard is exactly as complete as the declaration
-   (see [Supported interpretations](crate::_docs::reference::coverage)). NUL truncation is always in
-   the set — it is the one interpretation assumed rather than declared. The library
-   deliberately treats NUL as unsupported path content.
-4. **Imprecision fails closed.** Within the declared model, imprecision lands on the deny side: a false positive
-   costs availability (a `400` for a non-canonical spelling); a false negative is an
-   authorization bypass. No mechanism in the crate may trade the latter for the
-   former.
-5. **Stricter settings only add denials.** Every knob's stricter setting denies a superset of the
-   looser one. Within the declared model, tightening cannot create an allowed request,
-   so an unsure operator can over-declare
-   (see [Choosing a configuration](crate::_docs::guide::configuring)).
-6. **Canonical request paths flow.** Within the built-in model, the deny set contains
-   only non-canonical paths — ones carrying a recognized structural form, a
-   percent-escape, or (under a declared case-folding backend) uppercase. A canonical
-   request is not denied by the built-in checks. (Custom
-   [`StructuralProbe`](crate::path_confusion::StructuralProbe)s are the one
-   exception by design: an arbitrary deny-only predicate may reject content the
-   built-in model considers clean.) This condition does not promise that every
-   non-canonical resource identifier has an equivalent canonical spelling.
+| Check | Acceptance condition |
+|---|---|
+| Structural ambiguity | Every path and method in the conservatively analyzed region selects the raw path's rule identity |
+| ASCII case folding | Lowercasing selects the same rule for the request method |
+| Whole-path percent-decoding | Each configured complete decode result selects the same rule for the request method; results are also lowercased when configured |
+| NUL | Always rejected while the guard is active |
+| Custom probe | Rejected if any probe matches |
 
-Conditions 4–6 are exercised as executable properties: the one-sided reference-backend
-oracle, the configuration-monotonicity law, and the clean-path-never-denied law all
-run under `cargo test`.
+The structural check can reject a request even when every actual interpretation
+keeps its rule. For example, under a lone `/users/{id}` registration,
+`/users/4;2` is denied: the analyzed region contains default-rule gaps even
+though stripping `;2` keeps the rule. This is a conservative approximation:
+imprecision must add denials, never permit a rule change within the model.
 
-## How close to "deny only genuine ambiguity"?
+The case-folding and percent-decoding comparisons are exact for their respective
+modeled results. Other checks can still reject the same request. The reasons for
+this split and the structural region calculation belong to
+[How the guard decides](crate::_docs::explanation::decision).
 
-The ideal guard denies a path exactly when some declared interpretation resolves it to a
-different rule — no more. The real guard is exact on one axis and deliberately
-over-approximate on the other:
+## Modes
 
-- **Exact: the content axis.** The case-fold and content-decode checks *apply* the
-  declared transform and compare rules, so they deny iff a relocation actually exists
-  in this table. `/%61dmin` on a table with no `/admin` route is allowed; register
-  `/admin` and it flips to denied. No gap.
-- **Over-approximate: the structure axis.** Separator-like and traversal forms — encoded
-  separators, `//`, `;`, `..`, and their enabled alternate encodings — deny on
-  **anchored reachability**: the guard bounds where the supported structural family
-  could move the path (nothing before the form's anchor, one level of climb per
-  dot-segment) and denies iff the table routes anything in that bound to a
-  *different* rule than the raw path matched. It never applies the transforms
-  themselves, so the bound is coarse in a specific way: it treats **every** path
-  under the anchor as reachable, not just actual transform images. The remaining
-  over-denial is visible in this example: `/users/4;2` under a lone `/users/{id}`
-  route is denied — the anchor's subtree
-  contains default-rule fall-throughs — even though the only transform a `;` enables
-  (param-strip, which never crosses a separator) resolves it to `/users/4`, inside
-  its own rule. By contrast, `/files/a%2fb` under a lone `/files` subtree flows:
-  the subtree contains one rule, so the form cannot relocate within the declared
-  model.
-  `over_approximation_tests` pins the `;` case as denied *while* no declared
-  interpretation relocates it — the definition of
-  an over-approximation — and pins the uniform-subtree case, and the subtree remedy
-  below, as allowed. The over-denial is therefore documented and regression-tested.
-  NUL keeps an unconditional deny because the library does not support it as path
-  content.
+| Mode | Behavior |
+|---|---|
+| `RejectStructural` (default) | Applies the checks above; structural forms can be accepted when the analyzed region has one rule |
+| `RejectNonCanonical` | Rejects every enabled structural form, every complete percent escape, and uppercase ASCII when case folding is configured; also runs custom probes |
+| `Off` | Does not run ambiguity checks or custom probes |
 
-Stated precisely, the over-denial surface is: **paths carrying a recognized structural form
-whose every declared interpretation stays within its own rule, in a region the table does
-not cover uniformly** — most commonly separator or param bytes under an exact route
-or a partially-registered prefix. If that surface matters to a deployment, the
-remedy is registering the prefix as a full subtree (`subtree`/`blob_subtree`) so its
-uniformity is visible to the guard — never a relaxation of the structural classes,
-which removes that check entirely (see
-[Where the differential lives](crate::_docs::explanation::topology)).
+The strict mode does not grant exceptions for subtrees or blobs. Neither active
+mode rejects every possible unusual spelling: recognition remains limited to the
+configured model.
 
-The per-form split — which forms deny on sight and which deny only on relocation — is
-tabulated in [How the guard decides](crate::_docs::explanation::decision).
+## Invariants
+
+1. **Stricter settings only add denials.** Within the supported model, enabling more
+   checks or increasing decode depth cannot turn a denial into acceptance.
+2. **Adding registrations only adds denials.** A new registration has its own
+   identity, even if its rule value equals an existing value.
+3. **Canonical request paths pass built-in ambiguity checks.** Here, canonical means
+   a slash-prefixed path with no recognized structural form, no percent escape,
+   and no uppercase ASCII when case folding is configured. Custom probes may
+   reject such paths. Input validation and internal invariant failures are
+   separate from the ambiguity checks.
+4. **Failure does not return a rule.** `resolve` returns `Err(DenyReason)` on a
+   denial, including an invalid internal rule ID. That internal failure must not
+   be treated as successful default matching.
+
+The test suite exercises rule agreement, stricter configurations, added
+registrations, and canonical paths. These are implementation checks against an
+executable model, not proof about a deployed backend. See
+[How the security claim is tested](crate::_docs::explanation::testing).
+
+For operational responses to extra denials, use
+[Handling a denial](crate::_docs::guide::handling_denials).

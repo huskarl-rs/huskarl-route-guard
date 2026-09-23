@@ -302,7 +302,7 @@ fn unescape_braces(s: &str) -> String {
 /// terminal therefore remains more specific than a wildcard or catch-all terminal even
 /// when it has no entry for the request method. In that case resolution uses an `Any`
 /// entry at the same terminal, or the default rule; it does not backtrack to a
-/// less-specific path. See the crate-level example.
+/// less-specific path. See [Routing behavior](crate::_docs::reference::routing).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum MethodMatch {
     /// Matches any method (the wildcard default).

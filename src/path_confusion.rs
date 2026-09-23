@@ -1,48 +1,29 @@
-//! Path-confusion configuration: the types that declare the guard's mode and the
-//! backend behaviours it models.
+//! Configure the downstream parsing behaviors that the guard checks.
 //!
-//! Rules are matched on the request path, but the **raw** path is forwarded upstream
-//! unchanged. If the proxy and the upstream disagree about what a path *means* — a
-//! parser differential — a request can be authorized as one path while the upstream
-//! acts on another (`/x/../admin/secret`, `/admin%2fsecret`, `/%61dmin`, …). The
-//! guard denies a request when an interpretation in its declared model selects a
-//! different rule; it never rewrites what is forwarded.
+//! Use [`GuardConfig`] with [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config),
+//! or set the options individually on [`RuleRouter::builder`](crate::RuleRouter::builder).
 //!
-//! Four types configure the guard, individually through
-//! [`RuleRouter::build`](crate::RuleRouter::build) or grouped in [`GuardConfig`]
-//! through [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config):
+//! | Setting | Purpose | Default |
+//! |---|---|---|
+//! | [`PathConfusion`] | Choose checks based on possible rule changes, strict rejection, or off | [`RejectStructural`](PathConfusion::RejectStructural) |
+//! | [`CaseSensitivity`] | Declare whether downstream routing folds ASCII case | Required |
+//! | [`DecodeLayers`] | Declare the maximum supported percent-decode depth | Required |
+//! | [`StructuralClasses`] | Enable additional structural forms and custom detectors | Built-in classes only |
 //!
-//! - [`PathConfusion`] selects the mode (the default scoped structural check, the strict
-//!   all-positions reject, or off);
-//! - [`CaseSensitivity`] declares whether the upstream folds ASCII case — **required**,
-//!   with no default, because the library cannot infer it;
-//! - [`DecodeLayers`] declares whether up to two percent-decode passes may happen
-//!   behind this layer (a CDN/WAF/proxy in front of the origin) — likewise
-//!   **required**, with no default;
-//! - [`StructuralClasses`] selects which structural classes and encodings beyond the
-//!   always-on default the guard recognises, plus any custom [`StructuralProbe`]
-//!   detectors.
+//! These settings describe possible downstream behaviors; the crate does not detect
+//! them from your deployment. The default mode permits some structural forms when
+//! the checks establish that they cannot change the rule.
 //!
-//! When the guard denies, it reports a [`DenyReason`] naming the
-//! check and structural class that fired, so an operator can attribute a `400` to the
-//! configuration knob (or [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree)
-//! registration) that governs it.
+//! For practical choices, follow [Choosing a configuration](crate::_docs::guide::configuring).
+//! For exact guarantees and exclusions, consult the
+//! [security contract](crate::_docs::reference::contract) and
+//! [supported parsing behaviors](crate::_docs::reference::coverage).
+//! [How the guard decides](crate::_docs::explanation::decision) explains the algorithm.
 //!
-//! The full story lives in the [extended documentation](crate::_docs):
-//!
-//! - [The security contract](crate::_docs::reference::contract) — the property the guard
-//!   enforces, its conditions, and precisely where it over-denies;
-//! - [How the guard decides](crate::_docs::explanation::decision) — the checks that
-//!   run per request, and which forms deny on sight versus only on relocation;
-//! - [Supported interpretations](crate::_docs::reference::coverage) — what is and is not caught;
-//! - [The guard never rewrites the path](crate::_docs::explanation::no_rewrite) —
-//!   detection, not sanitisation, as a design position;
-//! - [Where the differential lives](crate::_docs::explanation::topology) — the split
-//!   topology this crate exists for, and why the configuration is global;
-//! - [Choosing a configuration](crate::_docs::guide::configuring) — the four
-//!   per-deployment decisions and their conservative directions;
-//! - [Glossary](crate::_docs::reference::glossary) — the small amount of
-//!   library-specific vocabulary.
+//! A rejected request carries a [`DenyReason`]. Its [`Display`](std::fmt::Display)
+//! gives the log detail; [`message()`](DenyReason::message) gives a short response
+//! message. The calling application sends the response and must not forward a
+//! rejected request.
 
 use std::sync::Arc;
 
@@ -74,7 +55,7 @@ use std::sync::Arc;
 /// ```
 #[derive(Clone, Debug)]
 pub struct GuardConfig {
-    /// Enforcement mode; defaults to scoped structural rejection.
+    /// Enforcement mode; defaults to checking for possible rule changes.
     pub path_confusion: PathConfusion,
     /// Additional structural classes and custom probes.
     pub structural_classes: StructuralClasses,
@@ -97,50 +78,39 @@ impl GuardConfig {
     }
 }
 
-/// Which path-confusion guard is active.
+/// Which ambiguity checks to run.
 ///
-/// Defaults to [`RejectStructural`](PathConfusion::RejectStructural): a recognized
-/// structural form denies unless the route table proves it harmless — every rule
-/// reachable past the form's anchor must be the rule the raw path matched (**scoped
-/// denial**) — while non-structural forms (ASCII case, ordinary escapes) deny only
-/// when the declared transform would **relocate** the path to a different rule.
-/// Which form gets which treatment is tabulated in
-/// [How the guard decides](crate::_docs::explanation::decision).
+/// The default checks for possible rule changes. The strict mode rejects every
+/// recognized non-canonical form, even when the rule would stay the same.
+/// See the [security contract](crate::_docs::reference::contract) for exact behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PathConfusion {
-    /// Deny (`400`) a request carrying a recognized structural form (`%2F`, `..`, `;`, …)
-    /// when its modeled reach contains another rule. This check does not simulate one
-    /// particular backend; it relies on the property the supported structural
-    /// interpretations share: a form rewrites the path at or after its own position (a
-    /// dot-segment additionally removes at most one preceding segment). The form
-    /// denies iff the route table makes some *other* rule — the default rule via a
-    /// coverage gap included — reachable within that bound. In practice: encoded
-    /// separators and matrix params **flow** under a fully-registered single-rule
-    /// subtree ([`subtree`](crate::RuleRouterBuilder::subtree) /
-    /// [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree)) and in unrouted
-    /// space, and **deny** wherever registrations divide the space; a `..` flows
-    /// only when its possible traversal stays inside its own rule; NUL always
-    /// denies. **The default.**
+    /// Check whether downstream parsing could select a different rule. The default.
+    ///
+    /// Despite the name, this mode accepts structural forms such as encoded slashes
+    /// when every path and method in the analyzed region selects the same rule.
+    /// Structural analysis is conservative and may reject more than actual parsing
+    /// would require. Case folding and percent-decoding compare the resulting rules
+    /// directly for the request method. NUL is always rejected.
+    ///
+    /// See [How the guard decides](crate::_docs::explanation::decision).
     #[default]
     RejectStructural,
-    /// Deny (`400`) any request carrying a recognized structural form (`%2F`, `..`, `//`, `;`)
-    /// **anywhere** in the path — the strictest point on the same axis as
-    /// [`RejectStructural`](Self::RejectStructural), with *every* position treated as
-    /// live (the table is not consulted). Strict hygiene / defense in depth: refuses
-    /// `..`, `//`, encoded separators, etc. outright, even where they would not change
-    /// the matched rule. It also rejects every percent escape and, under a declared
-    /// case-insensitive interpretation, uppercase. Opt in deliberately: this rejects
-    /// legitimate encoded content such as blob keys. Honors the configured
-    /// [`StructuralClasses`].
+    /// Reject every enabled structural form, every complete percent escape, and
+    /// uppercase ASCII when case-insensitive parsing is configured.
+    ///
+    /// Applies everywhere, including blob subtrees, without checking whether the
+    /// rule would change. This can reject legitimate encoded keys. Recognition is
+    /// still limited to the configured [`StructuralClasses`] and parsing model.
     RejectNonCanonical,
-    /// Disable the guard entirely.
+    /// Disable ambiguity checks and custom probes. [`resolve`](crate::RuleRouter::resolve)
+    /// still validates the path input and checks internal rule IDs.
     Off,
 }
 
 impl PathConfusion {
-    /// Deny recognized structural forms in route-relevant positions, without modeling a
-    /// backend (scoped structural check; see
-    /// [`RejectStructural`](Self::RejectStructural)). **The default.**
+    /// Check for possible rule changes; see [`RejectStructural`](Self::RejectStructural).
+    /// This is the default mode.
     #[must_use]
     pub fn reject_structural() -> Self {
         Self::RejectStructural

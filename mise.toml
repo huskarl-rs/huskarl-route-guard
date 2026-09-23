@@ -1,6 +1,6 @@
 [tools]
 "cargo:cargo-bolero" = "latest"
-"cargo:cargo-readme" = "3.4.0"
+"cargo:cargo-readme" = "latest"
 
 [tasks.fmt]
 run = "cargo +nightly fmt"

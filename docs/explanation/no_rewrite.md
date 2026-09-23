@@ -1,7 +1,8 @@
-# Why the guard forwards the raw path
+# Why the guard never rewrites paths
 
-The guard either denies a request or forwards its path unchanged. This is a boundary
-choice, not a claim that normalization is always wrong.
+The guard returns a rule or a denial; it does not forward requests. Its contract
+assumes the calling application forwards allowed requests with the path unchanged.
+This choice does not imply that normalization is always wrong.
 
 Normalization can be sound when one trusted component uses the same normalized value
 for authorization and dispatch, and downstream components cannot reinterpret it. In

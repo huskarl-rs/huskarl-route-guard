@@ -1,7 +1,8 @@
 # Choosing a configuration
 
-The configuration is a security assertion about the complete downstream path. The
-library cannot derive it from a framework name or inspect the deployment for you.
+Configure the parsing behaviors that may occur after your application forwards a
+request. Include every downstream component, not just the final server. The library
+cannot infer these behaviors from a framework name or inspect the deployment.
 
 ## Before you configure
 
@@ -19,16 +20,14 @@ characterization as security-testing work.
 
 Make these four per-deployment choices in order. Two are **required
 declarations** with no default — the builder will not compile without them —
-because they are facts about your topology the library cannot infer and refuses to
-guess in either direction:
+because the library cannot determine them:
 
 1. **Declare [`CaseSensitivity`](crate::path_confusion::CaseSensitivity)** —
    required, no default. Pick
-   [`Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive) for IIS /
-   ASP.NET, servlet containers on Windows, or files served from a Windows/macOS
-   filesystem;
-   [`Sensitive`](crate::path_confusion::CaseSensitivity::Sensitive) for a typical
-   Unix-style backend.
+   [`Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive) if a
+   downstream component folds ASCII case. Register literal routes in lowercase.
+   Pick [`Sensitive`](crate::path_confusion::CaseSensitivity::Sensitive) only when
+   downstream routing distinguishes ASCII case.
 2. **Declare [`DecodeLayers`](crate::path_confusion::DecodeLayers)** — required, no
    default. Pick [`UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo) when the
    whole path may be decoded either once or twice before it is finally routed — a
@@ -49,9 +48,10 @@ guess in either direction:
    NUL as path content.)
 4. **Pick the [`PathConfusion`](crate::path_confusion::PathConfusion) mode.**
    [`reject_structural`](crate::path_confusion::PathConfusion::reject_structural)
-   (the default) is the scoped check described in
-   [How the guard decides](crate::_docs::explanation::decision); pair it with
-   `blob_subtree` where you serve opaque keys;
+   (the default) rejects possible rule changes. Despite its name, it accepts
+   structural forms where the route table establishes that they cannot change the
+   rule. Use [Registering routes](crate::_docs::guide::registering) when setting up
+   areas for encoded keys;
    [`reject_non_canonical`](crate::path_confusion::PathConfusion::reject_non_canonical)
    is strict defense-in-depth that denies every form it recognizes as non-canonical —
    **including opaque blob keys and any percent-escape** — so opt in only where you
@@ -68,20 +68,6 @@ constructor requires case sensitivity and decode depth; mode and structural clas
 start at their defaults. Customize its fields and clone it when several route
 tables share the same downstream assumptions. The existing router builder remains
 available for declaring settings individually.
-
-## Method-qualified subtrees
-
-Structural coverage is computed across **all methods**, even though an individual
-request has one method. A GET-only `subtree_for` or `blob_subtree_for` therefore
-does not establish uniform coverage: unlisted methods fall through to the default
-rule. `/files/a%2fb` is denied even for GET under a lone GET-only `/files` subtree,
-while `/files/clean` still resolves normally. Case-folding and content-decode
-comparisons, in contrast, use the request's actual method.
-
-This is a deliberate availability tradeoff in the structural approximation.
-The blob declaration prevents nested paths; it does not make coverage uniform
-across methods. An all-method subtree can provide encoded-key tolerance, but only
-register one when its rule actually enforces the intended policy for every method.
 
 ## When behavior remains uncertain
 
