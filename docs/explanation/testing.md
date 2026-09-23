@@ -27,7 +27,11 @@ reachable routes beneath an **anchor** and requires that region to contain one r
 That argument depends on every supported structural transform leaving the anchor
 prefix unchanged. The property
 `no_modeled_transform_rewrites_inside_the_anchor` checks this premise directly across
-the enumerated subsets and sampled orders. Separate tests exhaust every order for a
+the enumerated subsets and sampled orders. A deterministic negative control adds an
+out-of-family strip-and-rescan sanitizer to the reference pipeline: the ordinary
+backend preserves a non-root anchor, while the mutated pipeline fails the same
+assertion after manufacturing traversal from `....//`. This verifies detection of
+that mutation, not every possible future transform. Separate tests exhaust every order for a
 bounded set of paths and transform sets of at most four steps. This is substantial
 regression coverage, not a formal proof over arbitrary paths and orders.
 
@@ -64,6 +68,51 @@ documents a behavior outside the model rather than claiming the guard rejects it
 These layers support one bounded conclusion: the implementation has strong evidence
 for its stated contract over the supported model. Platform behavior outside that model
 requires separate evidence and remains outside the guarantee.
+
+## Mutation sensitivity
+
+`mise run mutation-property` applies four fail-open guard mutations and runs only
+`guard_denies_every_modeled_relocation`. This checks that its assertion detects
+broken enforcement independently of other tests. `mise run mutation` audits all
+mutants generated in `guard.rs` and `structural.rs` against the unit and integration
+suite. Both use the pinned cargo-mutants version and a fixed proptest seed; ordinary
+Bolero smoke tests in the full suite remain randomized.
+
+These are on-demand audits. Survivors produce a nonzero exit status and require
+triage: a mutation can be equivalent, affect only diagnostics, or make the guard
+more conservative. Soundness alone cannot reject an always-deny implementation.
+Raw diffs and outcomes are disposable artifacts under `target/mutation-audit/`.
+A second property seed is supported through `PROPTEST_RNG_SEED`;
+`MUTATION_OUTPUT` preserves separate runs.
+
+### Known survivor rationale
+
+The September 2026 audit left six explained survivors after adding tests for
+inclusive analysis budgets, structural explanations at the budget, and overlapping
+set unions. These are triage notes, not permanent mutation exclusions:
+
+| Mutation | Rationale |
+| --- | --- |
+| `interpretations_deny` early-return condition: `||` → `&&` | Changes which precise checks are skipped; the final structural denial still applies. |
+| Same condition's length comparison: `>` → `==` | Verdict-redundant under the check ordering described below. |
+| Same length comparison: `>` → `<` | Same ordering rationale. |
+| Same length comparison: `>` → `>=` | Same ordering rationale. |
+| `ClassSet::SEPARATOR`: `1 << 0` → `1 >> 0` | Equivalent: both expressions are one. |
+| Internal `ClassSet::fmt`: return `Ok(())` without output | Untested diagnostic formatting, not equivalent behavior or an enforcement check. No exact debug-format contract is required. |
+
+The four early-return mutations preserve structural scanning and accumulation.
+The final `positional_deny` still rejects NUL and oversized structural paths;
+oversized percent-bearing paths are rejected before the loop, and precise checks
+have their own length check. Removing an early skip can perform extra work but
+cannot override the later structural denial.
+
+Skipping additional precise checks at or below the budget requires a structural
+hit or NUL. NUL still denies. For other structural hits, acceptance requires uniform
+anchor coverage, with the anchor bounded before the first content escape or
+case-folding byte. That already requires one identity throughout the relevant
+region. Revisit these four classifications if anchor construction, check precedence,
+or interpretation accumulation changes. Their rationale depends on these code
+invariants; surviving a mutation run alone does not establish equivalence.
 
 ## Real downstream baselines
 

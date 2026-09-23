@@ -273,6 +273,8 @@ enum Step {
     Merge,
     Dots,
     Case,
+    // Negative control only: excluded from canonical_order and modeled_backends.
+    StripTraversalControl,
 }
 
 fn apply(
@@ -284,6 +286,7 @@ fn apply(
     case_insensitive: bool,
 ) -> String {
     match step {
+        Step::StripTraversalControl => t.replace("../", ""),
         Step::Trunc => truncate_at_nul(t),
         Step::DecodeStruct => decode_pass(t, backend, classes, layers),
         Step::DecodeUnres => decode_unreserved(t),
@@ -1024,25 +1027,11 @@ proptest! {
         prop_assert!(router.resolve(&raw, &actual).is_err());
     }
 
-    /// The **premise** the structural verdict rests on, asserted directly rather than
-    /// inferred from the conclusion: no modeled transform, in any order, rewrites
-    /// inside the guard's anchor.
-    ///
-    /// [`guard_denies_every_modeled_relocation`] tests the *conclusion* — allow implies
-    /// no relocation. It holds because the guard bounds where a structural byte can
-    /// move a path (the anchor) and denies unless that whole region is one rule. That
-    /// reasoning has exactly one assumption: **every modeled transform leaves the
-    /// anchor prefix alone**, so every reinterpretation lands inside the bounded
-    /// region. Nothing else checks it — the conclusion cannot, because a path whose
-    /// bound is wrong is usually denied for unrelated reasons and never reaches the
-    /// assertion.
-    ///
-    /// This is the check that catches the dangerous shape directly: a transform that
-    /// rewrites *before* its own trigger. Add a strip-and-rescan sanitizer
-    /// ([coverage](crate::_docs::reference::coverage) puts them out of family,
-    /// where `....//` collapses to `../`) to [`Backend`] without widening the anchor,
-    /// and this fails on the transform itself — not several inferences downstream, and
-    /// not only on the rare table where it also flips a rule.
+    /// Every modeled transform must preserve the anchor prefix, including on paths
+    /// denied for unrelated reasons. The relocation property alone cannot check this
+    /// premise because it only constrains accepted requests. A deterministic mutation
+    /// control below verifies that the shared assertion detects a sanitizer that
+    /// manufactures traversal from otherwise inert dots.
     #[test]
     fn no_modeled_transform_rewrites_inside_the_anchor(
         specs in specs_strategy(),
@@ -1069,14 +1058,7 @@ proptest! {
                 let normalized = normalize_ordered(
                     &path, backend, &classes, layers, case.is_insensitive(), order,
                 );
-                prop_assert!(
-                    normalized.starts_with(anchor),
-                    "ANCHOR VIOLATED: {:?} has anchor {:?}, but backend {:?} applying {:?} \
-                     normalizes it to {:?} — the reachable-set argument bounds relocation \
-                     by that prefix, so a transform reaching behind it makes every scoped \
-                     allow unsound (classes {:?}, layers {:?}, case {:?})",
-                    path, anchor, backend, order, normalized, classes, layers, case
-                );
+                check_anchor_preserved(&path, anchor, &normalized)?;
             }
         }
     }
@@ -1098,6 +1080,63 @@ proptest! {
         let _ = router.raw_identity_for_test(&path, &http::Method::GET);
         let _ = router.denial_for_test(&path, &http::Method::GET);
     }
+}
+
+/// Shared assertion for generated backends and the deterministic mutation control.
+fn check_anchor_preserved(
+    path: &str,
+    anchor: &str,
+    normalized: &str,
+) -> proptest::test_runner::TestCaseResult {
+    prop_assert!(
+        normalized.starts_with(anchor),
+        "ANCHOR VIOLATED: {:?} has anchor {:?}, but normalizes to {:?}",
+        path,
+        anchor,
+        normalized
+    );
+    Ok(())
+}
+
+#[test]
+fn anchor_property_detects_strip_and_rescan_mutation() {
+    let classes = StructuralClasses::new();
+    let layers = DecodeDepth::UpToOne;
+    let router = build_router(
+        &[('s', "/safe")],
+        classes.clone(),
+        layers,
+        CaseSensitivity::Sensitive,
+    )
+    .expect("fixed table builds");
+    let path = "/safe/....//admin";
+    let anchor = router
+        .structural_anchor(path)
+        .expect("witness must exercise an anchor");
+    assert_eq!(anchor, "/safe/..../");
+    let backend = Backend {
+        merge_slashes: true,
+        resolve_dots: true,
+        ..Backend::NONE
+    };
+    let ordinary = normalize(path, backend, &classes, layers, false);
+    assert_eq!(ordinary, "/safe/..../admin");
+    check_anchor_preserved(path, anchor, &ordinary).expect("modeled transforms preserve anchor");
+
+    // A single-pass sanitizer manufactures ../ from ....//. Dot resolution then
+    // removes a segment before the original trigger, outside the modeled family.
+    let mutated = normalize_ordered(
+        path,
+        backend,
+        &classes,
+        layers,
+        false,
+        &[Step::StripTraversalControl, Step::Merge, Step::Dots],
+    );
+    assert_eq!(mutated, "/admin");
+    let error = check_anchor_preserved(path, anchor, &mutated)
+        .expect_err("the same property must reject the incompatible transform");
+    assert!(error.to_string().contains("ANCHOR VIOLATED"));
 }
 
 /// Bolero harness for [`fuzz_guard_relocation`] — the guard's soundness claim against the
@@ -1254,8 +1293,7 @@ mod transform_order_tests {
         )
         .expect("table builds");
         assert!(router.denial_for_test(path, &http::Method::GET).is_some());
-        // …and the two orders really do disagree about the rule, so the deny is
-        // load-bearing rather than incidental.
+        // The two transform orders reach different rules, requiring denial.
         assert_ne!(
             router.raw_identity_for_test("/b", &http::Method::GET),
             router.raw_identity_for_test("/admin/b", &http::Method::GET),

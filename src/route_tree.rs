@@ -1,9 +1,7 @@
 //! Owned route grammar + segment-tree matcher.
 //!
-//! This is the keystone of the path-confusion redesign: a matcher we **own**, so the
-//! scoped structural verdict can read the route structure directly — per-node
-//! coverage summaries, the anchor walk — instead of reverse-engineering `matchit`'s
-//! opaque parse tree. The deliberately small, whole-segment, anonymous grammar
+//! The structural verdict reads per-node coverage summaries and walks anchor
+//! prefixes directly. The whole-segment, anonymous grammar
 //! accepts public `matchit`-style syntax through `lower_matchit`. The
 //! test-only `parse_pattern` helper uses the following anonymous `*` notation:
 //!
@@ -88,9 +86,7 @@ pub(crate) struct Pattern {
 
 /// Why a pattern string is not a valid route in this grammar.
 ///
-/// Test-only: production lowers public matchit syntax via [`lower_matchit`]; the native
-/// `*`-grammar parser ([`parse_pattern`]) is exercised only by the unit tests and oracle.
-#[cfg(test)]
+/// Shared validation of the slash-delimited body precedes segment grammar checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PatternError {
     /// The pattern did not begin with `/`.
@@ -132,6 +128,20 @@ fn classify_segment(seg: &str) -> Segment {
     }
 }
 
+/// Split the slash-delimited body before interpreting either segment grammar.
+fn split_body(pat: &str) -> Result<(&str, bool), PatternError> {
+    let body = pat
+        .strip_prefix('/')
+        .ok_or(PatternError::MissingLeadingSlash)?;
+    let (body, trailing_slash) = body
+        .strip_suffix('/')
+        .map_or((body, false), |body| (body, true));
+    if !body.is_empty() && body.split('/').any(str::is_empty) {
+        return Err(PatternError::EmptyInteriorSegment);
+    }
+    Ok((body, trailing_slash))
+}
+
 /// Parse a pattern string into a [`Pattern`].
 ///
 /// # Errors
@@ -140,20 +150,11 @@ fn classify_segment(seg: &str) -> Segment {
 /// segment.
 #[cfg(test)]
 pub(crate) fn parse_pattern(pat: &str) -> Result<Pattern, PatternError> {
-    if !pat.starts_with('/') {
-        return Err(PatternError::MissingLeadingSlash);
-    }
-    let trailing_slash = pat.len() > 1 && pat.ends_with('/');
-    // Body: drop the leading slash and the single significant trailing slash.
-    let end = pat.len() - usize::from(trailing_slash);
-    let body = &pat[1..end];
+    let (body, trailing_slash) = split_body(pat)?;
 
     let mut segments = Vec::new();
     if !body.is_empty() {
         for seg in body.split('/') {
-            if seg.is_empty() {
-                return Err(PatternError::EmptyInteriorSegment);
-            }
             segments.push(classify_segment(seg));
         }
     }
@@ -183,21 +184,16 @@ pub(crate) fn parse_pattern(pat: &str) -> Result<Pattern, PatternError> {
 /// catch-all, a malformed param, or a **prefix/suffix param** (`/v{ver}`) — which the
 /// whole-segment grammar cannot represent.
 pub(crate) fn lower_matchit(pat: &str) -> Result<Pattern, LowerError> {
-    if !pat.starts_with('/') {
-        return Err(LowerError::MissingLeadingSlash);
-    }
-    let trailing_slash = pat.len() > 1 && pat.ends_with('/');
-    let end = pat.len() - usize::from(trailing_slash);
-    let body = &pat[1..end];
+    let (body, trailing_slash) = split_body(pat).map_err(|error| match error {
+        PatternError::MissingLeadingSlash => LowerError::MissingLeadingSlash,
+        PatternError::EmptyInteriorSegment => LowerError::EmptyInteriorSegment,
+    })?;
 
     let mut segments = Vec::new();
     if !body.is_empty() {
         let parts: Vec<&str> = body.split('/').collect();
         let last = parts.len() - 1;
         for (idx, seg) in parts.iter().enumerate() {
-            if seg.is_empty() {
-                return Err(LowerError::EmptyInteriorSegment);
-            }
             match lower_segment(seg)? {
                 SegLower::Literal(s) => segments.push(Segment::Literal(s)),
                 SegLower::Wildcard => segments.push(Segment::Wildcard),
@@ -272,21 +268,7 @@ fn lower_segment(seg: &str) -> Result<SegLower, LowerError> {
 /// Unescape matchit's doubled braces (`{{` → `{`, `}}` → `}`) so a literal segment
 /// matches the request path byte-for-byte.
 fn unescape_braces(s: &str) -> String {
-    if !s.contains("{{") && !s.contains("}}") {
-        return s.to_owned();
-    }
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let Some(&cur) = b.get(i) else { break };
-        out.push(cur);
-        i += usize::from(
-            (cur == b'{' && b.get(i + 1) == Some(&b'{'))
-                || (cur == b'}' && b.get(i + 1) == Some(&b'}')),
-        ) + 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+    s.replace("{{", "{").replace("}}", "}")
 }
 
 /// Which HTTP method(s) a registration applies to. `Any` (the default) matches every
@@ -405,7 +387,7 @@ impl MethodSlot {
 
 /// A node in the route tree. Structural bytes only ever land in a wildcard/catch-all
 /// position (literals match canonical pattern bytes), and the scoped verdict reads the
-/// per-node coverage summaries computed at build — the payoff of owning the matcher.
+/// per-node coverage summaries computed at build.
 #[derive(Clone, Default)]
 struct Node {
     /// Exact-segment children.
@@ -1435,7 +1417,7 @@ mod tests {
         assert_eq!(r.anchor_cover("/", &http::Method::POST), Cover::Mixed);
     }
 
-    // ── matching: precedence + backtracking (the load-bearing behavior) ───────
+    // ── matching: precedence + backtracking ───────
 
     /// Byte paths route. An invalid-UTF-8 segment can never equal a registered literal
     /// (patterns arrive as `&str`), but it must still fall through to the wildcard or

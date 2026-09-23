@@ -9,7 +9,7 @@
 //! | [`CaseSensitivity`] | Declare whether downstream routing folds ASCII case | Required |
 //! | [`DecodeDepth`] | Declare the maximum supported percent-decode depth | Required |
 //! | [`StructuralClasses`] | Enable additional structural forms and custom detectors | Built-in classes only |
-//! | [`max_path_len`](GuardConfig::max_path_len) | Limit analysis in original path bytes | 8,192 |
+//! | [`max_analysis_path_len`](GuardConfig::max_analysis_path_len) | Limit analysis in original path bytes | 8,192 |
 //!
 //! Parsing declarations describe possible downstream behaviors; the crate does not
 //! detect them from your deployment. The length budget controls resource use. The default mode permits some structural forms when
@@ -71,7 +71,7 @@ pub struct GuardConfig {
     /// Defaults to 8,192. This is a resource budget, not a parsing assumption or
     /// an overall request-size limit. With custom probes, every path is subject
     /// to this limit before any probe runs. Disabled mode bypasses this limit.
-    pub max_path_len: usize,
+    pub max_analysis_path_len: usize,
 }
 
 impl GuardConfig {
@@ -83,7 +83,7 @@ impl GuardConfig {
             structural_classes: StructuralClasses::default(),
             decode_depth,
             case_sensitivity,
-            max_path_len: 8192,
+            max_analysis_path_len: 8192,
         }
     }
 
@@ -92,8 +92,8 @@ impl GuardConfig {
     /// the limit. `usize::MAX` effectively removes the length cap. Larger budgets
     /// permit longer encoded keys at greater analysis cost.
     #[must_use]
-    pub fn with_max_path_len(mut self, max_path_len: usize) -> Self {
-        self.max_path_len = max_path_len;
+    pub fn with_max_analysis_path_len(mut self, max_analysis_path_len: usize) -> Self {
+        self.max_analysis_path_len = max_analysis_path_len;
         self
     }
 
@@ -290,7 +290,7 @@ impl std::fmt::Display for StructuralClass {
 /// for an attributed log line; use [`message`](Self::message) for the short static
 /// string suitable for the denial response body (it deliberately does not vary with
 /// the attribution).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResolveError {
     /// Path lookup stopped without a rule for the request method, an ALL rule,
@@ -330,9 +330,9 @@ pub enum ResolveError {
     NonCanonicalEscape,
     /// A registered [`StructuralProbe`] matched; carries the probe's
     /// [`name`](StructuralProbe::name).
-    Probe(&'static str),
+    Probe(String),
     /// A path requiring structural, decode, case-fold, or custom-probe checks
-    /// exceeds [`GuardConfig::max_path_len`] (8,192 bytes by default). In
+    /// exceeds [`GuardConfig::max_analysis_path_len`] (8,192 bytes by default). In
     /// [`RejectAmbiguous`](GuardMode::RejectAmbiguous), any `%` triggers the cap,
     /// even if malformed. In strict mode, complete escapes
     /// and recognized non-canonical forms trigger it. Paths requiring no checks
@@ -463,7 +463,7 @@ pub enum StructuralChar {
 /// `matches` must be **pure, deterministic, and ~O(n)**. Checks short-circuit on
 /// denial, and `Disabled` skips probes; do not rely on a probe being called for
 /// logging or other side effects.
-/// With probes registered, paths exceeding [`GuardConfig::max_path_len`] are
+/// With probes registered, paths exceeding [`GuardConfig::max_analysis_path_len`] are
 /// denied before invoking any probe, even if no probe would match.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
 /// `register_exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
@@ -474,8 +474,9 @@ pub enum StructuralChar {
 /// to limit that collateral, and fold the form into the alphabet proper once there is
 /// time for a release.
 pub trait StructuralProbe: Send + Sync {
-    /// A short static identifier for this probe, used in `Debug` output.
-    fn name(&self) -> &'static str;
+    /// A short identifier for this probe, used in diagnostics and denial errors.
+    /// The name may borrow runtime configuration; a denial copies it into the error.
+    fn name(&self) -> &str;
     /// Whether `path` carries this probe's structural form. See the trait docs for
     /// the whole-path, all-positions-live contract.
     fn matches(&self, path: &str) -> bool;
@@ -587,7 +588,7 @@ impl StructuralClasses {
 
 impl std::fmt::Debug for StructuralClasses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let probes: Vec<&'static str> = self.probes.iter().map(|p| p.name()).collect();
+        let probes: Vec<&str> = self.probes.iter().map(|p| p.name()).collect();
         f.debug_struct("StructuralClasses")
             .field("backslash", &self.backslash)
             .field("overlong_slash", &self.overlong_slash)
@@ -640,7 +641,10 @@ mod tests {
             ResolveError::DecodeRuleChange.message(),
             "Ambiguous request path"
         );
-        assert_eq!(ResolveError::Probe("p").message(), "Ambiguous request path");
+        assert_eq!(
+            ResolveError::Probe("p".into()).message(),
+            "Ambiguous request path"
+        );
         assert_eq!(
             ResolveError::NonCanonical(StructuralClass::DotSegment).message(),
             "Non-canonical request path"
@@ -656,7 +660,7 @@ mod tests {
         );
         // The probe's name reaches the log line.
         assert!(
-            ResolveError::Probe("reject-non-ascii")
+            ResolveError::Probe("reject-non-ascii".into())
                 .to_string()
                 .contains("reject-non-ascii")
         );

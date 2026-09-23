@@ -19,6 +19,7 @@ rule's policy. The crate does not forward requests.
 
 - **Input:** pass the request path alone, normally `uri.path()`. `resolve` rejects
   inputs that do not start with `/` (except `*`) or contain `?` or `#`.
+  `*` is accepted for any method and selects the default rule if guard checks pass.
 - **Forwarding:** the caller forwards accepted requests with their paths unchanged.
   The guard does not rewrite them.
 - **Identity:** each concrete rule definition has one identity across its patterns.

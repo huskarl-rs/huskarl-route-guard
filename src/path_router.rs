@@ -258,7 +258,6 @@ pub struct RuleRouter<R> {
     rules: Vec<R>,
     default: R,
     guard: PathConfusionGuard,
-    diagnostic_patterns: Vec<crate::diagnostics::DiagnosticPattern>,
 }
 
 impl<R> std::fmt::Debug for RuleRouter<R> {
@@ -316,6 +315,15 @@ impl<R> RuleRouter<R> {
         config: GuardConfig,
         registrations: impl IntoIterator<Item = PathRegistration<R>>,
     ) -> Result<Self, RuleRouterError> {
+        Self::build_inner(default, config, registrations, false).map(|(router, _)| router)
+    }
+
+    fn build_inner(
+        default: R,
+        config: GuardConfig,
+        registrations: impl IntoIterator<Item = PathRegistration<R>>,
+        diagnose: bool,
+    ) -> Result<(Self, Vec<crate::MethodGapDiagnostic>), RuleRouterError> {
         let mut tree_entries = Vec::new();
         let mut patterns = Vec::new();
         let mut rules = Vec::new();
@@ -378,40 +386,31 @@ impl<R> RuleRouter<R> {
             &path_fallbacks.into_iter().collect::<Vec<_>>(),
         )
         .map_err(|error| map_build_err(error, &patterns))?;
-        let diagnostic_patterns = tree_entries
-            .into_iter()
-            .zip(patterns)
-            .map(
-                |((parsed, _, _, methods), source)| crate::diagnostics::DiagnosticPattern {
-                    parsed,
-                    source,
-                    methods,
-                },
-            )
-            .collect();
         let guard = PathConfusionGuard::new(router, config);
-
-        Ok(Self {
-            rules,
-            default,
-            guard,
-            diagnostic_patterns,
-        })
-    }
-
-    /// Reports method gaps that hide a less-specific path's rule.
-    ///
-    /// This opt-in lint does not affect construction or request handling. It checks
-    /// standard HTTP methods and explicitly registered extension methods against
-    /// representative paths at pairwise pattern overlaps. Every report includes a
-    /// concrete witness; an empty result is not proof that no gaps exist.
-    ///
-    /// Patterns are retained for this analysis. Calling this method allocates and
-    /// examines pattern pairs; use it during startup, not for each request.
-    /// Results follow registration order and do not depend on guard mode.
-    #[must_use]
-    pub fn diagnostics(&self) -> Vec<crate::MethodGapDiagnostic> {
-        crate::diagnostics::method_gaps(&self.diagnostic_patterns, &self.guard)
+        let diagnostics = if diagnose {
+            let diagnostic_patterns: Vec<_> = tree_entries
+                .into_iter()
+                .zip(patterns)
+                .map(
+                    |((parsed, _, _, methods), source)| crate::diagnostics::DiagnosticPattern {
+                        parsed,
+                        source,
+                        methods,
+                    },
+                )
+                .collect();
+            crate::diagnostics::method_gaps(&diagnostic_patterns, &guard)
+        } else {
+            Vec::new()
+        };
+        Ok((
+            Self {
+                rules,
+                default,
+                guard,
+            },
+            diagnostics,
+        ))
     }
 
     /// Resolves `path` in one call: the path-confusion verdict first, then the rule
@@ -433,6 +432,7 @@ impl<R> RuleRouter<R> {
     /// (or be the special `*` request target) and must not contain `?` or `#`. Passing a
     /// full request-target such as `/admin?x=1`, or an absolute URI, returns
     /// [`ResolveError::InvalidPathInput`] rather than falling through to the default rule.
+    /// `*` is accepted for every method and selects the default rule if guard checks pass.
     ///
     /// # Errors
     ///
@@ -689,6 +689,27 @@ impl<R> RuleRouterBuilder<R> {
     pub fn build(self) -> Result<RuleRouter<R>, RuleRouterError> {
         RuleRouter::from_registrations(self.default, self.config, self.registrations)
     }
+
+    /// Constructs the router and reports method gaps hiding less-specific rules.
+    ///
+    /// This opt-in lint does not change routing. It checks standard HTTP methods
+    /// and registered extension methods at representative pairwise pattern overlaps.
+    /// Reports follow registration order and include concrete witnesses; an empty
+    /// result is not proof that no gaps exist. Results do not depend on guard mode.
+    ///
+    /// Use at startup: candidate analysis grows quadratically with pattern count,
+    /// multiplied by the examined methods, plus routing and report deduplication
+    /// costs. Large tables should measure this cost. The router retains no diagnostic
+    /// patterns; callers may discard the returned reports after reviewing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction errors as [`Self::build`].
+    pub fn build_with_diagnostics(
+        self,
+    ) -> Result<(RuleRouter<R>, Vec<crate::MethodGapDiagnostic>), RuleRouterError> {
+        RuleRouter::build_inner(self.default, self.config, self.registrations, true)
+    }
 }
 
 /// Validate literal request bytes once per declared pattern, including paths with
@@ -887,8 +908,8 @@ mod tests {
             Err(ResolveError::Structural(StructuralClass::Separator))
         );
         assert_eq!(
-            denied.err(),
-            r.denial_for_test("/admin%2fx", &http::Method::GET)
+            denied.as_ref().err(),
+            r.denial_for_test("/admin%2fx", &http::Method::GET).as_ref()
         );
         // The response-body string stays coarse; the attribution is for the log.
         assert_eq!(

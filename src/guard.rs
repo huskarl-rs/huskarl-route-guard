@@ -19,7 +19,7 @@ use crate::{
 pub(crate) struct PathConfusionGuard {
     router: Router,
     mode: GuardMode,
-    max_path_len: usize,
+    max_analysis_path_len: usize,
     /// Byte classes that deny, derived from the configured classes plus (when the backend
     /// folds case) [`ClassSet::CASE`].
     enabled: ClassSet,
@@ -70,7 +70,7 @@ impl PathConfusionGuard {
             structural_classes: classes,
             decode_depth: layers,
             case_sensitivity: case,
-            max_path_len,
+            max_analysis_path_len,
         } = config;
         let mut enabled = enabled_classes(&classes);
         if case.is_insensitive() {
@@ -79,7 +79,7 @@ impl PathConfusionGuard {
         Self {
             router,
             mode,
-            max_path_len,
+            max_analysis_path_len,
             enabled,
             enc: enabled_encodings(&classes, layers),
             case_insensitive: case.is_insensitive(),
@@ -122,13 +122,13 @@ impl PathConfusionGuard {
         if self.probes.is_empty() {
             return None;
         }
-        if path.len() > self.max_path_len {
+        if path.len() > self.max_analysis_path_len {
             return Some(ResolveError::TooLong);
         }
         self.probes
             .iter()
             .find(|probe| probe.matches(path))
-            .map(|probe| ResolveError::Probe(probe.name()))
+            .map(|probe| ResolveError::Probe(probe.name().to_owned()))
     }
 
     /// Whether `path` must be denied for GET. Test-only convenience for method-agnostic
@@ -166,7 +166,7 @@ impl PathConfusionGuard {
         if present.is_empty() {
             return None;
         }
-        if path.len() > self.max_path_len {
+        if path.len() > self.max_analysis_path_len {
             return Some(ResolveError::TooLong);
         }
         if present.contains_any(ClassSet::TRUNCATION) {
@@ -190,8 +190,7 @@ impl PathConfusionGuard {
     /// treats as invariant under every modeled transform, so that whatever a backend
     /// does to this path, the result still starts here.
     ///
-    /// That invariance is the load-bearing premise of the whole positional verdict —
-    /// it is why bounding `anchor_cover` bounds the relocation. It holds because:
+    /// Bounding `anchor_cover` bounds relocation only if this prefix is invariant:
     ///
     /// - Boundary-shift and climb transforms act at or after their own (enabled)
     ///   occurrence, which `offset` bounds.
@@ -232,7 +231,7 @@ impl PathConfusionGuard {
     /// that drifted would make this return `Some` where production denies outright,
     /// which costs a stricter test, never a weaker one.
     pub(crate) fn structural_anchor<'p>(&self, path: &'p str) -> Option<&'p str> {
-        if path.len() > self.max_path_len {
+        if path.len() > self.max_analysis_path_len {
             return None;
         }
         let enabled = self.enabled.without(ClassSet::CASE);
@@ -255,7 +254,7 @@ impl PathConfusionGuard {
         method: &http::Method,
         raw_rule: &impl Fn() -> Option<RuleId>,
     ) -> Option<ResolveError> {
-        if path.len() > self.max_path_len && path.contains('%') {
+        if path.len() > self.max_analysis_path_len && path.contains('%') {
             return Some(ResolveError::TooLong);
         }
         let mut structural = ScanResult::empty();
@@ -268,7 +267,7 @@ impl PathConfusionGuard {
             ));
             // NUL and oversized structural paths deny independently of routing.
             if structural.classes.contains_any(ClassSet::TRUNCATION)
-                || (path.len() > self.max_path_len
+                || (path.len() > self.max_analysis_path_len
                     && !structural
                         .classes
                         .intersect(self.enabled.without(ClassSet::CASE))
@@ -295,7 +294,7 @@ impl PathConfusionGuard {
         if view.is_original() && !folds {
             return None;
         }
-        if original_len > self.max_path_len {
+        if original_len > self.max_analysis_path_len {
             return Some(ResolveError::TooLong);
         }
         let folded;
@@ -316,14 +315,14 @@ impl PathConfusionGuard {
     /// opaque declarations ignored, so any enabled structural byte denies.
     fn noncanonical_deny(&self, path: &str) -> Option<ResolveError> {
         // Bound decoded buffers before scanning an escape-bearing strict request.
-        if path.len() > self.max_path_len && escape_present(path) {
+        if path.len() > self.max_analysis_path_len && escape_present(path) {
             return Some(ResolveError::TooLong);
         }
         let present = classes_present(path, self.enabled, self.enc).intersect(self.enabled);
         if present.is_empty() {
             return None;
         }
-        if path.len() > self.max_path_len {
+        if path.len() > self.max_analysis_path_len {
             return Some(ResolveError::TooLong);
         }
         Some(ResolveError::NonCanonical(primary_class(present)))
@@ -377,8 +376,7 @@ fn raise(prefix: &str, k: usize) -> &str {
 /// Whether `path` carries any complete `%XX` escape — the [`GuardMode::RequireCanonical`]
 /// "any escape is non-canonical" rule.
 fn escape_present(path: &str) -> bool {
-    let b = path.as_bytes();
-    (0..b.len()).any(|i| crate::percent::byte_at(b, i).is_some())
+    crate::percent::has_escape(path.as_bytes())
 }
 
 #[cfg(test)]

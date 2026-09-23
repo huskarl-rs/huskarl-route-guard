@@ -119,7 +119,7 @@ route redesign is appropriate, use
 
 ## Set the analysis budget
 
-[`GuardConfig::with_max_path_len`](crate::GuardConfig::with_max_path_len) sets the
+[`GuardConfig::with_max_analysis_path_len`](crate::GuardConfig::with_max_analysis_path_len) sets the
 maximum original path length in bytes for analysis (default: 8,192). Increase it
 if legitimate encoded keys need more room, accounting for the added analysis cost.
 This resource budget is separate from the downstream parsing declarations.

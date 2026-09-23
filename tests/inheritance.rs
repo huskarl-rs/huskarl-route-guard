@@ -238,13 +238,12 @@ fn path_tables_validate_duplicates_and_empty_definitions() {
 
 #[test]
 fn diagnostics_report_the_stopping_path_even_without_concrete_rules() {
-    let router = RuleRouter::builder("default", config())
+    let (router, diagnostics) = RuleRouter::builder("default", config())
         .register_subtree("/", |p| p.all("root"))
         .register_subtree("/files", |p| p)
         .register_path("/files/private", |p| p.fallback_inherit(true))
-        .build()
+        .build_with_diagnostics()
         .unwrap();
-    let diagnostics = router.diagnostics();
     assert!(!diagnostics.is_empty());
     for gap in diagnostics {
         assert_ne!(gap.pattern, "/files/private");

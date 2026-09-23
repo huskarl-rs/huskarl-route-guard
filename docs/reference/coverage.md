@@ -72,7 +72,7 @@ not seen at all:
   #         .with_structural_classes(classes.clone());
   #     let router = RuleRouter::builder("public", config).register_subtree("/admin", |path| path.all("protected")).build().unwrap();
   #     for path in ["/Ａdmin", "/%EF%BC%A1dmin", "/%25EF%25BC%25A1dmin", "/files/a%20b"] {
-  #         assert_eq!(router.resolve(path, &http::Method::GET).unwrap_err(), ResolveError::Probe("require-literal-ascii"));
+  #         assert_eq!(router.resolve(path, &http::Method::GET).unwrap_err(), ResolveError::Probe("require-literal-ascii".into()));
   #     }
   #     assert_eq!(*router.resolve("/files/readme", &http::Method::GET).unwrap().rule(), "public");
   #     assert_eq!(*router.resolve("/admin", &http::Method::GET).unwrap().rule(), "protected");

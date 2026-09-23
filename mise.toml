@@ -1,6 +1,7 @@
 [tools]
 "cargo:cargo-bolero" = "latest"
 "cargo:cargo-readme" = "latest"
+"cargo:cargo-mutants" = "27.1.0"
 
 [tasks.fmt]
 run = "cargo +nightly fmt"
@@ -56,3 +57,11 @@ description = "Two-decode NGINX normalized-URI proxy to Apache baseline"
 [tasks.fuzz]
 description = "Prime seeds and fuzz a bolero target by full name (nightly)"
 run = "bash scripts/fuzz.sh"
+
+[tasks.mutation]
+run = "bash scripts/mutation-test.sh full"
+description = "Audit guard and scanner mutations; preserve outcomes under target/mutation-audit"
+
+[tasks.mutation-property]
+run = "bash scripts/mutation-test.sh property"
+description = "Verify the soundness property detects four fail-open guard mutations"

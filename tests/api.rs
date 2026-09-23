@@ -10,12 +10,11 @@ fn config() -> GuardConfig {
 
 #[test]
 fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
-    let router = RuleRouter::builder("default", config())
+    let (router, diagnostics) = RuleRouter::builder("default", config())
         .register_subtree("/files", |path| path.all("files"))
         .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
-        .build()
+        .build_with_diagnostics()
         .unwrap();
-    let diagnostics = router.diagnostics();
     assert_eq!(diagnostics.len(), 1);
     let gap = &diagnostics[0];
     assert_eq!(gap.pattern, "/files/special");
@@ -35,32 +34,31 @@ fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
             .resolve("/files/hello%2fworld", &Method::GET)
             .is_err()
     );
-    assert_eq!(router.diagnostics(), diagnostics);
 }
 
 #[test]
 fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
-    let repaired = RuleRouter::builder("default", config())
+    let (repaired, diagnostics) = RuleRouter::builder("default", config())
         .register(
             PathRegistration::subtree("/files")
                 .with_path("/files/special")
                 .all("files"),
         )
         .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
-        .build()
+        .build_with_diagnostics()
         .unwrap();
-    assert!(repaired.diagnostics().is_empty());
+    assert!(diagnostics.is_empty());
     assert!(
         repaired
             .resolve("/files/hello%2fworld", &Method::GET)
             .is_ok()
     );
 
-    let get_only = RuleRouter::builder("default", config())
+    let (get_only, diagnostics) = RuleRouter::builder("default", config())
         .register(PathRegistration::subtree("/files").method(Method::GET, "files"))
-        .build()
+        .build_with_diagnostics()
         .unwrap();
-    assert!(get_only.diagnostics().is_empty());
+    assert!(diagnostics.is_empty());
     assert!(
         get_only
             .resolve("/files/hello%2fworld", &Method::GET)
@@ -77,13 +75,10 @@ fn method_gap_diagnostics_follow_overlapping_branches_and_extension_methods() {
         PathRegistration::path("/files/{other}").method(Method::GET, "get"),
     ];
     for mode in [GuardMode::RejectAmbiguous, GuardMode::Disabled] {
-        let router = RuleRouter::from_registrations(
-            "default",
-            config().with_mode(mode),
-            registrations.clone(),
-        )
-        .unwrap();
-        let gaps = router.diagnostics();
+        let (_, gaps) = RuleRouter::builder("default", config().with_mode(mode))
+            .register_all(registrations.clone())
+            .build_with_diagnostics()
+            .unwrap();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].pattern, "/files/{name}");
         assert_eq!(gaps[0].example_path, "/files/special");
@@ -94,14 +89,14 @@ fn method_gap_diagnostics_follow_overlapping_branches_and_extension_methods() {
 
 #[test]
 fn method_gap_diagnostics_ignore_unrelated_and_fully_shadowed_patterns() {
-    let router = RuleRouter::builder("default", config())
+    let (_, diagnostics) = RuleRouter::builder("default", config())
         .register_path("/{tenant}/special", |path| path.all("fallback"))
         .register(PathRegistration::path("/files/{name}").method(Method::POST, "post"))
         .register_path("/files/special", |path| path.all("override"))
         .register(PathRegistration::path("/unrelated").method(Method::POST, "post"))
-        .build()
+        .build_with_diagnostics()
         .unwrap();
-    assert!(router.diagnostics().is_empty());
+    assert!(diagnostics.is_empty());
 }
 
 #[test]

@@ -73,20 +73,21 @@ served. See the [deployment method recommendations](crate::_docs::reference::dep
 
 ### Inspect method gaps at startup
 
-Call [`diagnostics()`](crate::RuleRouter::diagnostics) after construction to find
+Use [`build_with_diagnostics()`](crate::RuleRouterBuilder::build_with_diagnostics) to find
 method gaps that hide a less-specific rule. Construction still succeeds, and the
-lint does not change routing. Applications can log the structured reports or treat
-them as configuration errors:
+lint does not change routing. Diagnostic inputs are discarded after construction;
+the router retains no extra pattern table. Pairwise analysis grows quadratically
+with pattern count, with additional method, routing, and report deduplication costs.
+Applications can log the structured reports or treat them as configuration errors:
 
 ```rust
 use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
 
-let router = RuleRouter::builder("default",
+let (router, diagnostics) = RuleRouter::builder("default",
     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .register_subtree("/files", |path| path.all("files"))
     .register_path("/files/special", |path| path.method(http::Method::POST, "write"))
-    .build().expect("valid routes");
-let diagnostics = router.diagnostics();
+    .build_with_diagnostics().expect("valid routes");
 assert_eq!(diagnostics[0].example_path, "/files/special");
 assert!(diagnostics[0].methods.contains(&http::Method::GET));
 assert_eq!(diagnostics[0].shadowed_registration, 0);

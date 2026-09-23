@@ -1046,6 +1046,17 @@ mod tests {
     }
 
     #[test]
+    fn union_preserves_classes_present_in_both_operands() {
+        let separators_and_params = ClassSet::SEPARATOR | ClassSet::PARAM;
+        let params_and_dots = ClassSet::PARAM | ClassSet::DOT_SEGMENT;
+        let combined = separators_and_params | params_and_dots;
+        for class in [ClassSet::SEPARATOR, ClassSet::PARAM, ClassSet::DOT_SEGMENT] {
+            assert!(combined.contains_any(class));
+        }
+        assert_eq!(combined | combined, combined);
+    }
+
+    #[test]
     fn intersect_models_enabled_classes() {
         // With only the boundary-shift classes enabled, a live CASE bit does not
         // cause denial — gating is the caller's intersect against enabled_classes.

@@ -40,7 +40,9 @@ impl<'a> Interpretation<'a> {
 
     fn decode(&self) -> Option<Self> {
         // Malformed escapes are a fixed point: do not allocate buffers for them.
-        (0..self.bytes.len()).find(|&i| byte_at(&self.bytes, i).is_some())?;
+        if !has_escape(&self.bytes) {
+            return None;
+        }
         let mut out = Vec::with_capacity(self.bytes.len());
         let mut origins = Vec::with_capacity(self.bytes.len());
         let mut i = 0;
@@ -77,6 +79,11 @@ pub(crate) fn interpretations(
         view = next;
         visit(&view);
     }
+}
+
+/// Whether the bytes contain a complete `%XX` escape.
+pub(crate) fn has_escape(bytes: &[u8]) -> bool {
+    (0..bytes.len()).any(|i| byte_at(bytes, i).is_some())
 }
 
 /// Decode one hex digit (`0`–`9`, `a`–`f`, `A`–`F`) to its value, or `None`.
