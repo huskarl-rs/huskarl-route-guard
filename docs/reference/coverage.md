@@ -87,6 +87,12 @@ not seen at all:
 - **Partial / selective decoding.** The content-decode check models the possibility
   that a backend decodes the whole path. A backend that decodes only *some*
   escapes, or in an order all its own, is not modelled.
+- **Whitespace trimming in path segments.** A backend that trims segment content
+  and drops empty segments can turn `/admin/%20` into `/admin`. Segment trimming
+  is not a built-in interpretation. The CVE-2020-17523-inspired regression in
+  `tests/cve_regressions.rs` demonstrates this limitation with an exact `/admin`
+  rule. Use registrations that cover the equivalent paths or a custom probe
+  accounting for raw and encoded whitespace if your backend has this behavior.
 - **Strip-style "sanitizers".** The built-in model includes decoding, slash merging,
   parameter stripping, and dot-segment resolution. Every supported member rewrites
   the path at or after the form that triggers it, which is what lets the scoped check

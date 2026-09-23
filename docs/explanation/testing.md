@@ -50,6 +50,14 @@ Coverage-guided fuzz targets exercise the scanner, the matcher differential, and
 end-to-end relocation property. Committed regression inputs keep previously discovered
 cases in ordinary test runs.
 
+`tests/cve_regressions.rs` adds reduced, source-linked CVE witnesses through the
+public API. An independent decoder and normalizer establish the downstream path;
+each denial fixture also verifies that this path reaches a different rule identity.
+The cases cover mixed encoded dots, encoded hex digits across two decode passes,
+parameter stripping followed by traversal, and slash merging. Separate assertions
+exercise decode-depth limits and exclusive subtrees. A whitespace-trimming example
+documents a behavior outside the model rather than claiming the guard rejects it.
+
 These layers support one bounded conclusion: the implementation has strong evidence
 for its stated contract over the supported model. Platform behavior outside that model
 requires separate evidence and remains outside the guarantee.

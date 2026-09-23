@@ -1267,7 +1267,7 @@ mod tests {
             CaseSensitivity::Sensitive,
         );
         assert!(istio.ambiguous("//admin"));
-        assert!(istio.ambiguous("/x%2fadmin"));
+        assert!(istio.ambiguous("/%2fadmin"));
 
         // CVE-2021-41773 (Apache): encoded `%2e%2e` dot-segments escape an alias.
         let apache = guard(
@@ -1282,6 +1282,7 @@ mod tests {
             CaseSensitivity::Sensitive,
         );
         assert!(apache.ambiguous("/cgi-bin/%2e%2e/secret"));
+        assert!(apache.ambiguous("/cgi-bin/.%2e/secret"));
 
         // CVE-2025-0108 (PAN-OS): nginx decoded `%252e%252e` once and let it past a
         // no-auth prefix; Apache decoded again and traversed. The topology is declared
