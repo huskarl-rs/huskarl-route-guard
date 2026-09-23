@@ -84,7 +84,7 @@ let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToTwo)
     .with_mode(GuardMode::RejectAmbiguous)
     .with_structural_classes(StructuralClasses::new().with_backslash());
 let router = RuleRouter::builder("default", config)
-    .subtree("/admin", "admin")
+    .register_subtree("/admin", |path| path.all("admin"))
     .build()
     .expect("valid routes");
 assert!(router.resolve("/admin%5cusers", &http::Method::GET).is_err());

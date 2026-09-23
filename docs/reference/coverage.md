@@ -70,7 +70,7 @@ not seen at all:
   # for depth in [DecodeDepth::UpToOne, DecodeDepth::UpToTwo] {
   #     let config = GuardConfig::new(CaseSensitivity::Insensitive, depth)
   #         .with_structural_classes(classes.clone());
-  #     let router = RuleRouter::builder("public", config).subtree("/admin", "protected").build().unwrap();
+  #     let router = RuleRouter::builder("public", config).register_subtree("/admin", |path| path.all("protected")).build().unwrap();
   #     for path in ["/Ａdmin", "/%EF%BC%A1dmin", "/%25EF%25BC%25A1dmin", "/files/a%20b"] {
   #         assert_eq!(router.resolve(path, &http::Method::GET).unwrap_err(), ResolveError::Probe("require-literal-ascii"));
   #     }

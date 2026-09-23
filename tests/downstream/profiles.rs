@@ -14,6 +14,8 @@ pub struct DeploymentSettings {
 
 pub struct Ablation {
     pub name: &'static str,
+    /// Method-registration removals deny safely; parsing removals expose confusion.
+    pub expect_method_denial: bool,
     pub guard: DeploymentSettings,
     pub witness: (&'static str, &'static str),
 }
@@ -22,8 +24,8 @@ pub struct Profile {
     pub backend: &'static str,
     pub name: &'static str,
     pub guard: DeploymentSettings,
-    // Each additional recommendation must have an accepted-request counterexample
-    // when removed. No counterexample means the recommendation needs review.
+    // Parsing recommendations require accepted-request counterexamples when removed.
+    // Method registrations instead require a safely denied witness when omitted.
     pub ablations: &'static [Ablation],
 }
 
@@ -52,11 +54,13 @@ const BACKSLASH: DeploymentSettings = DeploymentSettings {
 const REMOVE_CASE_FOLDING: &[Ablation] = &[
     Ablation {
         name: "without-case-folding",
+        expect_method_denial: false,
         witness: ("GET", "/ADMIN/PROBE.TXT"),
         guard: EXPRESS_SENSITIVE,
     },
     Ablation {
         name: "without-head",
+        expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
@@ -65,6 +69,7 @@ const REMOVE_CASE_FOLDING: &[Ablation] = &[
     },
     Ablation {
         name: "without-private-post-fallback",
+        expect_method_denial: true,
         witness: ("POST", "/files/private/probe.txt"),
         guard: DeploymentSettings {
             private_post_fallback: false,
@@ -75,11 +80,13 @@ const REMOVE_CASE_FOLDING: &[Ablation] = &[
 const REMOVE_BACKSLASH: &[Ablation] = &[
     Ablation {
         name: "without-backslash",
+        expect_method_denial: false,
         witness: ("GET", "/admin\\probe.txt"),
         guard: SENSITIVE,
     },
     Ablation {
         name: "without-head",
+        expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
@@ -90,6 +97,7 @@ const REMOVE_BACKSLASH: &[Ablation] = &[
 
 const HEAD: &[Ablation] = &[Ablation {
     name: "without-head",
+    expect_method_denial: true,
     witness: ("HEAD", "/admin/probe.txt"),
     guard: DeploymentSettings {
         include_head: false,
@@ -99,6 +107,7 @@ const HEAD: &[Ablation] = &[Ablation {
 const EXPRESS_METHODS: &[Ablation] = &[
     Ablation {
         name: "without-head",
+        expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
@@ -107,6 +116,7 @@ const EXPRESS_METHODS: &[Ablation] = &[
     },
     Ablation {
         name: "without-private-post-fallback",
+        expect_method_denial: true,
         witness: ("POST", "/files/private/probe.txt"),
         guard: SENSITIVE,
     },
@@ -118,6 +128,7 @@ const STATIC: DeploymentSettings = DeploymentSettings {
 const STATIC_METHODS: &[Ablation] = &[
     Ablation {
         name: "without-head",
+        expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
@@ -126,6 +137,7 @@ const STATIC_METHODS: &[Ablation] = &[
     },
     Ablation {
         name: "without-static-post",
+        expect_method_denial: true,
         witness: ("POST", "/admin/probe.txt"),
         guard: SENSITIVE,
     },
@@ -137,11 +149,13 @@ const TWO_DECODES: DeploymentSettings = DeploymentSettings {
 const REMOVE_SECOND_DECODE: &[Ablation] = &[
     Ablation {
         name: "without-second-decode",
+        expect_method_denial: false,
         witness: ("GET", "/%2561dmin/probe.txt"),
         guard: STATIC,
     },
     Ablation {
         name: "without-head",
+        expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
@@ -150,6 +164,7 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
     },
     Ablation {
         name: "without-static-post",
+        expect_method_denial: true,
         witness: ("POST", "/admin/probe.txt"),
         guard: DeploymentSettings {
             static_post: false,
@@ -159,7 +174,7 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
 ];
 
 // Fixed before observations. The harness tests only outgoing requests for each
-// candidate, and requires real confusion to justify retaining each extra setting.
+// candidate. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
     Profile {
         backend: "nginx-apache",

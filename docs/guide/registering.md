@@ -5,56 +5,58 @@ Start with the [tutorial](crate::_docs::tutorial) if you have not built a router
 
 ## Choose the paths each rule covers
 
-Use `route` for an exact path or pattern. Use `subtree` when the same policy applies
-to a prefix and everything beneath it. For example, `subtree("/admin", rule)`
+Use `register_path` for an exact path or pattern. Use `register_subtree` when the same
+method table applies to a prefix and everything beneath it. For example,
+`register_subtree("/admin", |path| path.all(rule))`
 covers `/admin`, `/admin/`, and `/admin/users` under one identity.
 
-Check trailing slashes deliberately. `subtree("/admin/", rule)` excludes the bare
+Check trailing slashes deliberately. `register_subtree("/admin/", |path| path.all(rule))` excludes the bare
 `/admin`. If the backend treats those spellings as equivalent, give them the same
 registration. The guard does not detect trailing-slash equivalence for you.
 
 Keep patterns that should share an identity in one registration. Two calls with
 equal rule values still create different identities. If the helper methods cannot
-express your group of patterns, assemble a [`Registration`](crate::Registration)
+express your group of patterns, assemble a [`PathRegistration`](crate::PathRegistration)
 and use [`from_registrations`](crate::RuleRouter::from_registrations).
 
 ## Set the default policy explicitly
 
-The default rule handles unmatched paths and methods that have no rule at the
-selected path. Choose a value your application can enforce safely in both cases.
-Test unmatched requests as well as registered paths.
+The default handles paths for which matching is exhausted, including through
+explicit inheritance. An unresolved method at a non-inheriting path is denied.
 
-## Add method-specific rules
+## Define each path's method table
 
-Construct a registration and call `for_methods`, then add it with `register`:
+Group overrides and fallback behavior in one registration:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
-
-let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
-let router = RuleRouter::builder("default", config)
-    .register(Registration::route("/health", "health").for_methods([http::Method::GET, http::Method::HEAD]))
-    .build()
-    .expect("valid routes");
-assert!(router.resolve("/health", &http::Method::POST).unwrap().is_default());
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, ResolveError, RuleRouter};
+use http::Method;
+let router = RuleRouter::builder("default", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .register_subtree("/files", |p| p.methods([Method::GET, Method::HEAD], "read"))
+    .register_path("/files/special", |p| p.fallback_inherit(true).method(Method::POST, "write"))
+    .build().unwrap();
+let parent = router.resolve("/files/ordinary", &Method::GET).unwrap();
+assert_eq!(router.resolve("/files/special", &Method::GET).unwrap(), parent);
+assert!(router.resolve("/files/hello%20world", &Method::GET).is_ok());
+assert!(router.resolve("/files/hello%2fworld", &Method::GET).is_ok());
+assert_eq!(router.resolve("/files/special", &Method::DELETE).unwrap_err(), ResolveError::MethodNotConfigured);
 ```
 
-Check each method you serve at an overlapping path: path matching happens before
-method lookup. `register_all` accepts an iterator for tables assembled dynamically.
+At a matching path the requested method wins, then `.all(rule)`, then inheritance
+if enabled, otherwise denial. Inheritance continues through matching-pattern
+precedence with the same path and method. Each intermediate path can stop it.
+The inherited rule retains its original identity, preserving uniform coverage.
 
-For example, with `/items/{id}` and a GET-only `/items/special`, POST to
-`/items/special` selects the default. It does not use `/items/{id}`. If POST needs a
-rule there, register it explicitly at `/items/special`, or add an all-method
-`route` at that exact path. See [Routing behavior](crate::_docs::reference::routing)
-for the executable example and precedence rules.
+Use `register_subtree` to share the method table across the prefix, trailing slash,
+and catch-all, or `register_exclusive_subtree` to additionally forbid overriding
+paths. For dynamically assembled tables, pass `PathRegistration` values to `register`,
+`register_all`, or `from_registrations`.
 
-Backend method dispatch must agree with these registrations. The tested Express
-fixture falls through a GET-only child to a parent POST handler, requiring an
-explicit child POST registration in the guard. The tested Axum and `SvelteKit`
-fixtures reject that gap instead. Also include HEAD where the backend serves GET
-handlers for HEAD. See the
-[deployment method recommendations](crate::_docs::reference::deployments#method-specific-registrations)
-for the exact setups and Apache's static-file POST behavior.
+Include HEAD explicitly where the backend serves GET handlers for HEAD; inheritance
+does not convert methods. If the backend falls through to a broader handler, enable
+inheritance deliberately or supply the appropriate concrete method rule. Missing
+method declarations now fail closed, but can prevent legitimate requests from being
+served. See the [deployment method recommendations](crate::_docs::reference::deployments#method-specific-registrations).
 
 ### Inspect method gaps at startup
 
@@ -64,12 +66,12 @@ lint does not change routing. Applications can log the structured reports or tre
 them as configuration errors:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
 
 let router = RuleRouter::builder("default",
     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .subtree("/files", "files")
-    .register(Registration::route("/files/special", "write").for_methods(http::Method::POST))
+    .register_subtree("/files", |path| path.all("files"))
+    .register_path("/files/special", |path| path.method(http::Method::POST, "write"))
     .build().expect("valid routes");
 let diagnostics = router.diagnostics();
 assert_eq!(diagnostics[0].example_path, "/files/special");
@@ -86,55 +88,42 @@ witness; this is not an exhaustive analysis of all paths or extension methods.
 An empty list does not prove there are no gaps. Analysis runs only when called and
 examines pattern pairs; the router retains pattern metadata for this purpose.
 
-Adding a same-path all-method rule repairs the default gap. To also preserve the
-surrounding rule's identity for GET encoded keys, include that path in the existing
-registration instead of creating a separate rule:
-
-```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter, subtree_patterns};
-
-let patterns = subtree_patterns("/files").into_iter()
-    .chain(["/files/special".to_owned()]);
-let router = RuleRouter::builder("default",
-    GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .register(Registration::patterns(patterns, "files"))
-    .register(Registration::route("/files/special", "write").for_methods(http::Method::POST))
-    .build().expect("valid routes");
-assert!(router.diagnostics().is_empty());
-assert!(router.resolve("/files/hello%2fworld", &http::Method::GET).is_ok());
-```
+If the child should preserve broader policies for other methods, enable
+`fallback_inherit(true)` on its path registration. The original broader rule is
+returned without copying its value or assigning a child identity. Alternatively,
+provide a concrete method or ALL rule when the child needs its own policy.
 
 ## Register areas that accept encoded keys
 
 If one rule applies to an entire file-key prefix for the methods it serves, use
-`exclusive_subtree("/files", rule)`. Encoded slashes such as `/files/a%2fb` can then be
+`register_exclusive_subtree("/files", |path| path.all(rule))`. Encoded slashes such as `/files/a%2fb` can then be
 accepted when every supported interpretation stays in that rule. The exclusive
 declaration rejects more-specific paths that can take precedence beneath it,
 regardless of registration order. This includes overlaps between literal and
-wildcard branches: `exclusive_subtree("/{tenant}", rule)` cannot coexist with
-`route("/files/private", other_rule)`. Unrelated routes and lower-priority fallback
+wildcard branches: `register_exclusive_subtree("/{tenant}", |path| path.all(rule))` cannot coexist with
+`register_path("/files/private", |path| path.all(other_rule))`. Unrelated routes and lower-priority fallback
 routes remain valid. Method-specific rules at the same path patterns remain valid;
-exclusivity restricts nested paths, not method slots. Use `subtree` instead if nested
+exclusivity restricts nested paths, not method slots. Use `register_subtree` instead if nested
 routes are intentional.
 
 Restrict the registration to the methods its policy serves. Structural checks use
 the request method, so a GET-only subtree can accept GET encoded keys. For example:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
 
 let router = RuleRouter::builder("default", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .register(Registration::exclusive_subtree("/files", "read-files").for_methods([http::Method::GET, http::Method::HEAD]))
+    .register_exclusive_subtree("/files", |path| path.methods([http::Method::GET, http::Method::HEAD], "read-files"))
     .build()
     .expect("valid routes");
 assert_eq!(*router.resolve("/files/a%2fb", &http::Method::GET).unwrap().rule(), "read-files");
-assert!(router.resolve("/files/a%2fb", &http::Method::POST).unwrap().is_default());
+assert_eq!(router.resolve("/files/a%2fb", &http::Method::POST).unwrap_err(), huskarl_route_guard::ResolveError::MethodNotConfigured);
 ```
 
-An accepted POST in this example still requires enforcement of the default policy.
+POST is denied in this example because the subtree has no POST or ALL rule and does not inherit.
 Adding a POST rule at the same subtree patterns does not change GET coverage.
 Adding a more-specific POST-only path under an ordinary subtree can change GET
-coverage: GET selects the default at that path, rather than the ancestor's GET rule.
+coverage: GET is denied there unless the child explicitly inherits the broader GET rule.
 
 ## Correct a route-table build error
 
@@ -153,7 +142,7 @@ exact restrictions.
   parsing model expects. Keep uppercase parameter names if useful; only literal
   request-path bytes participate in this check.
 - For an exclusive-subtree conflict, remove or move the overlapping route. If the
-  exception is intentional, change the exclusive declaration to `subtree`, then
+  exception is intentional, change the exclusive declaration to `register_subtree`, then
   recheck encoded-key requests because the new rule boundary can add denials.
 
 ## Verify the table through `resolve`

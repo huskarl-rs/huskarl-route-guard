@@ -12,20 +12,20 @@ use criterion::{
 };
 use http::Method;
 use huskarl_route_guard::{
-    GuardConfig, Registration, RuleRouter,
+    GuardConfig, PathRegistration, RuleRouter,
     config::{CaseSensitivity, DecodeDepth, GuardMode, StructuralClasses},
 };
 
 const DEFAULT_RULE: u32 = u32::MAX;
 
-fn registrations() -> Vec<Registration<u32>> {
+fn registrations() -> Vec<PathRegistration<u32>> {
     vec![
-        Registration::subtree("/admin", 0),
-        Registration::exclusive_subtree("/files", 1),
-        Registration::route("/health", 2),
-        Registration::route("/users/{id}", 3),
-        Registration::route("/method", 4),
-        Registration::route("/method", 5).for_methods(Method::GET),
+        PathRegistration::subtree("/admin").all(0),
+        PathRegistration::exclusive_subtree("/files").all(1),
+        PathRegistration::path("/health").all(2),
+        PathRegistration::path("/users/{id}").all(3),
+        PathRegistration::path("/method").all(4),
+        PathRegistration::path("/method").method(Method::GET, 5),
     ]
 }
 
@@ -265,19 +265,19 @@ fn path_length_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-fn exact_registrations(count: usize) -> Vec<Registration<u32>> {
+fn exact_registrations(count: usize) -> Vec<PathRegistration<u32>> {
     (0..count)
-        .map(|i| Registration::route(format!("/routes/item-{i}"), i as u32))
+        .map(|i| PathRegistration::path(format!("/routes/item-{i}")).all(i as u32))
         .collect()
 }
 
-fn subtree_registrations(count: usize) -> Vec<Registration<u32>> {
+fn subtree_registrations(count: usize) -> Vec<PathRegistration<u32>> {
     (0..count)
-        .map(|i| Registration::subtree(&format!("/tenant-{i}"), i as u32))
+        .map(|i| PathRegistration::subtree(&format!("/tenant-{i}")).all(i as u32))
         .collect()
 }
 
-fn build_router(registrations: Vec<Registration<u32>>) -> RuleRouter<u32> {
+fn build_router(registrations: Vec<PathRegistration<u32>>) -> RuleRouter<u32> {
     RuleRouter::from_registrations(
         DEFAULT_RULE,
         GuardConfig {
@@ -331,6 +331,62 @@ fn build_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+fn inheritance_scaling(c: &mut Criterion) {
+    let config = || GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+    let make_paths = |count: usize, method_count: usize| {
+        let methods = [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+        ];
+        let mut paths = vec![PathRegistration::subtree("/files").all(0)];
+        paths.extend((0..count).map(|i| {
+            PathRegistration::path(format!("/files/item-{i}"))
+                .fallback_inherit(true)
+                .methods(methods.iter().take(method_count).cloned(), i as u32 + 1)
+        }));
+        paths
+    };
+    let mut group = c.benchmark_group("build/method_views");
+    for count in [256, 4096] {
+        for methods in [1, 4, 8] {
+            group.bench_function(BenchmarkId::new(format!("{methods}_methods"), count), |b| {
+                b.iter_batched(
+                    || make_paths(count, methods),
+                    |paths| RuleRouter::from_registrations(DEFAULT_RULE, config(), paths).unwrap(),
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+
+    let router = RuleRouter::builder(DEFAULT_RULE, config())
+        .register_subtree("/files", |p| p.method(Method::GET, 0))
+        .register_subtree("/files/nested", |p| {
+            p.fallback_inherit(true).method(Method::POST, 1)
+        })
+        .register_path("/files/nested/item", |p| {
+            p.fallback_inherit(true).method(Method::PUT, 2)
+        })
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("resolve/inheritance");
+    resolve_case(
+        &mut group,
+        "two_fallbacks",
+        router,
+        "/files/nested/item",
+        Method::GET,
+    );
+    group.finish();
+}
+
 fn benchmark_config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))
@@ -345,6 +401,7 @@ criterion_group! {
         suspicious_resolution,
         path_length_scaling,
         route_count_scaling,
-        build_scaling
+        build_scaling,
+        inheritance_scaling
 }
 criterion_main!(benches);

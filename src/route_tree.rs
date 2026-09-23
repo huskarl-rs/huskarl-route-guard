@@ -34,6 +34,9 @@ pub(crate) type RuleId = u32;
 /// the default" and "matches registration N" are compared on the same footing.
 pub(crate) const DEFAULT_RULE: RuleId = u32::MAX;
 
+/// A stopped method lookup. Never indexes the public rule-value table.
+pub(crate) const DENIED_RULE: RuleId = u32::MAX - 1;
+
 /// A join-semilattice summary of a set of rule ids — the currency of the scoped
 /// structural verdict. `Empty` is the identity, joining two equal `Uniform`s is
 /// idempotent, and anything else is `Mixed`. [`DEFAULT_RULE`] is a legal `Uniform`
@@ -66,7 +69,7 @@ impl Cover {
 }
 
 /// One segment of a parsed pattern.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Segment {
     /// A literal segment, already unescaped; matched byte-for-byte.
     Literal(String),
@@ -77,7 +80,7 @@ pub(crate) enum Segment {
 }
 
 /// A parsed pattern: its segments plus whether it ends in a significant trailing slash.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Pattern {
     pub(crate) segments: Vec<Segment>,
     pub(crate) trailing_slash: bool,
@@ -289,11 +292,11 @@ fn unescape_braces(s: &str) -> String {
 /// Which HTTP method(s) a registration applies to. `Any` (the default) matches every
 /// method; `OneOf` matches the listed methods — all under the registration's **single
 /// rule id**, so "this rule for GET and HEAD" is one registration, not two. Method is
-/// **orthogonal to path**: path traversal is method-independent; terminal resolution
-/// and structural coverage use the request method.
+/// used for terminal resolution and structural coverage. The path-level inheritance
+/// setting controls whether an unresolved lookup can continue.
 ///
-/// Builder methods taking `impl Into<MethodMatch>` accept a bare [`http::Method`], an
-/// array, or a `Vec` of them. An empty `OneOf` matches nothing and is rejected at
+/// Path tables lower ALL and method definitions into this internal representation.
+/// An empty `OneOf` matches nothing and is rejected at
 /// build time ([`RuleRouterError::EmptyMethodSet`](crate::RuleRouterError::EmptyMethodSet))
 /// rather than silently registering an unreachable rule.
 ///
@@ -302,10 +305,10 @@ fn unescape_braces(s: &str) -> String {
 /// The router selects a path terminal before consulting this value. A literal path
 /// terminal therefore remains more specific than a wildcard or catch-all terminal even
 /// when it has no entry for the request method. In that case resolution uses an `Any`
-/// entry at the same terminal, or the default rule; it does not backtrack to a
-/// less-specific path. See [Routing behavior](crate::_docs::reference::routing).
+/// entry at the same terminal, then explicitly enabled inheritance, otherwise a
+/// method denial. Inheritance continues through matching-pattern precedence. See [Routing behavior](crate::_docs::reference::routing).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum MethodMatch {
+pub(crate) enum MethodMatch {
     /// Matches any method (the wildcard default).
     #[default]
     Any,
@@ -334,8 +337,12 @@ impl From<Vec<http::Method>> for MethodMatch {
 /// The rules terminating at one path position, keyed by method. A path can carry a
 /// method-wildcard rule and any number of method-specific ones; resolution is
 /// specific-method → wildcard → none.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MethodSlot {
+    /// An explicitly registered path, including a path with no rules.
+    claimed: bool,
+    /// Continue matching when neither a method override nor ALL applies.
+    inherit: bool,
     /// The method-wildcard rule, if any.
     any: Option<RuleId>,
     /// Method-specific rules.
@@ -344,10 +351,10 @@ struct MethodSlot {
 
 impl MethodSlot {
     fn is_empty(&self) -> bool {
-        self.any.is_none() && self.exact.is_empty()
+        !self.claimed && self.any.is_none() && self.exact.is_empty()
     }
 
-    /// Resolve specific-method → all-method rule → default.
+    /// Resolve a concrete method override, then ALL; None means no local definition.
     fn get(&self, method: &http::Method) -> Option<RuleId> {
         self.exact
             .iter()
@@ -356,9 +363,8 @@ impl MethodSlot {
             .or(self.any)
     }
 
-    /// Coverage for one method, or for all unregistered methods (`None`). An empty
-    /// slot contributes nothing, but a claimed path with no rule for this method
-    /// contributes the default: path matching must not fall back in that case.
+    /// Coverage in a compiled view. Slots are empty (allowing fallback) or carry
+    /// one concrete outcome, including `DENIED_RULE` for a stopped lookup.
     fn cover(&self, method: Option<&http::Method>) -> Cover {
         if self.is_empty() {
             Cover::Empty
@@ -372,7 +378,7 @@ impl MethodSlot {
     }
 
     /// Insert a rule for `method`; a duplicate `(position, method)` is a conflict
-    /// ([`Router::build`] attributes it to the entry as [`BuildError::Conflict`]),
+    /// ([`Router::build_with_fallbacks`] attributes it to the entry as [`BuildError::Conflict`]),
     /// including a method listed twice within one `OneOf`. An empty `OneOf` inserts
     /// nothing (the terminal stays unclaimed); `RuleRouter::from_registrations` rejects it before
     /// the tree is ever built.
@@ -400,7 +406,7 @@ impl MethodSlot {
 /// A node in the route tree. Structural bytes only ever land in a wildcard/catch-all
 /// position (literals match canonical pattern bytes), and the scoped verdict reads the
 /// per-node coverage summaries computed at build — the payoff of owning the matcher.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Node {
     /// Exact-segment children.
     literals: HashMap<String, Node>,
@@ -414,8 +420,6 @@ struct Node {
     catchall: MethodSlot,
     /// Coverage for methods without an explicit registration anywhere in the table.
     other_cover: RegionCover,
-    /// Coverage in the router's method-index order. Empty for all-method tables.
-    method_covers: Vec<RegionCover>,
 }
 
 /// Summaries for one method category at a node.
@@ -428,16 +432,8 @@ struct RegionCover {
 }
 
 impl Node {
-    fn cover(&self, method_index: Option<usize>) -> RegionCover {
-        method_index.map_or(self.other_cover, |index| {
-            self.method_covers
-                .get(index)
-                .copied()
-                .unwrap_or(RegionCover {
-                    all: Cover::Mixed,
-                    below: Cover::Mixed,
-                })
-        })
+    fn cover(&self) -> RegionCover {
+        self.other_cover
     }
 }
 
@@ -445,7 +441,7 @@ impl Node {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BuildError {
     /// Two rules claim the same terminal slot. `index` is the position, in the entries
-    /// given to [`Router::build`], of the entry that hit the conflict — so the caller
+    /// given to [`Router::build_with_fallbacks`], of the entry that hit the conflict — so the caller
     /// can name the offending pattern.
     Conflict {
         /// Index of the conflicting entry.
@@ -460,26 +456,29 @@ pub(crate) enum BuildError {
     },
 }
 
-/// Internal marker for a terminal-slot conflict during insertion; [`Router::build`]
+/// Internal marker for a terminal-slot conflict during insertion; [`Router::build_with_fallbacks`]
 /// attributes it to the offending entry as [`BuildError::Conflict`].
 struct SlotConflict;
 
 /// A `path -> RuleId` matcher over the owned grammar.
 pub(crate) struct Router {
     root: Node,
-    method_indices: HashMap<http::Method, usize>,
+    /// Each method view erases inheriting gaps and retains blocking gaps.
+    /// Rule IDs are shared; rule values are never cloned.
+    method_roots: HashMap<http::Method, Node>,
 }
 
 impl Router {
     /// Expand the same conservative coverage used by `anchor_cover` for diagnostics.
     pub(crate) fn anchor_identities(&self, anchor: &str, method: &http::Method) -> Vec<RuleId> {
+        let root = self.root_for(method);
         let segments: Vec<_> = anchor.split('/').filter(|s| !s.is_empty()).collect();
         let mut ids = Vec::new();
         let complete = if let Some((first, rest)) = segments.split_first() {
-            walk_identities(&self.root, first, rest, method, &mut ids)
+            walk_identities(root, first, rest, method, &mut ids)
         } else {
-            collect_identities(&self.root, method, true, &mut ids);
-            !self.root.leaf.is_empty() && !self.root.catchall.is_empty()
+            collect_identities(root, method, true, &mut ids);
+            !root.leaf.is_empty() && !root.catchall.is_empty()
         };
         if !complete {
             ids.push(DEFAULT_RULE);
@@ -490,16 +489,28 @@ impl Router {
     }
 
     /// Find a method gap and the rule hidden by the claimed path terminal.
-    pub(crate) fn method_gap(&self, path: &str, method: &http::Method) -> Option<RuleId> {
+    pub(crate) fn method_gap(
+        &self,
+        path: &str,
+        method: &http::Method,
+        pattern: &Pattern,
+    ) -> Option<RuleId> {
+        let root = self.root_for(method);
         let body = path.as_bytes().strip_prefix(b"/")?;
         if body.is_empty() {
             return None;
         }
-        let claimed = route(&self.root, body)?;
-        if claimed.get(method).is_some() {
+        let claimed = route(root, body)?;
+        if !std::ptr::eq(
+            claimed,
+            find_terminal(root, &pattern.segments, pattern.trailing_slash)?,
+        ) || claimed.get(method) != Some(DENIED_RULE)
+        {
             return None;
         }
-        route_skipping(&self.root, body, Some(claimed))?.get(method)
+        route_skipping(root, body, Some(claimed))?
+            .get(method)
+            .filter(|id| *id != DENIED_RULE)
     }
 
     /// Build a router from `(pattern, rule_id, opaque, method)` entries.
@@ -512,46 +523,58 @@ impl Router {
     /// # Errors
     ///
     /// [`BuildError`] on a terminal conflict or an opaque catch-all with a routing sibling.
+    #[cfg(test)]
     pub(crate) fn build(
         entries: &[(Pattern, RuleId, bool, MethodMatch)],
     ) -> Result<Self, BuildError> {
-        let mut root = Node::default();
+        Self::build_with_fallbacks(entries, &[])
+    }
+
+    pub(crate) fn build_with_fallbacks(
+        entries: &[(Pattern, RuleId, bool, MethodMatch)],
+        fallbacks: &[(Pattern, bool)],
+    ) -> Result<Self, BuildError> {
+        let mut source = Node::default();
         for (i, (pat, id, _, method)) in entries.iter().enumerate() {
-            insert(&mut root, &pat.segments, pat.trailing_slash, *id, method)
+            insert(&mut source, &pat.segments, pat.trailing_slash, *id, method)
                 .map_err(|SlotConflict| BuildError::Conflict { index: i })?;
         }
+        for (pattern, inherit) in fallbacks {
+            let slot = terminal(&mut source, &pattern.segments, pattern.trailing_slash);
+            slot.claimed = true;
+            slot.inherit = *inherit;
+        }
         validate_opaque(entries)?;
-        let mut method_indices = HashMap::new();
-        let mut methods = Vec::new();
+        let mut method_roots = HashMap::new();
         for (_, _, _, selection) in entries {
-            if let MethodMatch::OneOf(exact) = selection {
-                for method in exact {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        method_indices.entry(method.clone())
-                    {
-                        entry.insert(methods.len());
-                        methods.push(method.clone());
-                    }
+            if let MethodMatch::OneOf(methods) = selection {
+                for method in methods {
+                    method_roots
+                        .entry(method.clone())
+                        .or_insert_with(|| compile_method(&source, Some(method)));
                 }
             }
         }
-        compute_cover(&mut root, &methods);
         Ok(Self {
-            root,
-            method_indices,
+            root: compile_method(&source, None),
+            method_roots,
         })
     }
 
-    /// Match `path`, then resolve the claimed terminal with `method`.
-    /// A path that claims a terminal but has no rule for `method` returns
-    /// `None` — never a fall-back to a less-specific path.
+    fn root_for(&self, method: &http::Method) -> &Node {
+        self.method_roots.get(method).unwrap_or(&self.root)
+    }
+
+    /// Match in the compiled method view. Inheriting gaps are absent; blocking
+    /// gaps return `DENIED_RULE`. None means matching was exhausted.
     fn at(&self, path: &[u8], method: &http::Method) -> Option<RuleId> {
+        let root = self.root_for(method);
         let body = path.strip_prefix(b"/")?;
         let slot = if body.is_empty() {
             // The bare root path `/` claims the root leaf.
-            (!self.root.leaf.is_empty()).then_some(&self.root.leaf)
+            (!root.leaf.is_empty()).then_some(&root.leaf)
         } else {
-            route(&self.root, body)
+            route(root, body)
         }?;
         // Method resolution happens once, on the claimed terminal — no backtracking.
         slot.get(method)
@@ -597,11 +620,11 @@ impl Router {
     /// every suffix is covered (see [`walk_cover`]). The result is a superset of what
     /// concrete reinterpretations can reach — over-approximation only ever denies more.
     pub(crate) fn anchor_cover(&self, anchor: &str, method: &http::Method) -> Cover {
-        let method_index = self.method_indices.get(method).copied();
+        let root = self.root_for(method);
         let mut segs = anchor.split('/').filter(|s| !s.is_empty());
         if let Some(first) = segs.next() {
             let rest: Vec<&str> = segs.collect();
-            let (cover, complete) = walk_cover(&self.root, first, &rest, method, method_index);
+            let (cover, complete) = walk_cover(root, first, &rest, method);
             if complete {
                 cover
             } else {
@@ -611,43 +634,97 @@ impl Router {
             // Root anchor: the empty remainder is the bare `/`, which claims
             // `root.leaf` — so the *whole* table participates, own leaf included.
             // Complete only if both the bare `/` and every non-empty body are covered.
-            let complete = !self.root.leaf.is_empty() && !self.root.catchall.is_empty();
+            let complete = !root.leaf.is_empty() && !root.catchall.is_empty();
             if complete {
-                self.root.cover(method_index).all
+                root.cover().all
             } else {
-                self.root.cover(method_index).all.with(DEFAULT_RULE)
+                root.cover().all.with(DEFAULT_RULE)
             }
         }
     }
 }
 
-/// Precompute coverage for each explicitly registered method and one shared
-/// category for every other method. All-method tables need no per-method vectors.
-fn compute_cover(node: &mut Node, methods: &[http::Method]) {
-    for child in node.literals.values_mut() {
-        compute_cover(child, methods);
-    }
-    if let Some(child) = node.wildcard.as_deref_mut() {
-        compute_cover(child, methods);
-    }
-    node.other_cover = summarize(node, None, None);
-    node.method_covers = methods
-        .iter()
-        .enumerate()
-        .map(|(index, method)| summarize(node, Some(method), Some(index)))
-        .collect();
+/// Materialize one method's path semantics. An inheriting gap is absent from this
+/// view, so ordinary path backtracking continues. A blocking gap is a terminal
+/// carrying `DENIED_RULE`, so it stops lookup. Matching and coverage use this SAME tree.
+fn compile_method(source: &Node, method: Option<&http::Method>) -> Node {
+    let slot = |source: &MethodSlot| {
+        let id = method.map_or(source.any, |m| source.get(m));
+        let any = id.or_else(|| (!source.is_empty() && !source.inherit).then_some(DENIED_RULE));
+        MethodSlot {
+            any,
+            ..MethodSlot::default()
+        }
+    };
+    let mut node = Node {
+        literals: source
+            .literals
+            .iter()
+            .map(|(key, child)| (key.clone(), compile_method(child, method)))
+            .collect(),
+        wildcard: source
+            .wildcard
+            .as_deref()
+            .map(|child| Box::new(compile_method(child, method))),
+        leaf: slot(&source.leaf),
+        leaf_slash: slot(&source.leaf_slash),
+        catchall: slot(&source.catchall),
+        ..Node::default()
+    };
+    node.other_cover = summarize(&node, None);
+    node
 }
 
-fn summarize(node: &Node, method: Option<&http::Method>, index: Option<usize>) -> RegionCover {
+/// Locate the exact terminal represented by a diagnostic pattern.
+fn find_terminal<'a>(
+    node: &'a Node,
+    segments: &[Segment],
+    trailing: bool,
+) -> Option<&'a MethodSlot> {
+    match segments.split_first() {
+        None => Some(if trailing {
+            &node.leaf_slash
+        } else {
+            &node.leaf
+        }),
+        Some((Segment::CatchAll, _)) => Some(&node.catchall),
+        Some((Segment::Literal(s), rest)) => find_terminal(node.literals.get(s)?, rest, trailing),
+        Some((Segment::Wildcard, rest)) => find_terminal(node.wildcard.as_deref()?, rest, trailing),
+    }
+}
+
+/// Find or create a path terminal without assigning a rule to it.
+fn terminal<'a>(node: &'a mut Node, segments: &[Segment], trailing: bool) -> &'a mut MethodSlot {
+    match segments.split_first() {
+        None => {
+            if trailing {
+                &mut node.leaf_slash
+            } else {
+                &mut node.leaf
+            }
+        }
+        Some((Segment::CatchAll, _)) => &mut node.catchall,
+        Some((Segment::Literal(s), rest)) => {
+            terminal(node.literals.entry(s.clone()).or_default(), rest, trailing)
+        }
+        Some((Segment::Wildcard, rest)) => terminal(
+            node.wildcard.get_or_insert_with(Box::default),
+            rest,
+            trailing,
+        ),
+    }
+}
+
+fn summarize(node: &Node, method: Option<&http::Method>) -> RegionCover {
     let mut below = node
         .leaf_slash
         .cover(method)
         .join(node.catchall.cover(method));
     for child in node.literals.values() {
-        below = below.join(child.cover(index).all);
+        below = below.join(child.cover().all);
     }
     if let Some(child) = node.wildcard.as_deref() {
-        below = below.join(child.cover(index).all);
+        below = below.join(child.cover().all);
     }
     RegionCover {
         all: below.join(node.leaf.cover(method)),
@@ -664,23 +741,17 @@ fn summarize(node: &Node, method: Option<&http::Method>, index: Option<usize>) -
 /// catch-all only when both dead-end — so once a tier is complete, later tiers are
 /// unreachable and must not join the cover (else a fully-registered subtree nested
 /// under a broader catch-all would falsely read as mixed). At anchor depth a node
-/// contributes its method-specific `below` summary, and its completeness requires its own catch-all (all
+/// contributes its compiled `below` summary, and its completeness requires its own catch-all (all
 /// non-empty remainders) *and* `leaf_slash` (the empty remainder — a `;`-strip can
 /// produce exactly the anchor path). That conjunction is per-node rather than across
-/// tiers — cheaper, and wrong only toward denial. Completeness remains method-blind:
-/// a claimed terminal with no rule for this method resolves to the default and blocks
-/// fallback, just as it does in `route`.
-fn walk_cover(
-    node: &Node,
-    seg: &str,
-    rest: &[&str],
-    method: &http::Method,
-    method_index: Option<usize>,
-) -> (Cover, bool) {
+/// tiers — cheaper, and wrong only toward denial. Within the selected method view,
+/// compiled blocking terminals carry `DENIED_RULE` and stop fallback, while inheriting
+/// gaps are absent, just as in `route`.
+fn walk_cover(node: &Node, seg: &str, rest: &[&str], method: &http::Method) -> (Cover, bool) {
     let descend = |child: &Node| match rest.split_first() {
-        Some((next, tail)) => walk_cover(child, next, tail, method, method_index),
+        Some((next, tail)) => walk_cover(child, next, tail, method),
         None => (
-            child.cover(method_index).below,
+            child.cover().below,
             !child.catchall.is_empty() && !child.leaf_slash.is_empty(),
         ),
     };
@@ -917,6 +988,60 @@ mod tests {
         clippy::needless_pass_by_value,
         clippy::struct_excessive_bools
     )]
+
+    proptest::proptest! {
+        /// Independent fallback oracle: match each pattern separately with matchit,
+        /// then interpret method entries and inheritance in known precedence order.
+        #[test]
+        fn compiled_method_views_match_explicit_fallback_search(
+            settings in proptest::collection::vec((0u8..8, proptest::bool::ANY), 6),
+            probe in proptest::sample::select(vec![
+                "/files/private/key", "/files/other/key", "/files/private/", "/files/key",
+                "/other/private/key", "/other/key", "/files/a%2fb", "/files//key", "/", "/files/",
+            ]),
+            reverse in proptest::bool::ANY,
+        ) {
+            let patterns = ["/files/private/key", "/files/{name}/key", "/files/{*rest}",
+                "/{tenant}/private/key", "/{tenant}/{*rest}", "/{*rest}"];
+            let mut entries = Vec::new();
+            let mut fallbacks = Vec::new();
+            for (index, (pattern, (mask, inherit))) in patterns.iter().zip(&settings).enumerate() {
+                let parsed = lower_matchit(pattern).unwrap();
+                fallbacks.push((parsed.clone(), *inherit));
+                for (bit, method) in [(1, MethodMatch::Any), (2, http::Method::GET.into()), (4, http::Method::POST.into())] {
+                    if mask & bit != 0 {
+                        entries.push((parsed.clone(), u32::try_from(index * 3 + bit.trailing_zeros() as usize).unwrap(), false, method));
+                    }
+                }
+            }
+            if reverse { entries.reverse(); fallbacks.reverse(); }
+            let router = Router::build_with_fallbacks(&entries, &fallbacks).unwrap();
+            for method in [http::Method::GET, http::Method::POST, http::Method::from_bytes(b"CUSTOM").unwrap()] {
+                let mut expected = None;
+                for (index, (pattern, (mask, inherit))) in patterns.iter().zip(&settings).enumerate() {
+                    let mut matcher = matchit::Router::new();
+                    matcher.insert(*pattern, ()).unwrap();
+                    if matcher.at(probe).is_err() { continue; }
+                    let bit = if method == http::Method::GET { 2 } else if method == http::Method::POST { 4 } else { 0 };
+                    let selected = if mask & bit != 0 { bit } else { mask & 1 };
+                    if selected != 0 {
+                        expected = Some(u32::try_from(index * 3 + selected.trailing_zeros() as usize).unwrap());
+                        break;
+                    }
+                    if !inherit { expected = Some(DENIED_RULE); break; }
+                }
+                proptest::prop_assert_eq!(router.resolve(probe, &method), expected);
+                // A cached uniform region must include the actual concrete outcome,
+                // including denial and default. This also tests erased inherit gaps.
+                for anchor in ["/", "/files/", "/files/private/", "/other/"] {
+                    if probe.starts_with(anchor)
+                        && let Cover::Uniform(id) = router.anchor_cover(anchor, &method) {
+                        proptest::prop_assert_eq!(id, expected.unwrap_or(DEFAULT_RULE));
+                    }
+                }
+            }
+        }
+    }
 
     proptest::proptest! {
         #[test]
@@ -1256,8 +1381,8 @@ mod tests {
     }
 
     #[test]
-    fn anchor_cover_method_gap_injects_default() {
-        // GET stays uniform, but POST selects the default at the GET-only leaf
+    fn anchor_cover_method_gap_injects_denial() {
+        // GET stays uniform, but POST is denied at the GET-only leaf
         // instead of falling back to the surrounding all-method catch-all.
         let entries = vec![
             (
@@ -1293,8 +1418,8 @@ mod tests {
     #[test]
     fn multi_method_slot_resolves_each_and_stays_method_gapped() {
         // A OneOf registration claims each listed method under its single rule id;
-        // unlisted methods resolve uniformly to the default, while listed methods
-        // have default-rule gaps outside the registered path.
+        // unlisted methods deny at the path. Unmatched paths still select default
+        // for every method, so the root region is mixed in each method view.
         let entries = vec![(
             parse_pattern("/x").expect("pat"),
             0,
@@ -1304,13 +1429,10 @@ mod tests {
         let r = Router::build(&entries).expect("build");
         assert_eq!(r.resolve("/x", &http::Method::GET), Some(0));
         assert_eq!(r.resolve("/x", &http::Method::HEAD), Some(0));
-        assert_eq!(r.resolve("/x", &http::Method::POST), None);
+        assert_eq!(r.resolve("/x", &http::Method::POST), Some(DENIED_RULE));
         assert_eq!(r.anchor_cover("/", &http::Method::GET), Cover::Mixed);
         assert_eq!(r.anchor_cover("/", &http::Method::HEAD), Cover::Mixed);
-        assert_eq!(
-            r.anchor_cover("/", &http::Method::POST),
-            Cover::Uniform(DEFAULT_RULE)
-        );
+        assert_eq!(r.anchor_cover("/", &http::Method::POST), Cover::Mixed);
     }
 
     // ── matching: precedence + backtracking (the load-bearing behavior) ───────

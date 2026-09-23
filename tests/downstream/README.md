@@ -4,7 +4,9 @@ These tests validate the assumptions behind deployment recommendations. Only
 requests accepted by each candidate guard configuration are sent downstream.
 A reached route's independently assigned policy must agree with the authorized
 policy. Removal runs weaken one setting or registration assumption and must expose
-actual outgoing-request confusion to justify retaining that recommendation.
+actual outgoing-request confusion for parsing settings. Removing a method
+registration must instead deny its named request with `MethodNotConfigured`,
+without introducing accepted-request confusion.
 
 The user-facing reference is `docs/reference/deployments.md`.
 
@@ -42,7 +44,7 @@ Docker daemons are unsupported: the published address must be local loopback.
   body suppression; Apache assigns the header using filesystem directory scope.
 - `profiles.rs` declares guard settings, method-registration assumptions, and
   variants removing individual recommendations. Each removal pins a named
-  method/path counterexample as well as running the entire shared corpus.
+  method/path confusion or method-denial witness and runs the entire shared corpus.
 - `tests/downstream.rs` contains the backend-independent transport and assertions.
   Each candidate receives the same input corpus before guard filtering. It has
   no branches identifying particular servers.
@@ -102,9 +104,10 @@ A redirected request needs fresh authorization. Other statuses or network errors
 ## Outcomes and recommendation changes
 
 Recommended configurations must have zero policy mismatches. Each removal must
-produce confusion, including its named counterexample. If recommended settings
+produce its declared outcome: parsing confusion or safe method denial, including
+the named witness. If recommended settings
 permit confusion, fix and document the configuration or model and retain the
-counterexample. If removal finds no confusion, review and remove the unsupported
+counterexample. If a parsing-setting removal finds no confusion, review and remove the unsupported
 recommendation for that tested profile. Absence of counterexamples in this finite
 suite does not prove that a setting is unnecessary for arbitrary applications.
 

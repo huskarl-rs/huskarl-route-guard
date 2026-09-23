@@ -84,7 +84,7 @@ tightening and relaxing, and it is drawn by this layer's blindness to the upstre
   that *depends* on the rule→upstream binding being what you assumed — and this layer
   cannot confirm it. "This zone is Unix, stop checking `\`" becomes a clean relocation
   bypass the moment any of that zone's traffic is routed to a Windows backend. Unlike
-  the uniform-subtree tolerance (`subtree`/`exclusive_subtree`) — which is **bounded** by
+  the uniform-subtree tolerance (`register_subtree`/`register_exclusive_subtree`) — which is **bounded** by
   construction: it exists only where no other rule is reachable, and still denies
   NUL, any climb out, and any fold or decode that relocates, so even misuse cannot
   escape it — disabling a structural class removes that check when the guess turns
@@ -100,6 +100,6 @@ chain, its decode declaration must cover both. Combining supported behaviors is
 conservative within the model; passing separate profiles does not itself validate
 a production gateway's selection or forwarding logic.
 
-Whether you register a rule with `subtree`, `exclusive_subtree`, or `route` is a related
+Whether you register a rule with `register_subtree`, `register_exclusive_subtree`, or `register_path` is a related
 security decision, documented on the route-registration builders of the consuming
 authorization layer (e.g. huskarl-pingora's `Guard` and `LoginProxy`).

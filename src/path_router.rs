@@ -3,9 +3,9 @@
 //! An authorization layer that maps request paths to per-path rules needs the same two
 //! things regardless of which proxy or framework hosts it:
 //!
-//! - **Rule identity** — every pattern produced by one `route`/`subtree` call shares a
-//!   rule id, so the structural guard reasons at rule granularity (movement *within* a
-//!   registration is not a relocation; nested registrations have distinct IDs).
+//! - **Rule identity** — each concrete method or ALL definition has one rule ID shared
+//!   across its registration's patterns. Inheritance returns that original identity,
+//!   so movement within the same rule is not a relocation.
 //! - **The structural verdict** — deny a request whose path could be routed differently
 //!   by a normalizing backend than the rule the raw path matched.
 //!
@@ -15,13 +15,13 @@
 //! are lowered into the owned grammar at build time; whatever the grammar cannot express
 //! (in-segment prefix/suffix params) is a build-time error.
 //!
-//! [`RuleRouter::builder`] is the intended way to construct one: its
-//! [`route`](RuleRouterBuilder::route) / [`subtree`](RuleRouterBuilder::subtree) /
-//! [`exclusive_subtree`](RuleRouterBuilder::exclusive_subtree) methods expand subtree patterns
-//! internally. The registration-level [`RuleRouter::from_registrations`] remains for callers that
-//! assemble [`Registration`]s inside a builder of their own (as huskarl-pingora's
-//! `Guard`/`LoginProxy` do); rule ids are assigned from registration order, so the
-//! rule-granularity contract holds by construction on both paths.
+//! [`RuleRouter::builder`] constructs path tables with
+//! [`register_path`](RuleRouterBuilder::register_path),
+//! [`register_subtree`](RuleRouterBuilder::register_subtree), and
+//! [`register_exclusive_subtree`](RuleRouterBuilder::register_exclusive_subtree).
+//! Each table groups method overrides, an optional ALL rule, and explicit inheritance.
+//! [`RuleRouter::from_registrations`] accepts assembled [`PathRegistration`] values;
+//! rule IDs are assigned to concrete definitions in insertion order.
 
 use crate::{
     config::{GuardConfig, GuardMode, ResolveError},
@@ -31,8 +31,7 @@ use crate::{
 };
 
 /// The outcome of matching a path: which rule applies, and whether it came from a
-/// registration or is the default rule (no path matched, or the selected path has
-/// no rule for this method).
+/// concrete definition or is the default rule after path lookup was exhausted.
 ///
 /// The distinction is the route table's coverage made visible — an authorization
 /// layer typically logs *which* registration authorized a request, and treats a
@@ -40,16 +39,15 @@ use crate::{
 /// [`rule`](Self::rule) when only the rule matters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleMatch<'a, R> {
-    /// A registration matched: its rule id (the registration's position in build
-    /// order) and rule.
+    /// A concrete definition matched, directly or through inheritance. IDs follow
+    /// definition insertion order, with each definition shared across its patterns.
     Matched {
         /// The matched registration's rule id.
         id: u32,
         /// The matched registration's rule.
         rule: &'a R,
     },
-    /// No path matches, or the selected path has no rule for this method and no
-    /// all-method rule; the default applies.
+    /// Path lookup exhausted all matching paths, possibly through inheritance.
     Default {
         /// The default rule.
         rule: &'a R,
@@ -74,8 +72,7 @@ impl<'a, R> RuleMatch<'a, R> {
         }
     }
 
-    /// Whether the default rule applied because no path matched or the selected
-    /// path has neither this method nor an all-method rule.
+    /// Whether path lookup exhausted all matching paths and selected the default.
     #[must_use]
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default { .. })
@@ -108,10 +105,8 @@ pub enum RuleRouterError {
         /// The offending pattern.
         pattern: String,
     },
-    /// A registration's [`MethodMatch::OneOf`] is empty. It would match no method at
-    /// all, silently leaving every request on the registration's paths to the default
-    /// rule — almost certainly a construction bug, so it is rejected rather than
-    /// registered as unreachable.
+    /// A concrete override's method set is empty, so its rule could
+    /// never be selected. A path table with no concrete definitions is valid.
     EmptyMethodSet {
         /// The registration's first pattern, for attribution.
         pattern: String,
@@ -119,8 +114,8 @@ pub enum RuleRouterError {
     /// A registration has no patterns, so its rule would be unreachable while still
     /// consuming a rule id.
     EmptyPatternSet,
-    /// More registrations than there are rule ids: `u32::MAX` is reserved as the
-    /// default rule's sentinel id. Unreachable in any realistic configuration;
+    /// More concrete definitions than rule IDs: the two highest `u32` values are
+    /// reserved for default and method denial. Unreachable in realistic configurations;
     /// rejected rather than assumed impossible.
     TooManyRegistrations,
 }
@@ -152,7 +147,7 @@ impl std::fmt::Display for RuleRouterError {
                 "registration has no route patterns — its rule would be unreachable; add at least one pattern or remove the registration",
             ),
             Self::TooManyRegistrations => {
-                f.write_str("too many registrations: u32::MAX is reserved as the default rule's id")
+                f.write_str("too many rule definitions: the two highest u32 IDs are reserved for default and method denial")
             }
         }
     }
@@ -160,89 +155,81 @@ impl std::fmt::Display for RuleRouterError {
 
 impl std::error::Error for RuleRouterError {}
 
-/// One registration: a group of patterns sharing one rule — the crate's unit of **rule
-/// identity**. [`RuleRouter::from_registrations`] assigns each registration the rule id equal to its
-/// position, so identity is a fact of the input's shape rather than a contract the
-/// caller must uphold: patterns in one registration can never end up under different
-/// rules, and a rule can never be silently detached from its patterns.
+/// A path's concrete method overrides, optional ALL rule, and fallback behavior.
 ///
-/// Construct via [`route`](Self::route) / [`subtree`](Self::subtree) /
-/// [`exclusive_subtree`](Self::exclusive_subtree) (mirroring the builder methods), qualified with
-/// [`for_methods`](Self::for_methods) where the rule is method-specific — or
-/// use [`patterns`](Self::patterns) to group several patterns under one identity.
+/// Missing methods deny unless [`fallback_inherit`](Self::fallback_inherit) is enabled.
+/// Inheritance continues matching the original path and preserves the defining rule's
+/// identity. It cannot be assigned to an individual method.
 #[derive(Clone, Debug)]
-pub struct Registration<R> {
-    /// The `matchit`-style patterns this registration covers, all under one rule id.
-    /// Must contain at least one pattern; an empty list is rejected at build time.
-    pub(crate) patterns: Vec<String>,
-    /// The rule every pattern resolves to.
-    pub(crate) rule: R,
-    /// Forbids nested paths beneath a catch-all. Set only by `exclusive_subtree`.
-    pub(crate) opaque: bool,
-    /// Which method(s) the rule applies to. Path precedence is resolved before this
-    /// value; see [`MethodMatch`].
-    pub(crate) method: MethodMatch,
+pub struct PathRegistration<R> {
+    patterns: Vec<String>,
+    rules: Vec<(MethodMatch, R)>,
+    exclusive: bool,
+    inherit: bool,
 }
 
-impl<R> Registration<R> {
-    /// Groups patterns under one rule identity.
-    ///
-    /// Unlike separate registrations, changes between these patterns do not
-    /// cross a rule boundary. An empty iterator is rejected when building.
-    pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>, rule: R) -> Self {
+impl<R> PathRegistration<R> {
+    /// Register one exact path or whole-segment pattern. Initially all methods deny.
+    pub fn path(pattern: impl Into<String>) -> Self {
+        Self::patterns([pattern.into()])
+    }
+
+    /// Group patterns under the same method table. Each concrete rule has one identity
+    /// shared across all these patterns.
+    pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             patterns: patterns.into_iter().map(Into::into).collect(),
-            rule,
-            opaque: false,
-            method: MethodMatch::Any,
+            rules: Vec::new(),
+            exclusive: false,
+            inherit: false,
         }
     }
 
-    /// A single exact-match pattern (the row-level [`RuleRouterBuilder::route`]).
-    pub fn route(pattern: impl Into<String>, rule: R) -> Self {
-        Self {
-            patterns: vec![pattern.into()],
-            rule,
-            opaque: false,
-            method: MethodMatch::Any,
-        }
-    }
-
-    /// A path and everything beneath it, expanded via
-    /// [`subtree_patterns`](crate::subtree_patterns) (the row-level
-    /// [`RuleRouterBuilder::subtree`]).
-    pub fn subtree(path: &str, rule: R) -> Self {
-        Self {
-            patterns: crate::subtree_patterns(path),
-            rule,
-            opaque: false,
-            method: MethodMatch::Any,
-        }
-    }
-
-    /// Like [`subtree`](Self::subtree), but rejects paths that take precedence beneath
-    /// it, including through overlapping literal and wildcard branches, in either
-    /// registration order. Lower-priority fallbacks and method rules at the same
-    /// path patterns remain valid.
-    /// Request-time checks are unchanged. Method restrictions can still introduce
-    /// default-rule gaps at more-specific paths; see [`for_methods`](Self::for_methods).
-    pub fn exclusive_subtree(path: &str, rule: R) -> Self {
-        Self {
-            opaque: true,
-            ..Self::subtree(path, rule)
-        }
-    }
-
-    /// Restrict the registration to the given method(s) — a bare [`http::Method`],
-    /// an array, or a `Vec` of them — all under the registration's single rule id.
-    /// Path precedence is resolved before method matching; see [`MethodMatch`].
-    /// Structural coverage uses the request method. A complete subtree can accept
-    /// encoded keys for a listed method. More-specific paths without a rule for that
-    /// method still create default-rule gaps. See
-    /// [Registering routes](crate::_docs::guide::registering).
+    /// Register a prefix, its trailing slash, and descendants with one method table.
     #[must_use]
-    pub fn for_methods(mut self, method: impl Into<MethodMatch>) -> Self {
-        self.method = method.into();
+    pub fn subtree(path: &str) -> Self {
+        Self::patterns(crate::subtree_patterns(path))
+    }
+
+    /// Register a subtree and forbid overriding paths in its catch-all tail.
+    #[must_use]
+    pub fn exclusive_subtree(path: &str) -> Self {
+        Self {
+            exclusive: true,
+            ..Self::subtree(path)
+        }
+    }
+
+    /// Supply the concrete rule for methods without an explicit override.
+    /// Repeated ALL entries are rejected at build time.
+    #[must_use]
+    pub fn all(mut self, rule: R) -> Self {
+        self.rules.push((MethodMatch::Any, rule));
+        self
+    }
+
+    /// Supply a concrete override for one method. Duplicate methods are build errors.
+    #[must_use]
+    pub fn method(self, method: http::Method, rule: R) -> Self {
+        self.methods([method], rule)
+    }
+
+    /// Share one override identity across several methods. Empty or repeated methods
+    /// are rejected when building the router.
+    #[must_use]
+    pub fn methods(mut self, methods: impl IntoIterator<Item = http::Method>, rule: R) -> Self {
+        self.rules
+            .push((MethodMatch::OneOf(methods.into_iter().collect()), rule));
+        self
+    }
+
+    /// Continue to the next matching path when neither a method override nor ALL
+    /// supplies a rule. Defaults to false. Every intermediate path controls its own
+    /// continuation; an unresolved non-inheriting path denies. Exhaustion uses default.
+    /// A concrete ALL rule takes precedence and makes inheritance unnecessary here.
+    #[must_use]
+    pub fn fallback_inherit(mut self, inherit: bool) -> Self {
+        self.inherit = inherit;
         self
     }
 }
@@ -274,7 +261,7 @@ impl<R> RuleRouter<R> {
     ///
     /// let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
     /// let router = RuleRouter::builder("public", config)
-    ///     .subtree("/admin", "admin")
+    ///     .register_subtree("/admin", |path| path.all("admin"))
     ///     .build()
     ///     .expect("valid routes");
     /// assert_eq!(
@@ -295,7 +282,8 @@ impl<R> RuleRouter<R> {
 
     /// Builds a route table from an iterator of registrations.
     ///
-    /// Each registration receives one identity, shared by all its patterns.
+    /// Each concrete rule definition receives one identity shared by its patterns.
+    /// Inheritance creates no new identity.
     /// This is equivalent to `builder(default, config).register_all(registrations).build()`.
     ///
     /// # Errors
@@ -307,86 +295,77 @@ impl<R> RuleRouter<R> {
     pub fn from_registrations(
         default: R,
         config: GuardConfig,
-        registrations: impl IntoIterator<Item = Registration<R>>,
+        registrations: impl IntoIterator<Item = PathRegistration<R>>,
     ) -> Result<Self, RuleRouterError> {
-        let GuardConfig {
-            mode,
-            ref structural_classes,
-            decode_depth,
-            case_sensitivity,
-        } = config;
-        let byte_enabled = enabled_classes(structural_classes);
-        let enc = enabled_encodings(structural_classes, decode_depth);
-
         let mut tree_entries = Vec::new();
-        // Patterns parallel to `tree_entries`, kept so a tree build failure can be
-        // attributed to the pattern that caused it.
-        let mut patterns: Vec<String> = Vec::new();
-        let mut rules: Vec<R> = Vec::new();
-        for reg in registrations {
-            if reg.patterns.is_empty() {
+        let mut patterns = Vec::new();
+        let mut rules = Vec::new();
+        let mut path_fallbacks = std::collections::HashMap::new();
+        for registration in registrations {
+            if registration.patterns.is_empty() {
                 return Err(RuleRouterError::EmptyPatternSet);
             }
-            // An empty method set would claim the registration's terminals for *no*
-            // method, leaving its paths silently on the default rule — reject it.
-            if matches!(&reg.method, MethodMatch::OneOf(ms) if ms.is_empty()) {
-                return Err(RuleRouterError::EmptyMethodSet {
-                    pattern: reg.patterns.first().cloned().unwrap_or_default(),
-                });
-            }
-            // The rule id is the registration's position. `u32::MAX` is the internal
-            // default-rule sentinel (`route_tree::DEFAULT_RULE`), so it must never be
-            // assigned to a real registration.
-            let id = u32::try_from(rules.len())
-                .ok()
-                .filter(|&id| id != crate::route_tree::DEFAULT_RULE)
-                .ok_or(RuleRouterError::TooManyRegistrations)?;
-            for pattern in reg.patterns {
-                let lowered = lower_matchit(&pattern).map_err(|e| RuleRouterError::Route {
-                    pattern: pattern.clone(),
-                    reason: lower_reason(&e),
-                })?;
-                // Build-time canonical-pattern check: a registered pattern that itself
-                // carries a structural byte in a literal segment (or, under a
-                // case-folding backend, uppercase) is non-canonical under the configured
-                // model. Parameter names are route metadata, not request-path bytes,
-                // so inspect the lowered literals rather than the source pattern.
-                if mode != GuardMode::Disabled {
-                    let literals = lowered.segments.iter().filter_map(|segment| match segment {
-                        Segment::Literal(literal) => Some(literal.as_str()),
-                        Segment::Wildcard | Segment::CatchAll => None,
+            let mut parsed = Vec::new();
+            for pattern in &registration.patterns {
+                let lowered = validate_pattern(pattern, &config)?;
+                if path_fallbacks
+                    .insert(lowered.clone(), registration.inherit)
+                    .is_some_and(|previous| previous != registration.inherit)
+                {
+                    return Err(RuleRouterError::Route {
+                        pattern: pattern.clone(),
+                        reason: "conflicting fallback settings at the same path",
                     });
-                    if literals.clone().any(|literal| {
-                        !classes_present(literal, byte_enabled, enc)
-                            .intersect(byte_enabled)
-                            .is_empty()
-                    }) {
-                        return Err(RuleRouterError::NonCanonical { pattern });
-                    }
-                    if case_sensitivity.is_insensitive()
-                        && literals
-                            .clone()
-                            .any(|literal| literal.bytes().any(|b| b.is_ascii_uppercase()))
-                    {
-                        return Err(RuleRouterError::NonCanonicalCase { pattern });
-                    }
                 }
-
-                tree_entries.push((lowered, id, reg.opaque, reg.method.clone()));
-                patterns.push(pattern);
+                parsed.push(lowered);
             }
-            rules.push(reg.rule);
+            if registration.rules.is_empty() {
+                // A path with no rules still claims a terminal, but has no public ID.
+                for (pattern, lowered) in registration.patterns.iter().zip(&parsed) {
+                    tree_entries.push((
+                        lowered.clone(),
+                        crate::route_tree::DENIED_RULE,
+                        registration.exclusive,
+                        MethodMatch::OneOf(Vec::new()),
+                    ));
+                    patterns.push(pattern.clone());
+                }
+            }
+            for (method, rule) in registration.rules {
+                if matches!(&method, MethodMatch::OneOf(methods) if methods.is_empty()) {
+                    return Err(RuleRouterError::EmptyMethodSet {
+                        pattern: registration.patterns.first().cloned().unwrap_or_default(),
+                    });
+                }
+                // The two highest IDs are reserved for default and method denial.
+                let id = u32::try_from(rules.len())
+                    .ok()
+                    .filter(|&id| id < crate::route_tree::DENIED_RULE)
+                    .ok_or(RuleRouterError::TooManyRegistrations)?;
+                for (pattern, lowered) in registration.patterns.iter().zip(&parsed) {
+                    tree_entries.push((
+                        lowered.clone(),
+                        id,
+                        registration.exclusive,
+                        method.clone(),
+                    ));
+                    patterns.push(pattern.clone());
+                }
+                rules.push(rule);
+            }
         }
-
-        let router = Router::build(&tree_entries).map_err(|e| map_build_err(e, &patterns))?;
+        let router = Router::build_with_fallbacks(
+            &tree_entries,
+            &path_fallbacks.into_iter().collect::<Vec<_>>(),
+        )
+        .map_err(|error| map_build_err(error, &patterns))?;
         let diagnostic_patterns = tree_entries
             .into_iter()
             .zip(patterns)
             .map(
-                |((parsed, id, _, methods), source)| crate::diagnostics::DiagnosticPattern {
+                |((parsed, _, _, methods), source)| crate::diagnostics::DiagnosticPattern {
                     parsed,
                     source,
-                    id,
                     methods,
                 },
             )
@@ -418,9 +397,11 @@ impl<R> RuleRouter<R> {
 
     /// Resolves `path` in one call: the path-confusion verdict first, then the rule
     /// match. `Err(reason)` means the request must be **denied** — no rule is offered.
-    /// Path denials normally map to `400`; an internal invariant failure maps to `500`.
+    /// Ambiguity/input denials normally map to `400`, method-policy denials to `403`,
+    /// and internal invariant failures to `500`.
     /// `Ok` carries the [`RuleMatch`]: the matched registration's rule,
-    /// or the default rule for a path no registration covers.
+    /// or the default rule after matching is exhausted. A method gap at a
+    /// non-inheriting path returns [`ResolveError::MethodNotConfigured`].
     ///
     /// This is the request-handling entry point and always runs the configured checks.
     /// Use [`inspect_raw`](Self::inspect_raw) only to log the original path's match,
@@ -475,7 +456,11 @@ impl<R> RuleRouter<R> {
         if !is_request_path(path) {
             return Err(ResolveError::InvalidPathInput);
         }
-        let matched = self.rule_for_id(self.guard.resolve(path, method))?;
+        let id = self.guard.resolve(path, method);
+        if id == Some(crate::route_tree::DENIED_RULE) {
+            return Ok(crate::RawMatch::MethodDenied);
+        }
+        let matched = self.rule_for_id(id)?;
         Ok(matched
             .id()
             .map_or(crate::RawMatch::Default, |id| crate::RawMatch::Matched {
@@ -518,11 +503,17 @@ impl<R> RuleRouter<R> {
     #[cfg(test)]
     pub(crate) fn raw_match_for_test(&self, path: &str, method: &http::Method) -> RuleMatch<'_, R> {
         self.rule_for_id(self.guard.resolve(path, method))
-            .expect("valid test rule table")
+            .expect("test path must have a rule")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_identity_for_test(&self, path: &str, method: &http::Method) -> Option<u32> {
+        self.guard.resolve(path, method)
     }
 
     fn rule_for_id(&self, id: Option<u32>) -> Result<RuleMatch<'_, R>, ResolveError> {
         match id {
+            Some(crate::route_tree::DENIED_RULE) => Err(ResolveError::MethodNotConfigured),
             Some(id) => self
                 .rules
                 .get(id as usize)
@@ -563,17 +554,18 @@ fn is_request_path(path: &str) -> bool {
 /// Create with [`RuleRouter::builder`]. Configuration and the default are required
 /// up front, so every builder can be finished or extended in a loop.
 pub struct RuleRouterBuilder<R> {
-    registrations: Vec<Registration<R>>,
+    registrations: Vec<PathRegistration<R>>,
     default: R,
     config: GuardConfig,
 }
 
 impl<R> RuleRouterBuilder<R> {
-    /// Adds one registration. Its patterns and methods share one rule identity.
+    /// Adds a registration. Each concrete definition has one identity shared across
+    /// its patterns; inherited results retain the original defining identity.
     ///
     /// ```
     /// use huskarl_route_guard::{
-    ///     CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter,
+    ///     CaseSensitivity, DecodeDepth, GuardConfig, PathRegistration, RuleRouter,
     /// };
     ///
     /// let router = RuleRouter::builder(
@@ -581,10 +573,10 @@ impl<R> RuleRouterBuilder<R> {
     ///     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
     /// )
     /// .register(
-    ///     Registration::route("/health", "health")
-    ///         .for_methods([http::Method::GET, http::Method::HEAD]),
+    ///     PathRegistration::path("/health")
+    ///         .methods([http::Method::GET, http::Method::HEAD], "health"),
     /// )
-    /// .register(Registration::patterns(["/ready", "/live"], "probes"))
+    /// .register(PathRegistration::patterns(["/ready", "/live"]).all("probes"))
     /// .build()
     /// .expect("valid routes");
     /// assert_eq!(
@@ -593,46 +585,80 @@ impl<R> RuleRouterBuilder<R> {
     /// );
     /// ```
     #[must_use]
-    pub fn register(mut self, registration: Registration<R>) -> Self {
+    pub fn register(mut self, registration: PathRegistration<R>) -> Self {
         self.registrations.push(registration);
         self
+    }
+
+    /// Define a path's method table and fallback together.
+    ///
+    /// ```
+    /// use http::Method;
+    /// use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
+    /// let router = RuleRouter::builder(
+    ///     "public",
+    ///     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+    /// )
+    /// .register_subtree("/files", |path| path.method(Method::GET, "read"))
+    /// .register_path("/files/special", |path| {
+    ///     path.fallback_inherit(true).method(Method::POST, "write")
+    /// })
+    /// .build()
+    /// .unwrap();
+    /// assert_eq!(
+    ///     *router
+    ///         .resolve("/files/special", &Method::GET)
+    ///         .unwrap()
+    ///         .rule(),
+    ///     "read"
+    /// );
+    /// assert!(router.resolve("/files/hello%20world", &Method::GET).is_ok());
+    /// assert!(router.resolve("/files/hello", &Method::DELETE).is_err());
+    /// ```
+    #[must_use]
+    pub fn register_path(
+        self,
+        pattern: impl Into<String>,
+        configure: impl FnOnce(PathRegistration<R>) -> PathRegistration<R>,
+    ) -> Self {
+        self.register(configure(PathRegistration::path(pattern)))
+    }
+
+    /// Define one method table shared by a prefix, trailing slash, and descendants.
+    ///
+    /// `/files` includes `/files`, `/files/`, and descendants. A trailing slash in
+    /// the input excludes the bare path. More-specific registrations take precedence.
+    #[must_use]
+    pub fn register_subtree(
+        self,
+        path: &str,
+        configure: impl FnOnce(PathRegistration<R>) -> PathRegistration<R>,
+    ) -> Self {
+        self.register(configure(PathRegistration::subtree(path)))
+    }
+
+    /// Define an exclusive subtree's method table and fallback together.
+    ///
+    /// Rejects overriding paths in the catch-all tail at build time, including
+    /// overlapping literal and wildcard branches. Request-time checks are unchanged;
+    /// exclusivity does not disable method restrictions or guarantee acceptance.
+    #[must_use]
+    pub fn register_exclusive_subtree(
+        self,
+        path: &str,
+        configure: impl FnOnce(PathRegistration<R>) -> PathRegistration<R>,
+    ) -> Self {
+        self.register(configure(PathRegistration::exclusive_subtree(path)))
     }
 
     /// Adds registrations in iteration order, preserving each one's identity.
     #[must_use]
     pub fn register_all(
         mut self,
-        registrations: impl IntoIterator<Item = Registration<R>>,
+        registrations: impl IntoIterator<Item = PathRegistration<R>>,
     ) -> Self {
         self.registrations.extend(registrations);
         self
-    }
-
-    /// Registers an exact path or whole-segment pattern, such as `/users/{id}`.
-    /// Use [`subtree`](Self::subtree) to include descendants.
-    #[must_use]
-    pub fn route(self, pattern: impl Into<String>, rule: R) -> Self {
-        self.register(Registration::route(pattern, rule))
-    }
-
-    /// Registers a prefix and its descendants under one rule identity.
-    ///
-    /// `/files` includes `/files`, `/files/`, and descendants.
-    /// A trailing slash in the input excludes the bare path. More-specific
-    /// registrations take precedence. See [Routing behavior](crate::_docs::reference::routing).
-    #[must_use]
-    pub fn subtree(self, path: &str, rule: R) -> Self {
-        self.register(Registration::subtree(path, rule))
-    }
-
-    /// Registers a subtree and forbids more-specific paths beneath it.
-    ///
-    /// Exclusivity is checked at build time; request-time checks are the same as
-    /// [`subtree`](Self::subtree). It does not disable checks or guarantee tolerance
-    /// when method restrictions introduce other rule identities.
-    #[must_use]
-    pub fn exclusive_subtree(self, path: &str, rule: R) -> Self {
-        self.register(Registration::exclusive_subtree(path, rule))
     }
 
     /// Validates the registrations and constructs the router.
@@ -643,6 +669,42 @@ impl<R> RuleRouterBuilder<R> {
     pub fn build(self) -> Result<RuleRouter<R>, RuleRouterError> {
         RuleRouter::from_registrations(self.default, self.config, self.registrations)
     }
+}
+
+/// Validate literal request bytes once per declared pattern, including paths with
+/// no concrete rules. Parameter names are metadata and are not scanned.
+fn validate_pattern(
+    pattern: &str,
+    config: &GuardConfig,
+) -> Result<crate::route_tree::Pattern, RuleRouterError> {
+    let lowered = lower_matchit(pattern).map_err(|error| RuleRouterError::Route {
+        pattern: pattern.to_owned(),
+        reason: lower_reason(&error),
+    })?;
+    if config.mode != GuardMode::Disabled {
+        let enabled = enabled_classes(&config.structural_classes);
+        let enc = enabled_encodings(&config.structural_classes, config.decode_depth);
+        for segment in &lowered.segments {
+            if let Segment::Literal(literal) = segment {
+                if !classes_present(literal, enabled, enc)
+                    .intersect(enabled)
+                    .is_empty()
+                {
+                    return Err(RuleRouterError::NonCanonical {
+                        pattern: pattern.to_owned(),
+                    });
+                }
+                if config.case_sensitivity.is_insensitive()
+                    && literal.bytes().any(|b| b.is_ascii_uppercase())
+                {
+                    return Err(RuleRouterError::NonCanonicalCase {
+                        pattern: pattern.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(lowered)
 }
 
 /// Map a lowering failure to a stable, human-readable reason.
@@ -684,14 +746,14 @@ mod tests {
     };
 
     /// Build a router from `(pattern, rule)` rows, grouping consecutive rows with the
-    /// same rule value into one [`Registration`] (rule ids are then positional, so a
+    /// same rule value into one [`PathRegistration`] (rule ids are then positional, so a
     /// row's rule value equals its registration's id in these tests).
     fn router(rows: &[(&str, u32)], pc: GuardMode) -> Result<RuleRouter<u32>, RuleRouterError> {
-        let mut regs: Vec<Registration<u32>> = Vec::new();
+        let mut regs: Vec<PathRegistration<u32>> = Vec::new();
         for (pattern, rule) in rows {
             match regs.last_mut() {
-                Some(reg) if reg.rule == *rule => reg.patterns.push((*pattern).to_owned()),
-                _ => regs.push(Registration::route(*pattern, *rule)),
+                Some(reg) if reg.rules[0].1 == *rule => reg.patterns.push((*pattern).to_owned()),
+                _ => regs.push(PathRegistration::path(*pattern).all(*rule)),
             }
         }
         RuleRouter::from_registrations(
@@ -715,7 +777,7 @@ mod tests {
         let mut r = RuleRouter::from_registrations(
             "public",
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
-            vec![Registration::route("/admin", "protected")],
+            vec![PathRegistration::path("/admin").all("protected")],
         )
         .expect("build");
         // Inject an invariant violation that public construction cannot create.
@@ -744,20 +806,20 @@ mod tests {
     #[test]
     fn method_qualified_subtrees_allow_structural_keys_for_listed_methods() {
         for registration in [
-            Registration::subtree("/files", "files"),
-            Registration::exclusive_subtree("/files", "files"),
+            PathRegistration::subtree("/files"),
+            PathRegistration::exclusive_subtree("/files"),
         ] {
             let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
             let unrestricted = RuleRouter::from_registrations(
                 "default",
                 config.clone(),
-                vec![registration.clone()],
+                vec![registration.clone().all("files")],
             )
             .expect("build");
             let restricted = RuleRouter::from_registrations(
                 "default",
                 config,
-                vec![registration.for_methods(http::Method::GET)],
+                vec![registration.method(http::Method::GET, "files")],
             )
             .expect("build");
             assert!(
@@ -772,11 +834,11 @@ mod tests {
                     .rule(),
                 "files"
             );
-            assert!(
+            assert_eq!(
                 restricted
                     .resolve("/files/a%2fb", &http::Method::POST)
-                    .expect("uniform default")
-                    .is_default()
+                    .unwrap_err(),
+                ResolveError::MethodNotConfigured
             );
             assert_eq!(
                 *restricted
@@ -918,7 +980,7 @@ mod tests {
                 0,
                 GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
             )
-            .route(pattern, 1)
+            .register_path(pattern, |path| path.all(1))
             .build()
             .expect_err("invalid matchit pattern must fail the build");
             assert!(matches!(err, RuleRouterError::Route { .. }), "{pattern}");
@@ -931,8 +993,8 @@ mod tests {
             0,
             GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
         )
-        .route("/{UserId}", 1)
-        .route("/items/{x;y}", 2)
+        .register_path("/{UserId}", |path| path.all(1))
+        .register_path("/items/{x;y}", |path| path.all(2))
         .build()
         .expect("parameter names are metadata, not path bytes");
 
@@ -953,7 +1015,7 @@ mod tests {
             0,
             GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
         )
-        .route("/Admin/{UserId}", 1)
+        .register_path("/Admin/{UserId}", |path| path.all(1))
         .build()
         .expect_err("uppercase literal path bytes remain non-canonical");
         assert!(matches!(err, RuleRouterError::NonCanonicalCase { .. }));
@@ -968,7 +1030,7 @@ mod tests {
 
     #[test]
     fn opaque_blob_tolerates_separator_via_registration_flag() {
-        // The `opaque` registration flag (set by the builder's exclusive_subtree) reaches
+        // The exclusive registration flag (set by `register_exclusive_subtree`) reaches
         // the tree as a build-time guarantee; runtime tolerance comes from the
         // subtree's uniformity — structural bytes in the tail flow, a climb out of it
         // denies.
@@ -980,7 +1042,7 @@ mod tests {
                 decode_depth: DecodeDepth::UpToOne,
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
-            vec![Registration::exclusive_subtree("/files", 0)],
+            vec![PathRegistration::exclusive_subtree("/files").all(0)],
         )
         .expect("build");
         assert!(!denied(&r, "/files/a%2fb"));
@@ -999,8 +1061,8 @@ mod tests {
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
             vec![
-                Registration::exclusive_subtree("/files", 0),
-                Registration::route("/files/secret", 1),
+                PathRegistration::exclusive_subtree("/files").all(0),
+                PathRegistration::path("/files/secret").all(1),
             ],
         )
         .expect_err("opaque blob with sibling");
@@ -1037,8 +1099,8 @@ mod tests {
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
             vec![
-                Registration::subtree("/admin", 10),
-                Registration::route("/health", 20),
+                PathRegistration::subtree("/admin").all(10),
+                PathRegistration::path("/health").all(20),
             ],
         )
         .expect("build");
@@ -1064,7 +1126,7 @@ mod tests {
                 decode_depth: DecodeDepth::UpToOne,
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
-            vec![Registration::route("/x", 0).for_methods(Vec::new())],
+            vec![PathRegistration::path("/x").methods(Vec::new(), 0)],
         )
         .expect_err("empty method set rejected");
         assert!(matches!(&err, RuleRouterError::EmptyMethodSet { pattern } if pattern == "/x"));
@@ -1081,12 +1143,7 @@ mod tests {
                 decode_depth: DecodeDepth::UpToOne,
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
-            vec![Registration {
-                patterns: Vec::new(),
-                rule: 0,
-                opaque: false,
-                method: MethodMatch::Any,
-            }],
+            vec![PathRegistration::patterns(Vec::<String>::new()).all(0)],
         )
         .expect_err("empty pattern set rejected");
         assert!(matches!(err, RuleRouterError::EmptyPatternSet));
@@ -1102,7 +1159,7 @@ mod tests {
                 decode_depth: DecodeDepth::UpToOne,
                 case_sensitivity: CaseSensitivity::Sensitive,
             },
-            vec![Registration::route("/x", 0).for_methods([http::Method::GET, http::Method::GET])],
+            vec![PathRegistration::path("/x").methods([http::Method::GET, http::Method::GET], 0)],
         )
         .expect_err("duplicate method in one set rejected");
         assert!(matches!(&err, RuleRouterError::Route { .. }));
@@ -1116,8 +1173,8 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .subtree("/admin", 10)
-        .route("/health", 20)
+        .register_subtree("/admin", |path| path.all(10))
+        .register_path("/health", |path| path.all(20))
         .build()
         .expect("build");
         // The whole subtree shares one rule id; the route gets the next.
@@ -1147,7 +1204,7 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .subtree("/admin", 0)
+        .register_subtree("/admin", |path| path.all(0))
         .build()
         .expect("build");
         assert!(
@@ -1163,7 +1220,7 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .exclusive_subtree("/files", 0)
+        .register_exclusive_subtree("/files", |path| path.all(0))
         .build()
         .expect("build");
         assert!(
@@ -1189,8 +1246,8 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .exclusive_subtree("/files", 0)
-        .route("/files/secret", 1)
+        .register_exclusive_subtree("/files", |path| path.all(0))
+        .register_path("/files/secret", |path| path.all(1))
         .build()
         .expect_err("nested route under a blob");
         assert!(matches!(err, RuleRouterError::Route { .. }));
@@ -1202,9 +1259,9 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .register(Registration::route("/x", 0).for_methods(http::Method::GET))
-        .route("/x", 1)
-        .register(Registration::subtree("/api", 2).for_methods(http::Method::POST))
+        .register(PathRegistration::path("/x").method(http::Method::GET, 0))
+        .register_path("/x", |path| path.all(1))
+        .register(PathRegistration::subtree("/api").method(http::Method::POST, 2))
         .build()
         .expect("build");
         // Specific method wins; other methods fall to the wildcard rule on that path.
@@ -1213,14 +1270,14 @@ mod tests {
             r.raw_match_for_test("/x", &http::Method::POST).id(),
             Some(1)
         );
-        // A method-only subtree leaves other methods on the default rule.
+        // A method-only subtree denies other methods unless it inherits.
         assert_eq!(
             r.raw_match_for_test("/api/v1", &http::Method::POST).id(),
             Some(2)
         );
-        assert!(
-            r.raw_match_for_test("/api/v1", &http::Method::GET)
-                .is_default()
+        assert_eq!(
+            r.resolve("/api/v1", &http::Method::GET).unwrap_err(),
+            ResolveError::MethodNotConfigured
         );
     }
 
@@ -1230,14 +1287,10 @@ mod tests {
             vec![
                 // GET deliberately has the same rule id at the wildcard and literal
                 // terminals. It is the method-blind representative at both positions.
-                Registration {
-                    patterns: vec!["/x/{id}".to_owned(), "/x/a".to_owned()],
-                    rule: 0,
-                    opaque: false,
-                    method: http::Method::GET.into(),
-                },
-                Registration::route("/x/{id}", 1).for_methods(http::Method::POST),
-                Registration::route("/x/a", 2).for_methods(http::Method::POST),
+                PathRegistration::patterns(vec!["/x/{id}".to_owned(), "/x/a".to_owned()])
+                    .method(http::Method::GET, 0),
+                PathRegistration::path("/x/{id}").method(http::Method::POST, 1),
+                PathRegistration::path("/x/a").method(http::Method::POST, 2),
             ]
         };
 
@@ -1293,13 +1346,8 @@ mod tests {
             vec![
                 // The raw and twice-decoded forms are both rule 0, while the
                 // once-decoded form is rule 1: A -> B -> A.
-                Registration {
-                    patterns: vec!["/x/{id}".to_owned(), "/x/a".to_owned()],
-                    rule: 0,
-                    opaque: false,
-                    method: MethodMatch::Any,
-                },
-                Registration::route("/x/%61", 1),
+                PathRegistration::patterns(vec!["/x/{id}".to_owned(), "/x/a".to_owned()]).all(0),
+                PathRegistration::path("/x/%61").all(1),
             ]
         };
         let build = |layers| {
@@ -1344,12 +1392,12 @@ mod tests {
         .register_all(
             subtrees
                 .into_iter()
-                .map(|(path, rule)| Registration::subtree(path, rule)),
+                .map(|(path, rule)| PathRegistration::subtree(path).all(rule)),
         )
         .register_all(
             routes
                 .into_iter()
-                .map(|(path, rule)| Registration::route(path, rule)),
+                .map(|(path, rule)| PathRegistration::path(path).all(rule)),
         )
         .build()
         .expect("build");
@@ -1377,7 +1425,7 @@ mod tests {
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         );
         for (path, rule) in [("/admin", 0_u32), ("/public", 1)] {
-            b = b.subtree(path, rule);
+            b = b.register_subtree(path, |path| path.all(rule));
         }
         let r = b.build().expect("build");
         assert_eq!(
@@ -1394,10 +1442,10 @@ mod tests {
             u32::MAX,
             GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         )
-        .register(Registration::route("/x", 0).for_methods([http::Method::GET, http::Method::HEAD]))
+        .register(PathRegistration::path("/x").methods([http::Method::GET, http::Method::HEAD], 0))
         .register(
-            Registration::subtree("/api", 1)
-                .for_methods(vec![http::Method::PUT, http::Method::POST]),
+            PathRegistration::subtree("/api")
+                .methods(vec![http::Method::PUT, http::Method::POST], 1),
         )
         .build()
         .expect("build");
@@ -1406,7 +1454,10 @@ mod tests {
             r.raw_match_for_test("/x", &http::Method::HEAD).id(),
             Some(0)
         );
-        assert!(r.raw_match_for_test("/x", &http::Method::POST).is_default());
+        assert_eq!(
+            r.resolve("/x", &http::Method::POST).unwrap_err(),
+            ResolveError::MethodNotConfigured
+        );
         assert_eq!(
             r.raw_match_for_test("/api/v1", &http::Method::PUT).id(),
             Some(1)
@@ -1415,9 +1466,9 @@ mod tests {
             r.raw_match_for_test("/api/v1", &http::Method::POST).id(),
             Some(1)
         );
-        assert!(
-            r.raw_match_for_test("/api/v1", &http::Method::DELETE)
-                .is_default()
+        assert_eq!(
+            r.resolve("/api/v1", &http::Method::DELETE).unwrap_err(),
+            ResolveError::MethodNotConfigured
         );
     }
 }

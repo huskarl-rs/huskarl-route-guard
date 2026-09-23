@@ -13,23 +13,24 @@ crate does not interpret it.
 **Policy** — the authorization behavior the calling application enforces using
 the selected rule value. Returning a rule does not itself authorize the request.
 
-**Registration** — a group of patterns, a method selection, and one rule value.
-Each `route`, `subtree`, or `exclusive_subtree` call creates a registration.
+**Path registration** — patterns sharing concrete method overrides, an optional ALL
+rule, and an inheritance setting.
 
-**Rule identity / rule ID** — the identity assigned to a registration. All its
-patterns share that identity. Separate registrations have different identities
+**Rule identity / rule ID** — the identity assigned to a concrete rule definition.
+All its patterns share that identity. Inheritance retains the original definition
+and identity. Separate definitions have different identities
 even if their rule values are equal. “Same rule” in the guard's contract means
 the same identity.
 
 **Default rule** — the caller-provided fallback value and its distinct identity.
-It applies when no path matches or when the selected path has no rule for the
-request method and no all-method rule.
+It applies when matching exhausts the available paths, including through explicit
+inheritance. A missing method at a non-inheriting path denies instead.
 
 **Route table** — the registrations and the default rule.
 
 **Single-rule subtree / uniform coverage** — a region where every path selects
 the same rule identity for the request method. Other methods have their own coverage.
-Gaps that select the default count toward this check. A lone catch-all registration does not cover its bare prefix
+Default matches and method denials participate in this check. A lone catch-all registration does not cover its bare prefix
 or empty remainder.
 
 ## Path parsing
@@ -85,7 +86,7 @@ this check can reject requests that would keep their rule.
 path and compare rule identities for the request's method. Case-folding and
 percent-decoding use this approach.
 
-**Exclusive subtree** — an `exclusive_subtree` registration. It behaves like `subtree` during
+**Exclusive subtree** — a `register_exclusive_subtree` registration. It behaves like `register_subtree` during
 requests and additionally forbids more-specific paths beneath it at build time.
 It does not disable checks or remove method restrictions.
 

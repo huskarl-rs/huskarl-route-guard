@@ -11,7 +11,9 @@ use std::{
 };
 
 use http::Method;
-use huskarl_route_guard::{GuardConfig, Registration, RuleRouter, StructuralClasses};
+use huskarl_route_guard::{
+    GuardConfig, PathRegistration, ResolveError, RuleRouter, StructuralClasses,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Policy {
@@ -62,19 +64,19 @@ fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
         {
             continue;
         }
-        let registration = Registration::subtree(path, policy);
+        let registration = PathRegistration::subtree(path);
         builder = builder.register(if layout == Layout::Methods {
-            registration.for_methods(methods.clone())
+            registration.methods(methods.clone(), policy)
         } else {
-            registration
+            registration.all(policy)
         });
     }
     if layout == Layout::Methods && !settings.static_post {
         builder = builder
-            .register(Registration::subtree("/files", Policy::Files).for_methods(Method::POST));
+            .register(PathRegistration::subtree("/files").method(Method::POST, Policy::Files));
         if settings.private_post_fallback {
             builder = builder.register(
-                Registration::subtree("/files/private", Policy::Files).for_methods(Method::POST),
+                PathRegistration::subtree("/files/private").method(Method::POST, Policy::Files),
             );
         }
     }
@@ -261,7 +263,7 @@ fn downstream_baseline() {
             "/files/probe.txt",
             "/files/private/probe.txt",
         ] {
-            let policy = *guard.resolve(path, &method).unwrap().rule();
+            let resolution = guard.resolve(path, &method);
             let response = request(address, path, &method).unwrap();
             if method == Method::HEAD
                 || deployment.guard.static_post
@@ -269,8 +271,26 @@ fn downstream_baseline() {
                 || (deployment.guard.private_post_fallback && method == Method::POST)
             {
                 assert_eq!(response.status, 200, "{method} {path}");
-                assert_eq!(response_policy(&response), Some(policy), "{method} {path}");
+                match resolution {
+                    Ok(matched) => assert_eq!(
+                        response_policy(&response),
+                        Some(*matched.rule()),
+                        "{method} {path}"
+                    ),
+                    Err(error) => {
+                        // A native public fallback may serve a method the guard's
+                        // more-specific path intentionally blocks. This probe is
+                        // independent backend characterization, not forwarding.
+                        assert_eq!(error, ResolveError::MethodNotConfigured);
+                        assert_eq!(
+                            response_policy(&response),
+                            Some(Policy::Public),
+                            "{method} {path}"
+                        );
+                    }
+                }
             } else {
+                assert_eq!(resolution.unwrap_err(), ResolveError::MethodNotConfigured);
                 assert_eq!(response.status, 405, "{method} {path}: expected method gap");
             }
             if method == Method::HEAD {
@@ -312,15 +332,15 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         )
         .unwrap();
     }
-    let candidates = std::iter::once(("recommended", deployment.guard, None)).chain(
+    let candidates = std::iter::once(("recommended", deployment.guard, None, false)).chain(
         deployment
             .ablations
             .iter()
-            .map(|a| (a.name, a.guard, Some(a.witness))),
+            .map(|a| (a.name, a.guard, Some(a.witness), a.expect_method_denial)),
     );
     let mut failures = Vec::new();
-    for (candidate, settings, required_witness) in candidates {
-        let require_confusion = required_witness.is_some();
+    for (candidate, settings, required_witness, expect_method_denial) in candidates {
+        let require_confusion = required_witness.is_some() && !expect_method_denial;
         let mut witness_observed = false;
         let mut forwarded = 0;
         let mut served = 0;
@@ -341,7 +361,15 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             for method in methods {
                 let mut method_served = 0;
                 for path in corpus() {
-                    let Ok(matched) = guard.resolve(&path, &method) else {
+                    let resolution = guard.resolve(&path, &method);
+                    let Ok(matched) = resolution else {
+                        if expect_method_denial
+                            && layout == Layout::Methods
+                            && required_witness == Some((method.as_str(), path.as_str()))
+                        {
+                            assert_eq!(resolution.unwrap_err(), ResolveError::MethodNotConfigured);
+                            witness_observed = true;
+                        }
                         skipped += 1;
                         if let Some(report) = &mut report {
                             writeln!(
@@ -412,13 +440,13 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             served >= 10,
             "{candidate}: too few forwarded resource requests"
         );
-        if require_confusion && !witness_observed {
-            failures.push(format!("{candidate}: required accepted-request counterexample {required_witness:?} no longer reproduces"));
+        if required_witness.is_some() && !witness_observed {
+            failures.push(format!("{candidate}: required witness {required_witness:?} did not produce its expected outcome (method denial: {expect_method_denial})"));
         }
         if require_confusion && confusion == 0 {
             failures.push(format!("{candidate}: removal found no confusion; review and remove the unsupported recommendation for this profile"));
         } else if !require_confusion && confusion != 0 {
-            failures.push(format!("recommended configuration permits {confusion} route confusions; fix the profile or model and document required settings"));
+            failures.push(format!("configuration permits {confusion} route confusions; fix the profile or model and document required settings"));
         }
         println!(
             "{}/{}/{candidate}: forwarded={forwarded}, served={served}, not-forwarded={skipped}, route-confusions={confusion}",

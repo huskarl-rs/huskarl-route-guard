@@ -10,20 +10,20 @@ segment, and `/files/{*rest}` captures a non-empty remainder. Parameters must oc
 whole segments; in-segment parameters such as `/v{version}` are not supported.
 Trailing slashes are significant.
 
-Each registration associates one or more patterns and a method selection with a
-caller-provided rule value. Its patterns share one rule ID. Separate registrations
-have different IDs even if their values compare equal. The guard compares IDs,
+A path registration associates patterns with a method table and fallback setting.
+Each concrete rule definition has one ID shared across those patterns. Separate
+definitions have different IDs even if their values compare equal. The guard compares IDs,
 not rule values or application policies.
 
 | Registration | Paths covered |
 |---|---|
-| `route("/files", rule)` | `/files` only |
-| `subtree("/files", rule)` | `/files`, `/files/`, and paths below `/files/` |
-| `subtree("/files/", rule)` | `/files/` and paths below it; excludes `/files` |
-| `subtree("/", rule)` | All slash-prefixed request paths |
-| `exclusive_subtree("/files", rule)` | Same paths as `subtree`; nested paths are rejected at build time |
+| `PathRegistration::path("/files").all(rule)` | `/files` only |
+| `PathRegistration::subtree("/files").all(rule)` | `/files`, `/files/`, and paths below `/files/` |
+| `PathRegistration::subtree("/files/").all(rule)` | `/files/` and paths below it; excludes `/files` |
+| `PathRegistration::subtree("/").all(rule)` | All slash-prefixed request paths |
+| `PathRegistration::exclusive_subtree("/files").all(rule)` | Same paths as `subtree`; nested paths are rejected at build time |
 
-`Registration::for_methods` restricts a registration to selected HTTP methods.
+`PathRegistration::method` and `methods` define concrete method overrides.
 Add it with `builder.register(...)`. An exclusive subtree does not override
 method restrictions or disable any check.
 
@@ -36,17 +36,17 @@ For steps to correct a route table, see
 
 | Forbidden construction | Example | Reason |
 |---|---|---|
-| A pattern without a leading slash | `route("admin", rule)` | Patterns describe slash-prefixed paths. |
-| An empty interior segment | `route("/files//key", rule)` | The route grammar has no empty interior segments; a single trailing slash is supported. |
-| A parameter occupying part of a segment | `route("/v{version}", rule)` or `route("/files/{name}.json", rule)` | Parameters must occupy a whole segment. |
-| A non-final catch-all | `route("/files/{*rest}/metadata", rule)` or `route("/files/{*rest}/", rule)` | A catch-all consumes the entire remaining path. |
-| A malformed or unnamed parameter | `route("/users/{id", rule)`, `route("/users/{}", rule)`, or `route("/files/{*}", rule)` | Parameters need balanced braces and a non-empty name; `*` is reserved for the catch-all marker. |
+| A pattern without a leading slash | `PathRegistration::path("admin").all(rule)` | Patterns describe slash-prefixed paths. |
+| An empty interior segment | `PathRegistration::path("/files//key").all(rule)` | The route grammar has no empty interior segments; a single trailing slash is supported. |
+| A parameter occupying part of a segment | `PathRegistration::path("/v{version}").all(rule)` or `PathRegistration::path("/files/{name}.json").all(rule)` | Parameters must occupy a whole segment. |
+| A non-final catch-all | `PathRegistration::path("/files/{*rest}/metadata").all(rule)` or `PathRegistration::path("/files/{*rest}/").all(rule)` | A catch-all consumes the entire remaining path. |
+| A malformed or unnamed parameter | `PathRegistration::path("/users/{id").all(rule)`, `PathRegistration::path("/users/{}").all(rule)`, or `PathRegistration::path("/files/{*}").all(rule)` | Parameters need balanced braces and a non-empty name; `*` is reserved for the catch-all marker. |
 | Two registrations claiming the same path and method slot | Two all-method `/health` routes; or GET `/users/{id}` and GET `/users/{name}` | Parameter names do not distinguish routing positions. Each position has at most one all-method rule and one rule per specific method. Equal rule values do not remove the conflict. |
-| A method repeated within one registration | `.for_methods([http::Method::GET, http::Method::GET])` | The registration claims the same method slot twice. |
-| An empty method set | `.for_methods(Vec::<http::Method>::new())` | The registration would match no methods. |
-| An empty pattern set | `Registration::patterns(Vec::<String>::new(), rule)` | The registration would match no paths. |
-| Structural forms in a literal, while the guard is active | `route("/files/..", rule)`, `route("/admin%2Fusers", rule)`, or `route("/files;v=1", rule)` | Registered literals cannot depend on spellings the configured guard treats as path structure. Opt-in structural classes extend this restriction. |
-| Uppercase literals with active, case-insensitive parsing | `route("/Admin", rule)` with `CaseSensitivity::Insensitive` | The registered spelling must already agree with ASCII lowercasing. Parameter names are metadata and may contain uppercase letters. |
+| A method repeated within one registration | `.methods([http::Method::GET, http::Method::GET], rule)` | The registration claims the same method slot twice. |
+| An empty method set | `.methods(Vec::<http::Method>::new(), rule)` | The registration would match no methods. |
+| An empty pattern set | `PathRegistration::patterns(Vec::<String>::new()).all(rule)` | The registration would match no paths. |
+| Structural forms in a literal, while the guard is active | `PathRegistration::path("/files/..").all(rule)`, `PathRegistration::path("/admin%2Fusers").all(rule)`, or `PathRegistration::path("/files;v=1").all(rule)` | Registered literals cannot depend on spellings the configured guard treats as path structure. Opt-in structural classes extend this restriction. |
+| Uppercase literals with active, case-insensitive parsing | `PathRegistration::path("/Admin").all(rule)` with `CaseSensitivity::Insensitive` | The registered spelling must already agree with ASCII lowercasing. Parameter names are metadata and may contain uppercase letters. |
 
 The pattern grammar, slot-conflict checks, and exclusivity checks also apply in
 `GuardMode::Disabled`. The structural-literal and case checks apply only while the
@@ -73,12 +73,12 @@ branches, independently of registration order and method restrictions.
 For example, both registration orders are rejected:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, PathRegistration, RuleRouter};
 
 let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
 let registrations = [
-    Registration::exclusive_subtree("/{tenant}", "tenant-rule"),
-    Registration::route("/files/private", "private-rule"),
+    PathRegistration::exclusive_subtree("/{tenant}").all("tenant-rule"),
+    PathRegistration::path("/files/private").all("private-rule"),
 ];
 assert!(RuleRouter::from_registrations("default", config.clone(), registrations.clone()).is_err());
 assert!(RuleRouter::from_registrations("default", config, registrations.into_iter().rev()).is_err());
@@ -101,63 +101,72 @@ does not consume that tail. Ordinary terminal-slot conflict rules still apply.
 For the rationale behind these restrictions, see
 [How the guard decides](crate::_docs::explanation::decision).
 
-## Path precedence comes before method matching
+## Path precedence and explicit inheritance
 
-Method-qualified registrations do not change path precedence. The router first picks
-the matching path, preferring literal segments, then wildcards, then catch-alls.
-A path branch that cannot complete a match can fall back to a lower-priority branch.
-Once a path matches, the router looks up the request method at that position. If
-there is no matching method and no all-method rule, the default applies; routing does not backtrack to a
-less-specific path pattern.
+Match the original request path, preferring literal segments, then wildcards, then
+catch-alls. A branch that cannot finish matching falls back to the next branch.
+At each matching path:
+
+1. Use the concrete override for the request method, if present.
+2. Otherwise use the concrete `ALL` rule, if present.
+3. Otherwise continue to the next matching path only if `fallback_inherit(true)`.
+4. Otherwise deny with `MethodNotConfigured`.
+
+Every intermediate path controls continuation. Inheritance keeps the original path
+and method; it does not remove directory components or change GET to another method.
+A closer path's `ALL` wins over a farther path's explicit GET. Method overrides
+always supply concrete rules; inheritance is a path-level setting.
 
 ```rust
-use huskarl_route_guard::{
-    Registration, RuleRouter,
-    config::{CaseSensitivity, DecodeDepth, GuardConfig},
-};
-
+use huskarl_route_guard::{RuleRouter, GuardConfig, CaseSensitivity, DecodeDepth, ResolveError};
+use http::Method;
 let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .route("/items/{id}", "generic-item")
-    .register(Registration::route("/items/special", "get-special").for_methods(http::Method::GET))
-    .build()
-    .expect("valid route table");
-
-assert_eq!(
-    *router
-        .resolve("/items/special", &http::Method::GET)
-        .expect("ordinary path")
-        .rule(),
-    "get-special"
-);
-assert!(
-    router
-        .resolve("/items/special", &http::Method::POST)
-        .expect("ordinary path")
-        .is_default()
-);
+    .register_subtree("/files", |p| p.method(Method::GET, "read"))
+    .register_path("/files/special", |p| p.fallback_inherit(true).method(Method::POST, "write"))
+    .register_path("/files/blocked", |p| p.method(Method::POST, "write-only"))
+    .build().unwrap();
+let parent = router.resolve("/files/ordinary", &Method::GET).unwrap();
+assert_eq!(router.resolve("/files/special", &Method::GET).unwrap(), parent);
+assert_eq!(*router.resolve("/files/special", &Method::POST).unwrap().rule(), "write");
+assert_eq!(router.resolve("/files/blocked", &Method::GET).unwrap_err(), ResolveError::MethodNotConfigured);
+assert_eq!(router.resolve("/files/special", &Method::DELETE).unwrap_err(), ResolveError::MethodNotConfigured);
 ```
 
-## Default rule
+`register_path`, `register_subtree`, and `register_exclusive_subtree` configure a
+[`PathRegistration`](crate::PathRegistration). Use `.all(rule)`, `.method(method,
+rule)`, or `.methods(methods, rule)` for concrete definitions. Duplicate methods or
+ALL definitions are build errors. A method table may have no rules: it either
+blocks all methods or inherits them. Omitting the inheritance setting means false.
+A concrete ALL rule takes precedence even if inheritance is enabled.
 
-The default applies when no path pattern matches, or when the selected path has
-neither the requested method nor an all-method rule. The default has its own
-identity for ambiguity checks. A change between a registration and the default
-counts as a rule change in either direction.
+Declarations merged at the same path must agree on the inheritance setting.
+
+## Default rule and identity
+
+The default applies only when matching exhausts the available paths, including
+through explicit inheritance. A method gap at a non-inheriting path is a denial,
+not a default match. This also applies with `GuardMode::Disabled`.
+
+Each concrete rule definition receives one identity, shared across the registration's
+patterns. In a subtree method table, a GET rule has the same identity at the bare
+prefix, trailing slash, and catch-all. An inherited result is the original defining
+rule and identity; the child creates no copied rule. Separately defined equal values
+still have different identities.
 
 ## Methods and ambiguity checks
 
-All ambiguity checks compare rules for the request's actual method. Structural
-checks require every path in the analyzed region to select the same rule for that
-method. Methods without explicit registrations use the all-method rules and default.
+All checks use the request's method and the same inheritance semantics as matching.
+A structural region must contain one allowed identity. A reachable method denial
+prevents that region from being accepted as uniform with an allowed rule.
 
-| Route table | Request | Result in `RejectAmbiguous` |
+| Path tables | Request | Result in `RejectAmbiguous` |
 |---|---|---|
-| GET-only `/files` subtree | GET `/files/a%2fb` | Accepted with the GET rule: the region has uniform GET coverage. |
-| GET-only `/files` subtree | POST `/files/a%2fb` | Accepted with the default: the region uniformly selects default for POST. |
-| Separate GET and POST rules for the same `/files` subtree patterns | GET `/files/a%2fb` | Accepted with the GET rule; the POST rule does not change GET coverage. |
-| GET-only `/files` subtree plus GET `/files/private` | GET `/files/a%2fb` | Denied: another GET identity is reachable in the analyzed region. |
-| GET-only `/files` subtree plus POST `/files/private` | GET `/files/a%2fb` | Denied: the more-specific POST-only terminal selects default for GET. |
+| GET-only `/files` subtree | GET `/files/a%2fb` | Accepted with the GET rule. |
+| GET-only `/files` subtree | POST `/files/a%2fb` | `MethodNotConfigured`. |
+| GET and POST rules in the same `/files` subtree table | GET `/files/a%2fb` | Accepted with the GET rule. |
+| GET-only `/files`, POST-only `/files/private` with inheritance enabled | GET `/files/a%2fb` | Accepted; the child inherits the same GET identity. |
+| GET-only `/files`, POST-only `/files/private` with inheritance disabled | GET `/files/a%2fb` | Denied; the region contains a stopped GET lookup. |
 
-Acceptance still requires enforcement of the returned rule, including the default.
-Exclusive subtrees use the same request-time checks, but reject the nested path
-configurations in the last two rows at build time.
+Acceptance still requires enforcement of the returned policy. Exclusivity remains
+a path-level build restriction: nested overriding paths are rejected even when
+those paths inherit for some methods.

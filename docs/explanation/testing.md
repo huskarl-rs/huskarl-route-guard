@@ -37,11 +37,14 @@ The owned route matcher is tested independently against `matchit`. The end-to-en
 property tests then compare raw and transformed paths using that matcher. Additional
 properties check that stricter configurations only add denials and clean paths
 continue to flow. Generated route tables include overlapping literal and wildcard
-subtrees, with all-method rules and generated method restrictions. The relocation
+subtrees, with all-method rules, generated method restrictions, and inheritance
+settings. An additional property compares compiled method views against a search
+that matches each pattern independently with `matchit`, then follows explicit
+method/ALL/inheritance precedence. Uniform coverage is checked against its results. The relocation
 property holds the request method fixed while transforming the path, including a
 custom method absent from the registrations. Regression tests cover uniform
-method-specific subtrees, same-path method overrides, and default-rule gaps created
-by more-specific paths. A regression test checks that adding a literal subtree can turn a denial
+method-specific subtrees, same-path method overrides, inherited rule identity, and
+method-denial gaps created by non-inheriting paths. A regression test checks that adding a literal subtree can turn a denial
 into acceptance by shadowing a wildcard branch, while preserving agreement between
 the raw and decoded paths. Exclusive-subtree tests cover overriding paths, unrelated
 routes, and lower-priority fallbacks in both registration orders.
@@ -81,10 +84,11 @@ for Apache), which the harness independently maps to authorization policies.
 A forwarded request reaching a different policy invalidates the recommendation.
 Denied requests are recorded as not forwarded and provide no downstream evidence.
 
-Additional runs remove individual recommended settings. They must produce actual
-accepted-request confusion to justify retaining the setting. Case folding for
-default/insensitive Express, backslash handling for `SvelteKit`, and method
-registration choices each have such counterexamples. The NGINX–Apache profile
+Additional runs remove individual parsing settings and must produce actual
+accepted-request confusion. Case folding for default/insensitive Express and
+backslash handling for `SvelteKit` have such counterexamples. Method-registration
+removals instead must produce `MethodNotConfigured` for a named request and no
+accepted-request confusion: missing methods now fail closed. The NGINX–Apache profile
 requires `UpToTwo`; removing its second decode declaration also reproduces confusion.
 The corpus combines content escapes, separator transformations, and case variants. GET and HEAD run across all
 layouts; POST exercises a layout with method-specific registrations and gaps.
@@ -105,7 +109,8 @@ format are documented in `tests/downstream/README.md` in the repository.
 `mise run bench` runs the Criterion suite in `benches/route_guard.rs`. It measures the
 public `RuleRouter` API across clean-path guard overhead, representative allowed and
 denied suspicious paths, path-length and route-count scaling, and route-table build
-cost. Router construction stays outside request-resolution timings; generated
+cost. Method-view build cases vary both path count and distinct method count;
+an inherited lookup benchmark follows two fallbacks. Router construction stays outside request-resolution timings; generated
 registration inputs stay outside build timings.
 
 For a quick fixture check, run:

@@ -61,11 +61,11 @@ fn cve_2021_41773_mixed_literal_and_encoded_dots() {
     // https://blog.qualys.com/vulnerabilities-threat-research/2021/10/27/apache-http-server-path-traversal-remote-code-execution-cve-2021-41773-cve-2021-42013
     for exclusive in [false, true] {
         let builder = RuleRouter::builder("public", config(DecodeDepth::UpToOne))
-            .route("/secret", "protected");
+            .register_path("/secret", |path| path.all("protected"));
         let router = if exclusive {
-            builder.exclusive_subtree("/cgi-bin", "cgi")
+            builder.register_exclusive_subtree("/cgi-bin", |path| path.all("cgi"))
         } else {
-            builder.subtree("/cgi-bin", "cgi")
+            builder.register_subtree("/cgi-bin", |path| path.all("cgi"))
         }
         .build()
         .unwrap();
@@ -85,12 +85,12 @@ fn cve_2021_42013_encoded_hex_digits_reveal_traversal_on_second_pass() {
     // UpToTwo is required: the first pass only manufactures encoded dots.
     for exclusive in [false, true] {
         for depth in [DecodeDepth::UpToOne, DecodeDepth::UpToTwo] {
-            let builder =
-                RuleRouter::builder("public", config(depth)).route("/secret", "protected");
+            let builder = RuleRouter::builder("public", config(depth))
+                .register_path("/secret", |path| path.all("protected"));
             let router = if exclusive {
-                builder.exclusive_subtree("/cgi-bin", "cgi")
+                builder.register_exclusive_subtree("/cgi-bin", |path| path.all("cgi"))
             } else {
-                builder.subtree("/cgi-bin", "cgi")
+                builder.register_subtree("/cgi-bin", |path| path.all("cgi"))
             }
             .build()
             .unwrap();
@@ -120,8 +120,8 @@ fn cve_2020_1957_parameter_stripping_exposes_parent_segment() {
     // https://shiro.apache.org/security-reports.html#CVE-2020-1957
     // https://yuanxzhang.github.io/paper/uabscan-ccs25-long.pdf
     let router = RuleRouter::builder("public", config(DecodeDepth::UpToOne))
-        .exclusive_subtree("/public", "public-files")
-        .route("/admin", "protected")
+        .register_exclusive_subtree("/public", |path| path.all("public-files"))
+        .register_path("/admin", |path| path.all("protected"))
         .build()
         .unwrap();
     for raw in ["/public/..;x/admin", "/public/..%3bx/admin"] {
@@ -136,7 +136,7 @@ fn cve_2020_1957_parameter_stripping_exposes_parent_segment() {
 fn cve_2021_31920_separator_witnesses_reach_the_protected_route() {
     // https://istio.io/latest/news/security/istio-security-2021-005/
     let router = RuleRouter::builder("public", config(DecodeDepth::UpToOne))
-        .route("/admin", "protected")
+        .register_path("/admin", |path| path.all("protected"))
         .build()
         .unwrap();
     for raw in ["//admin", "/%2fadmin", "/%2Fadmin"] {
@@ -153,7 +153,7 @@ fn cve_2020_17523_inspired_segment_trimming_is_outside_the_model() {
     // A reduced whitespace-tokenization example, not Shiro's Ant matcher.
     // Our exact /admin registration deliberately excludes /admin/<space>.
     let router = RuleRouter::builder("public", config(DecodeDepth::UpToOne))
-        .route("/admin", "protected")
+        .register_path("/admin", |path| path.all("protected"))
         .build()
         .unwrap();
     let raw = "/admin/%20";

@@ -4,7 +4,8 @@
 
 For every request accepted by the active guard, every interpretation in the
 configured downstream parsing model selects the **same rule identity** as the raw
-path for the request method, using this route table.
+path for the request method, using this route table. A transformed path that stops
+at a method denial is not agreement with an allowed rule.
 
 The default rule has a distinct identity. A change from the default to a
 registration, from a registration to the default, or between registrations is a
@@ -20,8 +21,9 @@ rule's policy. The crate does not forward requests.
   inputs that do not start with `/` (except `*`) or contain `?` or `#`.
 - **Forwarding:** the caller forwards accepted requests with their paths unchanged.
   The guard does not rewrite them.
-- **Identity:** patterns in one registration share an identity. Separate
-  registrations remain distinct even if their rule values are equal.
+- **Identity:** each concrete rule definition has one identity across its patterns.
+  Inheritance returns that original identity; separate definitions remain distinct
+  even if their values are equal.
 - **Parsing model:** the *declared interpretation set* consists of the built-in
   parsing behaviors, enabled options, and their supported combinations. See
   [Supported path interpretations](crate::_docs::reference::coverage) for the exact
@@ -30,8 +32,8 @@ rule's policy. The crate does not forward requests.
   by that model and this authorization route table. The library does not inspect
   or certify a deployment.
 - **Mode:** `Disabled` disables ambiguity checks. `resolve` still validates input and
-  rejects invalid internal rule IDs. Custom probes can add denials but cannot
-  establish agreement for behaviors outside the model.
+  rejects invalid internal rule IDs and unresolved methods at non-inheriting paths.
+  Custom probes can add denials but cannot establish agreement for behaviors outside the model.
 
 See [Routing behavior](crate::_docs::reference::routing) for pattern precedence,
 method fall-through, and registration identity.
@@ -76,13 +78,13 @@ configured model.
 2. **Route-table changes preserve rule agreement, not previous decisions.** Adding
    registrations can change both the selected rule and whether a path is accepted.
    Every accepted path must still satisfy rule agreement under the configured
-   parsing model. A new registration has its own identity, even if its rule value
-   equals an existing value.
+   parsing model. A new concrete definition has its own identity, even if its rule
+   value equals an existing value. Inheritance introduces no new identity.
 3. **Canonical request paths pass built-in ambiguity checks.** Here, canonical means
    a slash-prefixed path with no recognized structural form, no percent escape,
    and no uppercase ASCII when case folding is configured. Custom probes may
    reject such paths. Input validation and internal invariant failures are
-   separate from the ambiguity checks.
+   separate from the ambiguity checks, as are method denials at non-inheriting paths.
 4. **Failure does not return a rule.** `resolve` returns `Err(ResolveError)` on a
    denial, including an invalid internal rule ID. That internal failure must not
    be treated as successful default matching.

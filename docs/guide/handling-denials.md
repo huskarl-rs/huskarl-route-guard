@@ -25,6 +25,7 @@ triaging structural classes.
 
 | `ResolveError` | What it means | What to do |
 |---|---|---|
+| `MethodNotConfigured` | Lookup stopped at a path without a method rule, ALL rule, or inheritance | Deny the request (normally `403`); configure the missing method, ALL, or inheritance only if the policy intends it. |
 | `InvalidRuleId` | An internal invariant failed: the matched ID is absent from the rule table | Deny authorization, report a server error (`500`), and investigate the library failure. Never substitute the default rule. |
 | `InvalidPathInput` | The supplied value was not a request path alone | Pass `uri.path()`; do not strip or reinterpret the input inside the authorization layer. |
 | `Structural(NulTruncation)` | A raw or `%00` NUL — no legitimate path carries one | Treat as hostile or corrupt. No remedy by design. |
@@ -50,7 +51,8 @@ than switching a check off.
 identity, with no policy reference. For more detail, call
 [`explain`](crate::RuleRouter::explain). Its `denial` field uses the same check order
 as `resolve`. A scoped structural denial also includes the stable anchor, the
-registration IDs contributing to its coverage, and whether the default contributes.
+rule IDs contributing to its coverage, whether the default contributes, and whether
+the region contains method denials.
 These are conservative coverage results, not proof of particular backend rewrites.
 
 ```rust
@@ -58,8 +60,8 @@ use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter}
 
 let router = RuleRouter::builder("default",
     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .subtree("/files", "files")
-    .route("/files/private", "private")
+    .register_subtree("/files", |path| path.all("files"))
+    .register_path("/files/private", |path| path.all("private"))
     .build().expect("valid routes");
 let explanation = router.explain("/files/a%2fb", &http::Method::GET).unwrap();
 assert!(explanation.denial.is_some());
@@ -84,7 +86,7 @@ through these checks before changing the parsing configuration:
 `route("/files/{id}", …)` or a hand-written lone catch-all covers only its own
 shape; everything else under `/files/` falls to the default rule, which is a
 reachable *other* rule, so encoded keys deny.
-[`subtree("/files", …)`](crate::RuleRouterBuilder::subtree) registers the bare
+[`register_subtree("/files", …)`](crate::RuleRouterBuilder::register_subtree) registers the bare
 path, the trailing slash, and the catch-all under **one rule id** — gap-free, so
 all those paths select the same rule and keys like `/files/a%2fb` can be accepted.
 This assumes no nested registration changes the rule for the request method.
@@ -104,18 +106,19 @@ sibling prefix (`/files-admin`, `/admin/files`). If the nesting is necessary, ke
 it and accept the extra denials.
 
 **Check method-specific rules too.** A
-registration restricted with [`for_methods(POST)`](crate::Registration::for_methods) inside a subtree
-resolves *other* methods to the default rule unless that path also has an
-all-method rule. Different identities in either case prevent the structural check
+registration restricted with [`method(POST, rule)`](crate::PathRegistration::method) inside a subtree
+denies *other* methods unless that path also has an ALL rule or explicitly
+inherits an applicable broader rule. Different identities in either case prevent the structural check
 from accepting the area as one rule. Consider moving the method-specific endpoint
 outside the file-key prefix.
+An inheriting child keeps the original broader rule identity.
 A lone GET-only subtree can accept GET encoded keys: unlisted methods do not
 participate in GET coverage. Adding a POST rule at the same subtree patterns also
 leaves GET coverage unchanged; adding a new, more-specific POST-only terminal does
 not.
 
 **Declare exclusivity to prevent nested paths.**
-[`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) behaves like `subtree` at
+[`register_exclusive_subtree`](crate::RuleRouterBuilder::register_exclusive_subtree) behaves like `register_subtree` at
 runtime but rejects configurations with nested paths at build time. Use it to
 prevent a later nested registration from making encoded keys start failing.
 It does not remove method restrictions.
@@ -137,8 +140,8 @@ change that rejects previously accepted keys fails in CI:
 use huskarl_route_guard::{RuleRouter, config::{CaseSensitivity, DecodeDepth, GuardConfig}};
 
 let router = RuleRouter::builder("default", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .exclusive_subtree("/files", "files-rule")
-    .route("/health", "health-rule")
+    .register_exclusive_subtree("/files", |path| path.all("files-rule"))
+    .register_path("/health", |path| path.all("health-rule"))
     .build()
     .expect("valid table");
 

@@ -39,8 +39,8 @@
 //!     "public",
 //!     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
 //! )
-//! .subtree("/admin", "admin")
-//! .route("/health", "health")
+//! .register_subtree("/admin", |path| path.all("admin"))
+//! .register_path("/health", |path| path.all("health"))
 //! .build()
 //! .expect("valid route table");
 //!
@@ -60,9 +60,11 @@
 //! assert!(router.resolve("/admin/a%2fb", &http::Method::GET).is_ok());
 //! ```
 //!
-//! The string values above are application data, not built-in policies. Each
-//! registration has a distinct identity even when its value equals another's.
-//! The guard compares those identities.
+//! `.all(rule)` supplies a concrete rule for every method without a specific override.
+//!
+//! The string values above are application data, not built-in policies. Each concrete
+//! rule definition has a distinct identity even when its value equals another's.
+//! Inheritance returns the original defining rule and identity.
 //!
 //! # Integration essentials
 //!
@@ -70,11 +72,12 @@
 //!   fragment. `resolve` validates this boundary.
 //! - Use `resolve` for request handling. On `Ok`, enforce the returned rule's policy;
 //!   on `Err`, deny the request. Forward allowed requests with the path unchanged.
-//! - Path matching happens before method lookup. A more-specific path with no rule
-//!   for the request method uses an all-method rule at that path or the default;
-//!   it does not fall back to a less-specific path.
+//! - At each matching path, use the method override, then its ALL rule. Otherwise
+//!   continue only with explicit `fallback_inherit(true)`; a stopped lookup denies.
+//!   Matching exhaustion uses the default. `register_path` and `register_subtree`
+//!   group method definitions and inheritance in one path table.
 //! - The default mode, `RejectAmbiguous`, accepts some structural forms when they
-//!   cannot cross a rule boundary. `exclusive_subtree` adds a build-time restriction on
+//!   cannot cross a rule boundary. `register_exclusive_subtree` adds a build-time restriction on
 //!   nested paths; it does not disable checks.
 //!
 //! # Documentation
@@ -111,12 +114,13 @@ pub use config::{
 pub use diagnostics::{
     MethodGapDiagnostic, RawMatch, ResolutionExplanation, StructuralExplanation,
 };
-pub use path_router::{Registration, RuleMatch, RuleRouter, RuleRouterBuilder, RuleRouterError};
-pub use route_tree::MethodMatch;
+pub use path_router::{
+    PathRegistration, RuleMatch, RuleRouter, RuleRouterBuilder, RuleRouterError,
+};
 
 /// Expands a path into the `matchit` patterns that cover that path
 /// and everything beneath it — the expansion behind
-/// [`RuleRouterBuilder::subtree`] and `subtree`-style builder methods downstream.
+/// [`RuleRouterBuilder::register_subtree`] and subtree builder methods downstream.
 ///
 /// - `/blah`  → `/blah`, `/blah/`, `/blah/{*rest}`
 /// - `/blah/` → `/blah/`, `/blah/{*rest}` (the bare `/blah` is *not* included)

@@ -85,15 +85,16 @@ without a response body. Canonical probes assert successful handlers and expecte
 405 responses; a 405 is not counted as policy agreement.
 
 - Include HEAD wherever the backend serves a protected GET route for HEAD.
-  All tested fixtures do so. Removing HEAD from the guard's method declarations
-  exposes requests authorized under the public default that reach protected routes.
+  All tested fixtures do so. Removing HEAD from a non-inheriting method table now
+  denies those requests with `MethodNotConfigured`, rather than authorizing public access.
 - This Apache static-file configuration also serves POST. Protect those resources
   for POST as well, or enforce a separately tested method restriction. This applies
   to the Apache origin in the NGINX chain too.
 - The framework fixtures register POST for `/files`, but only GET for its private
   child. Express falls through to the parent's POST handler. Mirror that with an
-  explicit POST registration at `/files/private` using the files policy: this
-  guard's method gap falls to the default, not the parent. Axum and `SvelteKit`
+  explicit POST registration at `/files/private` using the files policy, or enable
+  inheritance there to retain the parent POST rule and identity. Without either,
+  the guard denies the method gap. Axum and `SvelteKit`
   return 405 for POST at the private child in these fixtures, so they need no
   corresponding fallback registration.
 
@@ -101,17 +102,16 @@ For example, the tested Express method layout includes:
 
 ```rust
 use http::Method;
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
 
 let router = RuleRouter::builder(
     "public",
     GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
 )
-.register(Registration::subtree("/files", "files")
-    .for_methods([Method::GET, Method::HEAD, Method::POST]))
-.register(Registration::subtree("/files/private", "private")
-    .for_methods([Method::GET, Method::HEAD]))
-.register(Registration::subtree("/files/private", "files").for_methods(Method::POST))
+.register_subtree("/files", |path|
+    path.methods([Method::GET, Method::HEAD, Method::POST], "files"))
+.register_subtree("/files/private", |path|
+    path.methods([Method::GET, Method::HEAD], "private").method(Method::POST, "files"))
 .build().unwrap();
 assert_eq!(*router.resolve("/files/private/probe.txt", &Method::POST).unwrap().rule(), "files");
 ```
@@ -129,19 +129,21 @@ Only requests accepted by the candidate guard are sent downstream. A denied requ
 supplies no downstream safety evidence; redirects and backend rejections supply no evidence
 of policy agreement either.
 
-Separate runs remove each additional recommendation and require an accepted request
-to reach a different policy:
+Separate runs remove parsing settings and require accepted-request confusion.
+Removing a method declaration instead must deny its named request safely: these
+method entries are needed for availability, not to prevent default-rule fallthrough.
 
 | Recommendation removed | Observed counterexample | Result |
 |---|---|---|
 | Case folding for default or explicitly insensitive Express | `/ADMIN/PROBE.TXT` | Guard authorizes public; backend reaches admin |
 | Backslash handling for `SvelteKit` adapter-node | `/admin\probe.txt` | Guard authorizes public; backend reaches admin |
 | Second decode for the specified NGINX–Apache chain | `/%2561dmin/probe.txt` | Guard authorizes public; origin serves admin |
-| HEAD declarations | `HEAD /admin/probe.txt` | Guard authorizes public; backend reaches admin |
-| Apache POST declarations | `POST /admin/probe.txt` | Guard authorizes public; Apache serves admin file |
-| Express child POST fallback registration | `POST /files/private/probe.txt` | Guard authorizes public; backend reaches files handler |
+| HEAD declarations | `HEAD /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
+| Apache POST declarations | `POST /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
+| Express child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
 
-These counterexamples justify retaining the corresponding settings. No additional
+The confusion witnesses justify the parsing settings; the method-denial witnesses
+pin safe failure when an availability requirement is omitted. No additional
 backslash, fullwidth, overlong, or second-decode setting is recommended for the
 other direct profiles. `UpToOne` is the minimum available decode setting; built-in
 structural classes cannot be removed individually. These tests make no claim about
@@ -192,15 +194,15 @@ extra decoding. It must not be generalized to every NGINX `proxy_pass` configura
 
 The real chain converts `/%2561dmin/probe.txt` to `/%61dmin/probe.txt` before Apache
 serves `/admin/probe.txt`. With `UpToOne`, the guard accepts this as public but the
-origin serves admin. The expanded removal run found 321 policy mismatches;
-the recommended `UpToTwo` profile found none. Proxy access logs record the incoming
+origin serves admin. The removal run must reproduce this confusion;
+the recommended `UpToTwo` profile must permit none. Proxy access logs record the incoming
 and normalized paths, and separate origin logs are retained.
 
 For this exact chain, use `Sensitive`, `UpToTwo`, default structural classes, and
 `RejectAmbiguous`. Include HEAD and POST in the static-resource registrations as
 above. The suite separately removes the second decode declaration, HEAD declaration,
-and static-file POST declarations, requiring a named outgoing-request counterexample
-for each.
+and static-file POST declarations. The decode removal requires an outgoing-request
+counterexample; the method removals require explicit method denial.
 
 ## Running the tests
 

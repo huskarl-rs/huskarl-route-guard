@@ -11,8 +11,9 @@ useful when a downstream component may parse the path differently.
 ## 1. Build a route table
 
 For this example, assume the downstream service distinguishes ASCII case and
-percent-decodes paths at most once. Use `subtree` to cover `/admin` and everything
-beneath it, and `route` to cover just `/health`. The strings are rule values for
+percent-decodes paths at most once. Use `register_subtree` to cover `/admin` and everything
+beneath it, and `register_path` to cover just `/health`. Each `.all(...)` defines
+the rule for methods without a specific override. The strings are rule values for
 your application to act on; the crate does not enforce their policies.
 
 ```rust
@@ -22,8 +23,8 @@ use huskarl_route_guard::{
 };
 
 let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .subtree("/admin", "admin")
-    .route("/health", "health")
+    .register_subtree("/admin", |path| path.all("admin"))
+    .register_path("/health", |path| path.all("health"))
     .build()
     .expect("valid route table");
 
@@ -46,8 +47,8 @@ those interpretations select different rules, `resolve` denies the request:
 ```rust
 # use huskarl_route_guard::{RuleRouter, config::{CaseSensitivity, DecodeDepth, GuardConfig}};
 # let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-#     .subtree("/admin", "admin")
-#     .route("/health", "health")
+#     .register_subtree("/admin", |path| path.all("admin"))
+#     .register_path("/health", |path| path.all("health"))
 #     .build().unwrap();
 let denial = router
     .resolve("/admin%2fusers", &http::Method::GET)
@@ -62,7 +63,8 @@ client if you want a deliberately less revealing response.
 ## 3. Allow encoded slashes inside file keys
 
 Suppose `/files` forwards object keys unchanged and the entire prefix has one policy.
-Rebuild the router with `exclusive_subtree`. It covers the prefix like `subtree` and
+Rebuild the router with `register_exclusive_subtree`. It covers the prefix like
+`register_subtree` and
 also rejects configurations that put more-specific paths beneath it:
 
 ```rust
@@ -72,8 +74,8 @@ use huskarl_route_guard::{
 };
 
 let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
-    .subtree("/admin", "admin")
-    .exclusive_subtree("/files", "files")
+    .register_subtree("/admin", |path| path.all("admin"))
+    .register_exclusive_subtree("/files", |path| path.all("files"))
     .build()
     .expect("valid route table");
 

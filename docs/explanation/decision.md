@@ -91,8 +91,8 @@ The region includes:
 
 - literal and wildcard branches that path matching could reach;
 - ancestor catch-alls used when a more-specific branch cannot finish matching;
-- gaps that select the default, including missing trailing-slash coverage and
-  more-specific terminals without a rule for the request method.
+- unmatched gaps that select the default, including missing trailing-slash coverage;
+- method denials at paths with no applicable rule and inheritance disabled.
 
 This is called **uniform coverage**: every path selects the same rule for the
 request method. The modeled transformations change paths, not HTTP methods.
@@ -111,11 +111,15 @@ By contrast, a complete `subtree("/files", rule)` covers
 A GET-only subtree can therefore accept that request for GET. An `exclusive_subtree` has the
 same request-time behavior; its extra protection is a build-time error if someone
 adds more-specific paths beneath it. A more-specific terminal with no rule for
-GET would create a default-rule gap and prevent uniform GET coverage.
+GET would create a method denial and prevent uniform GET coverage unless it
+explicitly inherits. Inheritance retains the broader GET rule identity.
 
-At build time the tree stores coverage summaries for each explicitly registered
-method and one shared category for all other methods. Request handling selects the
-appropriate summaries; it does not recompute coverage over the whole tree.
+At build time the router compiles a view for each explicitly registered method
+and a shared view for all other methods. Inheriting gaps are removed from each
+view; blocking gaps become denial terminals. Matching and cached coverage use the
+same view, preserving fallback semantics without copying rule values. This trades
+additional tree storage for a simple request-time lookup; storage scales with the
+number of nodes times the number of distinct registered methods.
 
 ## Why exclusivity is checked across overlapping patterns
 
@@ -133,13 +137,12 @@ compare overlapping patterns using the same precedence as request matching.
 
 Disjoint method sets do not repair that overlap: the path terminal is selected
 before method lookup. A GET-only exclusive subtree and a POST-only nested exact
-route still change where a GET request resolves; it can fall through to the default
-at the exact route. Conversely, a broader fallback that never takes precedence
+route can stop GET lookup with a method denial at the exact route. Conversely, a broader fallback that never takes precedence
 inside the exclusive tail does not introduce a nested exception and remains valid.
 
 This build-time restriction does not itself prove uniform rule coverage. Rules for
 different methods at the same path patterns are still allowed. Gaps for the request
-method can still introduce the default identity into an analyzed region. The runtime guard therefore applies the same
+method can still introduce a denial into an analyzed region. The runtime guard therefore applies the same
 checks to ordinary and exclusive subtrees. The
 [routing reference](crate::_docs::reference::routing) lists forbidden combinations
 and the permitted boundaries of exclusivity.
@@ -177,7 +180,7 @@ rejects every enabled structural form and every complete percent escape, plus
 uppercase ASCII when case folding is configured. It does not use the route table
 to grant exceptions. A blob registration therefore provides no tolerance in this
 mode. `Disabled` disables these checks; public `resolve` still validates its path input
-and checks the returned rule ID.
+and checks the returned rule ID and method availability.
 
 ## Why route-table changes matter
 

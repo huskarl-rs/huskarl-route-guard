@@ -5,7 +5,7 @@ use std::{cell::LazyCell, sync::Arc};
 use crate::{
     config::{GuardConfig, GuardMode, ResolveError, StructuralProbe},
     percent::{Interpretation, interpretations},
-    route_tree::{Cover, DEFAULT_RULE, Router, RuleId},
+    route_tree::{Cover, DEFAULT_RULE, DENIED_RULE, Router, RuleId},
     structural::{
         ClassSet, Encodings, ScanResult, classes_present, enabled_classes, enabled_encodings,
         primary_class, scan, scan_interpretation,
@@ -70,15 +70,23 @@ impl PathConfusionGuard {
         if includes_default {
             registrations.pop();
         }
+        let includes_method_denial = registrations.contains(&DENIED_RULE);
+        registrations.retain(|id| *id != DENIED_RULE);
         Some(crate::StructuralExplanation {
             anchor: anchor.to_owned(),
             registrations,
             includes_default,
+            includes_method_denial,
         })
     }
 
-    pub(crate) fn method_gap(&self, path: &str, method: &http::Method) -> Option<RuleId> {
-        self.router.method_gap(path, method)
+    pub(crate) fn method_gap(
+        &self,
+        path: &str,
+        method: &http::Method,
+        pattern: &crate::route_tree::Pattern,
+    ) -> Option<RuleId> {
+        self.router.method_gap(path, method, pattern)
     }
 
     /// Build a guard over `router` for the given mode and structural configuration.
@@ -126,6 +134,7 @@ impl PathConfusionGuard {
         };
         match denial {
             Some(reason) => Err(reason),
+            None if *raw == Some(DENIED_RULE) => Err(ResolveError::MethodNotConfigured),
             None => Ok(*raw),
         }
     }
@@ -625,9 +634,9 @@ mod tests {
         assert!(!uniform.ambiguous("//"), "one-rule table cannot relocate");
     }
 
-    /// A method-qualified route inside an otherwise-uniform subtree resolves other
-    /// methods to the default rule at that path. Its new identity for POST and its
-    /// default-rule gap for GET both keep the surrounding region mixed.
+    /// A non-inheriting method-qualified route denies other methods at that path.
+    /// Its new identity for POST and its denial for GET both keep the surrounding
+    /// region mixed.
     #[test]
     fn method_only_route_keeps_subtree_denying() {
         let entries = vec![

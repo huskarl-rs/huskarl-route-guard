@@ -36,7 +36,7 @@ use std::sync::Arc;
 ///
 /// ```
 /// use huskarl_route_guard::{
-///     Registration, RuleRouter,
+///     PathRegistration, RuleRouter,
 ///     config::{CaseSensitivity, DecodeDepth, GuardConfig},
 /// };
 ///
@@ -44,7 +44,7 @@ use std::sync::Arc;
 /// let router = RuleRouter::from_registrations(
 ///     "public",
 ///     config,
-///     [Registration::subtree("/admin", "protected")],
+///     [PathRegistration::subtree("/admin").all("protected")],
 /// )
 /// .expect("valid routes");
 /// assert!(
@@ -118,7 +118,8 @@ pub enum GuardMode {
     /// still limited to the configured [`StructuralClasses`] and parsing model.
     RequireCanonical,
     /// Disable ambiguity checks and custom probes. [`resolve`](crate::RuleRouter::resolve)
-    /// still validates the path input and checks internal rule IDs.
+    /// still validates the path input, checks internal rule IDs, and denies
+    /// unresolved methods at non-inheriting paths.
     Disabled,
 }
 
@@ -183,8 +184,8 @@ impl CaseSensitivity {
 /// can only deny more. Additional denials can affect nested escapes, including
 /// escapes assembled from encoded hex digits. More than two decode passes are outside
 /// the model. Inside a subtree with uniform coverage for the request method
-/// ([`subtree`](crate::RuleRouterBuilder::subtree) /
-/// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)), double-encoded
+/// ([`register_subtree`](crate::RuleRouterBuilder::register_subtree) /
+/// [`register_exclusive_subtree`](crate::RuleRouterBuilder::register_exclusive_subtree)), double-encoded
 /// *separators* in keys can stay tolerated even under `UpToTwo` in
 /// [`RejectAmbiguous`](GuardMode::RejectAmbiguous). Exclusivity alone does not
 /// establish uniform coverage, and other checks can still deny the request.
@@ -225,8 +226,8 @@ pub enum StructuralClass {
     /// An encoded or alternate `/` separator (`%2F`, `//`, and enabled forms).
     /// Denied unless every rule reachable past its anchor is the matched rule —
     /// tolerated under a fully-registered single-rule subtree
-    /// ([`subtree`](crate::RuleRouterBuilder::subtree) /
-    /// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)).
+    /// ([`register_subtree`](crate::RuleRouterBuilder::register_subtree) /
+    /// [`register_exclusive_subtree`](crate::RuleRouterBuilder::register_exclusive_subtree)).
     Separator,
     /// A `;`/`%3B` matrix path-parameter. Scoped like
     /// [`Separator`](Self::Separator).
@@ -264,7 +265,7 @@ impl std::fmt::Display for StructuralClass {
 ///
 /// The attribution is what makes a `400` actionable instead of a dead end: each
 /// variant names the check, and its documentation names the sanctioned remedy (a
-/// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) registration for opaque
+/// [`register_exclusive_subtree`](crate::RuleRouterBuilder::register_exclusive_subtree) registration for opaque
 /// keys, a configuration declaration to review, …). Use [`Display`](std::fmt::Display)
 /// for an attributed log line; use [`message`](Self::message) for the short static
 /// string suitable for the denial response body (it deliberately does not vary with
@@ -272,6 +273,9 @@ impl std::fmt::Display for StructuralClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResolveError {
+    /// Path lookup stopped without a rule for the request method, an ALL rule,
+    /// or permission to inherit. Deny even when ambiguity checks are disabled.
+    MethodNotConfigured,
     /// The route tree returned an ID absent from the rule table. This indicates an
     /// internal invariant violation, not invalid client input. Deny the request and
     /// report an internal server error; never authorize it using the default rule.
@@ -284,7 +288,7 @@ pub enum ResolveError {
     /// relocate the request — some rule other than the matched one is reachable
     /// within the byte's anchored scope. Remedies: if the prefix legitimately
     /// carries opaque keys, register it as a whole single-rule subtree
-    /// (`subtree`/`exclusive_subtree`) so its uniformity is visible; a NUL has no remedy
+    /// (`register_subtree`/`register_exclusive_subtree`) so its uniformity is visible; a NUL has no remedy
     /// by design. The full triage procedure is
     /// [Handling a denial](crate::_docs::guide::handling_denials).
     Structural(StructuralClass),
@@ -324,6 +328,7 @@ impl ResolveError {
     pub fn message(&self) -> &'static str {
         match self {
             Self::InvalidRuleId => "Internal routing error",
+            Self::MethodNotConfigured => "Method not configured",
             Self::InvalidPathInput => "Invalid request path",
             Self::Structural(_)
             | Self::CaseFoldRuleChange
@@ -340,6 +345,9 @@ impl std::error::Error for ResolveError {}
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MethodNotConfigured => {
+                f.write_str("request method has no rule at a non-inheriting path")
+            }
             Self::InvalidRuleId => {
                 f.write_str("internal routing error: matched rule ID is absent from the rule table")
             }
@@ -405,7 +413,7 @@ pub enum StructuralChar {
 /// denial, and `Disabled` skips probes; do not rely on a probe being called for
 /// logging or other side effects.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
-/// `exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
+/// `register_exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
 /// monotonic, blunt semantics of a custom detector — by construction it can only
 /// ever deny *more*, never fewer, at the
 /// cost of also rejecting legitimate content that carries the form. Scope the

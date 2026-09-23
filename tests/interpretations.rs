@@ -2,8 +2,8 @@
 //! Do not use production escape readers or scanner helpers in this oracle.
 use http::Method;
 use huskarl_route_guard::{
-    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, Registration, ResolveError, RuleRouter,
-    StructuralChar, StructuralClass, StructuralClasses,
+    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, PathRegistration, ResolveError,
+    RuleRouter, StructuralChar, StructuralClass, StructuralClasses,
 };
 use proptest::prelude::*;
 
@@ -18,9 +18,9 @@ fn config(depth: DecodeDepth) -> GuardConfig {
 
 fn router(depth: DecodeDepth) -> RuleRouter<&'static str> {
     RuleRouter::builder("default", config(depth))
-        .subtree("/admin", "admin")
-        .subtree("/files", "files")
-        .register(Registration::route("/files/private", "post-only").for_methods(Method::POST))
+        .register_subtree("/admin", |path| path.all("admin"))
+        .register_subtree("/files", |path| path.all("files"))
+        .register(PathRegistration::path("/files/private").method(Method::POST, "post-only"))
         .build()
         .unwrap()
 }
@@ -169,7 +169,7 @@ fn depth_limits_and_uniform_subtree_tolerance_are_preserved() {
     );
     for depth in [DecodeDepth::UpToOne, DecodeDepth::UpToTwo] {
         let uniform = RuleRouter::builder("default", config(depth))
-            .subtree("/files", "files")
+            .register_subtree("/files", |path| path.all("files"))
             .build()
             .unwrap();
         for path in [

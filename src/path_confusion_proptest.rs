@@ -47,8 +47,7 @@ use crate::{
     config::{
         CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, StructuralChar, StructuralClasses,
     },
-    path_router::{Registration, RuleRouter, RuleRouterError},
-    route_tree::MethodMatch,
+    path_router::{PathRegistration, RuleRouter, RuleRouterError},
     subtree_patterns,
 };
 
@@ -170,18 +169,16 @@ fn build_router(
 ) -> Result<RuleRouter<u32>, RuleRouterError> {
     // Rule ids are positional, so spec `i` gets rule id `i` — the rule value below
     // (`enumerate`'s index) matches it, which the properties' messages rely on.
-    let registrations: Vec<Registration<u32>> = specs
+    let registrations: Vec<PathRegistration<u32>> = specs
         .iter()
         .enumerate()
-        .map(|(id, (kind, path))| Registration {
-            patterns: if *kind == 's' {
+        .map(|(id, (kind, path))| {
+            PathRegistration::patterns(if *kind == 's' {
                 subtree_patterns(path)
             } else {
                 vec![(*path).to_owned()]
-            },
-            rule: u32::try_from(id).expect("catalog is small"),
-            opaque: false,
-            method: MethodMatch::Any,
+            })
+            .all(u32::try_from(id).expect("catalog is small"))
         })
         .collect();
     RuleRouter::from_registrations(
@@ -857,7 +854,7 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
     // Rule identity for the oracle: the matched registration's id, or `None` for the
     // default rule — which participates as a rule of its own (a relocation onto or off
     // the default rule is a bypass like any other).
-    let raw_rule = router.raw_match_for_test(&path, &http::Method::GET).id();
+    let raw_rule = router.raw_identity_for_test(&path, &http::Method::GET);
     if router.denial_for_test(&path, &http::Method::GET).is_some() {
         return; // denied — sound regardless of any backend
     }
@@ -866,9 +863,7 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
         if normalized == path {
             continue;
         }
-        let reloc_rule = router
-            .raw_match_for_test(&normalized, &http::Method::GET)
-            .id();
+        let reloc_rule = router.raw_identity_for_test(&normalized, &http::Method::GET);
         assert_eq!(
             reloc_rule, raw_rule,
             "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend {backend:?} \
@@ -908,6 +903,7 @@ proptest! {
         method_qualified in any::<bool>(),
         method_masks in prop::collection::vec(0u8..32, CATALOG.len()),
         request_method in 0u8..6,
+        inheritance in prop::collection::vec(any::<bool>(), CATALOG.len()),
     ) {
         // Under a case-folding backend the catalog (lowercase) builds fine; an
         // unbuildable subset (matchit conflict) is simply skipped.
@@ -918,16 +914,17 @@ proptest! {
         };
         let registrations = specs.iter().zip(&method_masks).enumerate().map(|(id, ((kind, path), mask))| {
             let registration = if *kind == 's' {
-                Registration::subtree(path, id)
+                PathRegistration::subtree(path)
             } else {
-                Registration::route(*path, id)
+                PathRegistration::path(*path)
             };
-            if !method_qualified || *mask == 0 {
-                registration
+            let registration = if !method_qualified || *mask == 0 {
+                registration.all(id)
             } else {
-                registration.for_methods((0u8..5).filter(|bit| mask & (1 << bit) != 0)
-                    .map(method_from_index).collect::<Vec<_>>())
-            }
+                registration.methods((0u8..5).filter(|bit| mask & (1 << bit) != 0)
+                    .map(method_from_index), id)
+            };
+            registration.fallback_inherit(inheritance[id])
         });
         let Ok(router) = RuleRouter::from_registrations(
             usize::MAX,
@@ -939,7 +936,7 @@ proptest! {
 
         // Rule identity via `id()`: the default rule (`None`) participates as a rule
         // of its own, so relocations onto or off it are caught like any other.
-        let raw_rule = router.raw_match_for_test(&path, &method).id();
+        let raw_rule = router.raw_identity_for_test(&path, &method);
         if router.denial_for_test(&path, &method).is_some() {
             return Ok(()); // denied — sound regardless of any backend
         }
@@ -961,7 +958,7 @@ proptest! {
                 if normalized == path {
                     continue;
                 }
-                let reloc_rule = router.raw_match_for_test(&normalized, &method).id();
+                let reloc_rule = router.raw_identity_for_test(&normalized, &method);
                 prop_assert_eq!(
                     reloc_rule,
                     raw_rule,
@@ -994,14 +991,9 @@ proptest! {
         let literal = format!("/{prefix}/{}", transform.canonical_leaf);
         let raw = format!("/{prefix}/{}", transform.raw_leaf);
         let registrations = vec![
-            Registration {
-                patterns: vec![wildcard.clone(), literal.clone()],
-                rule: 0,
-                opaque: false,
-                method: representative.clone().into(),
-            },
-            Registration::route(wildcard, 1).for_methods(actual.clone()),
-            Registration::route(literal.clone(), 2).for_methods(actual.clone()),
+            PathRegistration::patterns([wildcard.clone(), literal.clone()]).method(representative.clone(), 0),
+            PathRegistration::path(wildcard).method(actual.clone(), 1),
+            PathRegistration::path(literal.clone()).method(actual.clone(), 2),
         ];
         let router = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: transform.layers, case_sensitivity: transform.case }, registrations)?;
 
@@ -1014,8 +1006,8 @@ proptest! {
         );
         prop_assert_eq!(&normalized, &literal);
 
-        let raw_rule = router.raw_match_for_test(&raw, &actual).id();
-        let normalized_rule = router.raw_match_for_test(&normalized, &actual).id();
+        let raw_rule = router.raw_identity_for_test(&raw, &actual);
+        let normalized_rule = router.raw_identity_for_test(&normalized, &actual);
         prop_assert_ne!(raw_rule, normalized_rule);
         prop_assert!(
             router.denial_for_test(&raw, &representative).is_none(),
@@ -1098,7 +1090,7 @@ proptest! {
     /// is `deny(clippy::panic)`, but that cannot see runtime slicing/UTF-8 edges).
     #[test]
     fn never_panics_on_arbitrary_input(pattern in ".*", path in ".*") {
-        let _ = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: DecodeDepth::UpToOne, case_sensitivity: CaseSensitivity::Sensitive }, vec![Registration::route(pattern, 0u32)]);
+        let _ = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: DecodeDepth::UpToOne, case_sensitivity: CaseSensitivity::Sensitive }, vec![PathRegistration::path(pattern).all(0u32)]);
 
         let router = build_router(
             &[('s', "/admin"), ('e', "/users/{id}")],
@@ -1107,7 +1099,7 @@ proptest! {
             CaseSensitivity::Insensitive,
         )
         .expect("fixed table builds");
-        let _ = router.raw_match_for_test(&path, &http::Method::GET);
+        let _ = router.raw_identity_for_test(&path, &http::Method::GET);
         let _ = router.denial_for_test(&path, &http::Method::GET);
     }
 }
@@ -1269,10 +1261,8 @@ mod transform_order_tests {
         // …and the two orders really do disagree about the rule, so the deny is
         // load-bearing rather than incidental.
         assert_ne!(
-            router.raw_match_for_test("/b", &http::Method::GET).id(),
-            router
-                .raw_match_for_test("/admin/b", &http::Method::GET)
-                .id(),
+            router.raw_identity_for_test("/b", &http::Method::GET),
+            router.raw_identity_for_test("/admin/b", &http::Method::GET),
         );
     }
 
@@ -1335,7 +1325,7 @@ mod transform_order_tests {
                 continue;
             }
             allowed += 1;
-            let raw_rule = router.raw_match_for_test(path, &http::Method::GET).id();
+            let raw_rule = router.raw_identity_for_test(path, &http::Method::GET);
             for backend in &backends {
                 for order in permutations(&canonical_order(*backend)) {
                     let normalized =
@@ -1343,9 +1333,7 @@ mod transform_order_tests {
                     if normalized == *path {
                         continue;
                     }
-                    let reloc_rule = router
-                        .raw_match_for_test(&normalized, &http::Method::GET)
-                        .id();
+                    let reloc_rule = router.raw_identity_for_test(&normalized, &http::Method::GET);
                     assert_eq!(
                         reloc_rule, raw_rule,
                         "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend \
@@ -1386,12 +1374,12 @@ mod over_approximation_tests {
         path: &str,
         classes: &StructuralClasses,
     ) -> Vec<String> {
-        let raw = router.raw_match_for_test(path, &http::Method::GET).id();
+        let raw = router.raw_identity_for_test(path, &http::Method::GET);
         modeled_backends(classes, CaseSensitivity::Sensitive)
             .into_iter()
             .map(|b| normalize(path, b, classes, DecodeDepth::UpToOne, false))
             .filter(|n| n != path)
-            .filter(|n| router.raw_match_for_test(n, &http::Method::GET).id() != raw)
+            .filter(|n| router.raw_identity_for_test(n, &http::Method::GET) != raw)
             .collect()
     }
 

@@ -1,7 +1,7 @@
 use http::Method;
 use huskarl_route_guard::{
-    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, Registration, ResolveError, RuleRouter,
-    StructuralClasses,
+    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, PathRegistration, ResolveError,
+    RuleRouter, StructuralClasses,
 };
 
 fn config() -> GuardConfig {
@@ -11,8 +11,8 @@ fn config() -> GuardConfig {
 #[test]
 fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
     let router = RuleRouter::builder("default", config())
-        .subtree("/files", "files")
-        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .register_subtree("/files", |path| path.all("files"))
+        .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
         .build()
         .unwrap();
     let diagnostics = router.diagnostics();
@@ -24,11 +24,9 @@ fn method_gap_diagnostics_report_witnesses_without_changing_resolution() {
     assert!(gap.methods.contains(&Method::GET));
     assert!(!gap.methods.contains(&Method::POST));
     for method in &gap.methods {
-        assert!(
-            router
-                .resolve(&gap.example_path, method)
-                .unwrap()
-                .is_default()
+        assert_eq!(
+            router.resolve(&gap.example_path, method).unwrap_err(),
+            ResolveError::MethodNotConfigured
         );
     }
     assert!(gap.to_string().contains("encoded paths"));
@@ -46,8 +44,8 @@ fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
         .into_iter()
         .chain(["/files/special".to_owned()]);
     let repaired = RuleRouter::builder("default", config())
-        .register(Registration::patterns(patterns, "files"))
-        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .register(PathRegistration::patterns(patterns).all("files"))
+        .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
         .build()
         .unwrap();
     assert!(repaired.diagnostics().is_empty());
@@ -58,7 +56,7 @@ fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
     );
 
     let get_only = RuleRouter::builder("default", config())
-        .register(Registration::subtree("/files", "files").for_methods(Method::GET))
+        .register(PathRegistration::subtree("/files").method(Method::GET, "files"))
         .build()
         .unwrap();
     assert!(get_only.diagnostics().is_empty());
@@ -73,9 +71,9 @@ fn method_gap_diagnostics_honor_same_terminal_rules_and_identity_repairs() {
 fn method_gap_diagnostics_follow_overlapping_branches_and_extension_methods() {
     let custom = Method::from_bytes(b"PURGE").unwrap();
     let registrations = [
-        Registration::route("/{tenant}/special", "fallback").for_methods(custom.clone()),
-        Registration::route("/files/{name}", "post").for_methods(Method::POST),
-        Registration::route("/files/{other}", "get").for_methods(Method::GET),
+        PathRegistration::path("/{tenant}/special").method(custom.clone(), "fallback"),
+        PathRegistration::path("/files/{name}").method(Method::POST, "post"),
+        PathRegistration::path("/files/{other}").method(Method::GET, "get"),
     ];
     for mode in [GuardMode::RejectAmbiguous, GuardMode::Disabled] {
         let router = RuleRouter::from_registrations(
@@ -96,10 +94,10 @@ fn method_gap_diagnostics_follow_overlapping_branches_and_extension_methods() {
 #[test]
 fn method_gap_diagnostics_ignore_unrelated_and_fully_shadowed_patterns() {
     let router = RuleRouter::builder("default", config())
-        .route("/{tenant}/special", "fallback")
-        .register(Registration::route("/files/{name}", "post").for_methods(Method::POST))
-        .route("/files/special", "override")
-        .register(Registration::route("/unrelated", "post").for_methods(Method::POST))
+        .register_path("/{tenant}/special", |path| path.all("fallback"))
+        .register(PathRegistration::path("/files/{name}").method(Method::POST, "post"))
+        .register_path("/files/special", |path| path.all("override"))
+        .register(PathRegistration::path("/unrelated").method(Method::POST, "post"))
         .build()
         .unwrap();
     assert!(router.diagnostics().is_empty());
@@ -108,8 +106,8 @@ fn method_gap_diagnostics_ignore_unrelated_and_fully_shadowed_patterns() {
 #[test]
 fn raw_inspection_exposes_only_identity_and_explanations_attribute_method_gaps() {
     let router = RuleRouter::builder("default", config())
-        .subtree("/files", "files")
-        .register(Registration::route("/files/special", "post").for_methods(Method::POST))
+        .register_subtree("/files", |path| path.all("files"))
+        .register(PathRegistration::path("/files/special").method(Method::POST, "post"))
         .build()
         .unwrap();
     let path = "/files/hello%2fworld";
@@ -123,7 +121,8 @@ fn raw_inspection_exposes_only_identity_and_explanations_attribute_method_gaps()
     let structural = explanation.structural.unwrap();
     assert_eq!(structural.anchor, "/files/");
     assert_eq!(structural.registrations, [0]);
-    assert!(structural.includes_default);
+    assert!(!structural.includes_default);
+    assert!(structural.includes_method_denial);
 
     let post = router
         .explain(path, &Method::POST)
@@ -142,8 +141,8 @@ fn explanations_preserve_denial_order_and_omit_inapplicable_anchors() {
         GuardMode::Disabled,
     ] {
         let router = RuleRouter::builder("default", config().with_mode(mode))
-            .subtree("/files", "files")
-            .route("/admin", "admin")
+            .register_subtree("/files", |path| path.all("files"))
+            .register_path("/admin", |path| path.all("admin"))
             .build()
             .unwrap();
         for path in ["/files/key", "/files/a%2fb", "/files/%00", "/%61dmin"] {
@@ -160,7 +159,7 @@ fn explanations_preserve_denial_order_and_omit_inapplicable_anchors() {
         "default",
         GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
     )
-    .route("/admin", "admin")
+    .register_path("/admin", |path| path.all("admin"))
     .build()
     .unwrap();
     let explanation = router.explain("/ADMIN", &Method::GET).unwrap();
@@ -171,7 +170,7 @@ fn explanations_preserve_denial_order_and_omit_inapplicable_anchors() {
 #[test]
 fn grouped_patterns_share_identity_but_equal_values_do_not() {
     let grouped = RuleRouter::builder("default", config())
-        .register(Registration::patterns(["/a", "/%61"], "same-value"))
+        .register(PathRegistration::patterns(["/a", "/%61"]).all("same-value"))
         .build()
         .unwrap();
     assert_eq!(
@@ -180,8 +179,8 @@ fn grouped_patterns_share_identity_but_equal_values_do_not() {
     );
 
     let separate = RuleRouter::builder("default", config())
-        .route("/a", "same-value")
-        .route("/%61", "same-value")
+        .register_path("/a", |path| path.all("same-value"))
+        .register_path("/%61", |path| path.all("same-value"))
         .build()
         .unwrap();
     assert_eq!(
@@ -193,8 +192,8 @@ fn grouped_patterns_share_identity_but_equal_values_do_not() {
 #[test]
 fn iterator_and_builder_preserve_methods_and_registration_order() {
     let registrations = [
-        Registration::route("/health", "health").for_methods([Method::GET, Method::HEAD]),
-        Registration::exclusive_subtree("/files", "files"),
+        PathRegistration::path("/health").methods([Method::GET, Method::HEAD], "health"),
+        PathRegistration::exclusive_subtree("/files").all("files"),
     ];
     let direct =
         RuleRouter::from_registrations("default", config(), registrations.clone()).unwrap();
@@ -209,18 +208,16 @@ fn iterator_and_builder_preserve_methods_and_registration_order() {
     ] {
         assert_eq!(direct.resolve(path, &method), built.resolve(path, &method));
     }
-    assert!(
-        built
-            .resolve("/health", &Method::POST)
-            .unwrap()
-            .is_default()
+    assert_eq!(
+        built.resolve("/health", &Method::POST).unwrap_err(),
+        ResolveError::MethodNotConfigured
     );
 }
 
 #[test]
 fn diagnostics_validate_input_without_authorizing_ambiguous_paths() {
     let router = RuleRouter::builder("public", config())
-        .subtree("/admin", "admin")
+        .register_subtree("/admin", |path| path.all("admin"))
         .build()
         .unwrap();
     assert!(
@@ -240,13 +237,13 @@ fn diagnostics_validate_input_without_authorizing_ambiguous_paths() {
 fn reused_configuration_carries_enforcement_and_structural_options() {
     let config = config().with_structural_classes(StructuralClasses::new().with_backslash());
     let default = RuleRouter::builder("public", config.clone())
-        .subtree("/admin", "admin")
+        .register_subtree("/admin", |path| path.all("admin"))
         .build()
         .unwrap();
     assert!(default.resolve("/admin\\secret", &Method::GET).is_err());
     assert!(default.resolve("/admin/a%2fb", &Method::GET).is_ok());
     let strict = RuleRouter::builder("public", config.with_mode(GuardMode::RequireCanonical))
-        .subtree("/admin", "admin")
+        .register_subtree("/admin", |path| path.all("admin"))
         .build()
         .unwrap();
     assert!(strict.resolve("/admin/a%2fb", &Method::GET).is_err());
@@ -254,14 +251,14 @@ fn reused_configuration_carries_enforcement_and_structural_options() {
 
 #[test]
 fn adding_a_literal_subtree_can_restore_rule_agreement() {
-    let existing = Registration::subtree("/{tenant}/private", "private");
+    let existing = PathRegistration::subtree("/{tenant}/private").all("private");
     let before = RuleRouter::builder("default", config())
         .register(existing.clone())
         .build()
         .unwrap();
     let after = RuleRouter::builder("default", config())
         .register(existing)
-        .subtree("/files", "files")
+        .register_subtree("/files", |path| path.all("files"))
         .build()
         .unwrap();
 
@@ -301,12 +298,16 @@ fn exclusive_subtrees_reject_overriding_paths_in_either_registration_order() {
         // Even disjoint method sets cannot make a path override safe: path
         // precedence is resolved before method lookup.
         for methods in [None, Some((Method::GET, Method::POST))] {
-            let mut protected = Registration::exclusive_subtree(exclusive, "exclusive");
-            let mut other = Registration::route(nested, "override");
-            if let Some((a, b)) = methods {
-                protected = protected.for_methods(a);
-                other = other.for_methods(b);
-            }
+            let protected = PathRegistration::exclusive_subtree(exclusive);
+            let other = PathRegistration::path(nested);
+            let (protected, other) = if let Some((a, b)) = methods {
+                (
+                    protected.method(a, "exclusive"),
+                    other.method(b, "override"),
+                )
+            } else {
+                (protected.all("exclusive"), other.all("override"))
+            };
             for reverse in [false, true] {
                 let mut registrations = [protected.clone(), other.clone()];
                 if reverse {
@@ -344,8 +345,8 @@ fn exclusive_subtrees_allow_unrelated_and_lower_priority_routes() {
     ] {
         for reverse in [false, true] {
             let mut registrations = [
-                Registration::exclusive_subtree(exclusive, "exclusive"),
-                Registration::route(other, "other"),
+                PathRegistration::exclusive_subtree(exclusive).all("exclusive"),
+                PathRegistration::path(other).all("other"),
             ];
             if reverse {
                 registrations.reverse();
@@ -363,8 +364,8 @@ fn exclusive_subtrees_allow_unrelated_and_lower_priority_routes() {
 #[test]
 fn exclusive_subtrees_allow_method_rules_at_the_same_paths() {
     let router = RuleRouter::builder("default", config())
-        .exclusive_subtree("/{tenant}", "all-methods")
-        .register(Registration::subtree("/{name}", "get").for_methods(Method::GET))
+        .register_exclusive_subtree("/{tenant}", |path| path.all("all-methods"))
+        .register(PathRegistration::subtree("/{name}").method(Method::GET, "get"))
         .build()
         .unwrap();
     for path in ["/files", "/files/", "/files/key"] {
@@ -380,10 +381,10 @@ fn exclusive_subtrees_allow_method_rules_at_the_same_paths() {
 fn structural_coverage_uses_each_requests_method() {
     let custom = Method::from_bytes(b"READ-KEY").unwrap();
     let router = RuleRouter::builder("default", config())
-        .exclusive_subtree("/files", "fallback")
-        .register(Registration::subtree("/files", "read").for_methods([Method::GET, Method::HEAD]))
-        .register(Registration::subtree("/files", "write").for_methods(Method::POST))
-        .register(Registration::subtree("/files", "custom").for_methods(custom.clone()))
+        .register_exclusive_subtree("/files", |path| path.all("fallback"))
+        .register(PathRegistration::subtree("/files").methods([Method::GET, Method::HEAD], "read"))
+        .register(PathRegistration::subtree("/files").method(Method::POST, "write"))
+        .register(PathRegistration::subtree("/files").method(custom.clone(), "custom"))
         .build()
         .unwrap();
     for (method, expected) in [
@@ -409,45 +410,41 @@ fn structural_coverage_uses_each_requests_method() {
 
 #[test]
 fn another_method_only_affects_get_when_it_changes_path_precedence() {
-    let read = Registration::subtree("/files", "read").for_methods(Method::GET);
+    let read = PathRegistration::subtree("/files").method(Method::GET, "read");
     let original = RuleRouter::builder("default", config())
         .register(read.clone())
         .build()
         .unwrap();
     let same_paths = RuleRouter::builder("default", config())
         .register(read.clone())
-        .register(Registration::subtree("/files", "write").for_methods(Method::POST))
+        .register(PathRegistration::subtree("/files").method(Method::POST, "write"))
         .build()
         .unwrap();
     assert_eq!(
         original.resolve("/files/a%2fb", &Method::GET),
         same_paths.resolve("/files/a%2fb", &Method::GET)
     );
-    assert!(
-        original
-            .resolve("/files/a%2fb", &Method::POST)
-            .unwrap()
-            .is_default()
+    assert_eq!(
+        original.resolve("/files/a%2fb", &Method::POST).unwrap_err(),
+        ResolveError::MethodNotConfigured
     );
 
     for nested_method in [Method::GET, Method::POST] {
         let nested = RuleRouter::builder("default", config())
             .register(read.clone())
             .register(
-                Registration::route("/files/private", "private").for_methods(nested_method.clone()),
+                PathRegistration::path("/files/private").method(nested_method.clone(), "private"),
             )
             .build()
             .unwrap();
-        // GET either reaches another GET rule, or the default at a POST-only
+        // GET either reaches another GET rule, or a denial at a POST-only
         // terminal. Both are different from the surrounding GET subtree.
         assert!(nested.resolve("/files/a%2fb", &Method::GET).is_err());
         assert!(nested.resolve("/files/private;x", &Method::GET).is_err());
         if nested_method == Method::POST {
-            assert!(
-                nested
-                    .resolve("/files/private", &Method::GET)
-                    .unwrap()
-                    .is_default()
+            assert_eq!(
+                nested.resolve("/files/private", &Method::GET).unwrap_err(),
+                ResolveError::MethodNotConfigured
             );
         }
     }
@@ -455,19 +452,17 @@ fn another_method_only_affects_get_when_it_changes_path_precedence() {
 
 #[test]
 fn structural_coverage_respects_method_gaps_in_a_shadowing_branch() {
-    let ancestor = Registration::subtree("/{tenant}", "read").for_methods(Method::GET);
+    let ancestor = PathRegistration::subtree("/{tenant}").method(Method::GET, "read");
     let complete = RuleRouter::builder("default", config())
         .register(ancestor.clone())
-        .register(Registration::subtree("/files", "write").for_methods(Method::POST))
+        .register(PathRegistration::subtree("/files").method(Method::POST, "write"))
         .build()
         .unwrap();
-    // The entire literal branch selects default for GET; it must not fall back
+    // The entire literal branch denies GET; it must not fall back
     // to the ancestor's wildcard, even though that branch has a GET rule.
-    assert!(
-        complete
-            .resolve("/files/a%2fb", &Method::GET)
-            .unwrap()
-            .is_default()
+    assert_eq!(
+        complete.resolve("/files/a%2fb", &Method::GET).unwrap_err(),
+        ResolveError::MethodNotConfigured
     );
     assert_eq!(
         *complete
@@ -479,20 +474,18 @@ fn structural_coverage_respects_method_gaps_in_a_shadowing_branch() {
 
     let incomplete = RuleRouter::builder("default", config())
         .register(ancestor)
-        .register(Registration::route("/files/{*rest}", "write").for_methods(Method::POST))
+        .register(PathRegistration::path("/files/{*rest}").method(Method::POST, "write"))
         .build()
         .unwrap();
     // Without the trailing-slash terminal, /files/ reaches the wildcard's GET
-    // rule, while /files/key claims the POST-only catch-all and defaults for GET.
+    // rule, while /files/key claims the POST-only catch-all and denies GET.
     assert_eq!(
         *incomplete.resolve("/files/", &Method::GET).unwrap().rule(),
         "read"
     );
-    assert!(
-        incomplete
-            .resolve("/files/key", &Method::GET)
-            .unwrap()
-            .is_default()
+    assert_eq!(
+        incomplete.resolve("/files/key", &Method::GET).unwrap_err(),
+        ResolveError::MethodNotConfigured
     );
     assert!(incomplete.resolve("/files/a%2fb", &Method::GET).is_err());
 }

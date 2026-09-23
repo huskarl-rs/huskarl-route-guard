@@ -3,9 +3,9 @@
 use http::Method;
 
 use crate::{
-    MethodMatch, ResolveError,
+    ResolveError,
     guard::PathConfusionGuard,
-    route_tree::{Pattern, RuleId, Segment},
+    route_tree::{MethodMatch, Pattern, Segment},
 };
 
 /// Raw routing identity for diagnostics, without an authorization rule reference.
@@ -20,22 +20,25 @@ use crate::{
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RawMatch {
-    /// A registration's position in construction order.
+    /// Lookup stopped at a path that does not serve this method or inherit.
+    MethodDenied,
+    /// A concrete rule definition's ID in insertion order.
     Matched {
         /// The registration ID.
         id: u32,
     },
-    /// No rule at the selected path serves this method, or no path matched.
+    /// Matching exhausted the available paths, possibly through inheritance.
     Default,
 }
 
 impl RawMatch {
-    /// The registration ID, or `None` for the default.
+    /// The defining rule ID, or `None` for default or method denial.
+    /// Match the enum variants to distinguish those outcomes.
     #[must_use]
     pub fn id(self) -> Option<u32> {
         match self {
             Self::Matched { id } => Some(id),
-            Self::Default => None,
+            Self::Default | Self::MethodDenied => None,
         }
     }
 
@@ -68,20 +71,22 @@ pub struct ResolutionExplanation {
 pub struct StructuralExplanation {
     /// Stable prefix retained after accounting for potential traversal.
     pub anchor: String,
-    /// Registration IDs contributing to the region's coverage, sorted and unique.
+    /// Rule IDs contributing to the region's coverage, sorted and unique.
     /// These are conservative possibilities, not necessarily actual normalized paths.
     pub registrations: Vec<u32>,
     /// Whether the default identity also contributes to the region's coverage.
     pub includes_default: bool,
+    /// Whether the region contains paths that stop lookup without a method rule.
+    pub includes_method_denial: bool,
 }
 
-/// A path terminal selects the default for methods served by its path fallback.
+/// A non-inheriting path denies methods served by a lower-priority matching path.
 ///
 /// This is advisory: the gap may be intentional. It can also prevent uniform
 /// structural coverage and cause encoded paths in the surrounding region to be
 /// denied. Supplying a same-path rule fixes the gap, but a separate registration
-/// still has a distinct identity. Group patterns in one registration when they
-/// should share identity.
+/// still has a distinct identity. Enable inheritance to retain the broader rule
+/// identity, or group the patterns under one definition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MethodGapDiagnostic {
@@ -89,12 +94,12 @@ pub struct MethodGapDiagnostic {
     pub pattern: String,
     /// A concrete raw path demonstrating the gap.
     pub example_path: String,
-    /// Methods selecting the default at this path.
+    /// Methods denied at this path instead of reaching the broader rule.
     ///
     /// Only standard HTTP methods and explicitly registered extension methods are
     /// examined; this list need not include every affected extension method.
     pub methods: Vec<Method>,
-    /// Registration ID selected if the blocking path terminal were absent.
+    /// Rule ID selected if the blocking path terminal were absent.
     ///
     /// All method rules at that terminal are ignored together for this comparison.
     pub shadowed_registration: u32,
@@ -102,7 +107,7 @@ pub struct MethodGapDiagnostic {
 
 impl std::fmt::Display for MethodGapDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pattern {:?} selects the default for ", self.pattern)?;
+        write!(f, "pattern {:?} denies ", self.pattern)?;
         for (index, method) in self.methods.iter().enumerate() {
             if index > 0 {
                 f.write_str(", ")?;
@@ -120,7 +125,6 @@ impl std::fmt::Display for MethodGapDiagnostic {
 pub(crate) struct DiagnosticPattern {
     pub(crate) parsed: Pattern,
     pub(crate) source: String,
-    pub(crate) id: RuleId,
     pub(crate) methods: MethodMatch,
 }
 
@@ -160,9 +164,6 @@ pub(crate) fn method_gaps(
     }
     let mut diagnostics: Vec<MethodGapDiagnostic> = Vec::new();
     for (index, pattern) in patterns.iter().enumerate() {
-        let MethodMatch::OneOf(handled) = &pattern.methods else {
-            continue;
-        };
         // Co-located method registrations form one terminal, even if parameter
         // names differ. A same-terminal Any rule eliminates all method gaps.
         if patterns
@@ -179,14 +180,9 @@ pub(crate) fn method_gaps(
             let Some(path) = overlap_path(&pattern.parsed, &other.parsed, &capture) else {
                 continue;
             };
-            if !handled
-                .iter()
-                .any(|method| guard.resolve(&path, method) == Some(pattern.id))
-            {
-                continue;
-            }
             for method in &methods {
-                let Some(shadowed_registration) = guard.method_gap(&path, method) else {
+                let Some(shadowed_registration) = guard.method_gap(&path, method, &pattern.parsed)
+                else {
                     continue;
                 };
                 if let Some(existing) = diagnostics.iter_mut().find(|diagnostic| {
