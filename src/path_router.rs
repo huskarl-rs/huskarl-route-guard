@@ -218,9 +218,12 @@ impl<R> Registration<R> {
         }
     }
 
-    /// Like [`subtree`](Self::subtree), but rejects nested paths at build time.
+    /// Like [`subtree`](Self::subtree), but rejects paths that take precedence beneath
+    /// it, including through overlapping literal and wildcard branches, in either
+    /// registration order. Lower-priority fallbacks and method rules at the same
+    /// path patterns remain valid.
     /// Request-time checks are unchanged. Method restrictions can still introduce
-    /// default-rule gaps; see [`for_methods`](Self::for_methods).
+    /// default-rule gaps at more-specific paths; see [`for_methods`](Self::for_methods).
     pub fn exclusive_subtree(path: &str, rule: R) -> Self {
         Self {
             opaque: true,
@@ -231,9 +234,9 @@ impl<R> Registration<R> {
     /// Restrict the registration to the given method(s) — a bare [`http::Method`],
     /// an array, or a `Vec` of them — all under the registration's single rule id.
     /// Path precedence is resolved before method matching; see [`MethodMatch`].
-    /// Structural coverage spans all methods: restricting a subtree (including a
-    /// exclusive subtree) introduces default-rule gaps for other methods, so structural
-    /// keys can be denied even for a listed method. See
+    /// Structural coverage uses the request method. A complete subtree can accept
+    /// encoded keys for a listed method. More-specific paths without a rule for that
+    /// method still create default-rule gaps. See
     /// [Registering routes](crate::_docs::guide::registering).
     #[must_use]
     pub fn for_methods(mut self, method: impl Into<MethodMatch>) -> Self {
@@ -680,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn method_qualified_subtrees_deny_structural_keys_for_listed_methods() {
+    fn method_qualified_subtrees_allow_structural_keys_for_listed_methods() {
         for registration in [
             Registration::subtree("/files", "files"),
             Registration::exclusive_subtree("/files", "files"),
@@ -704,8 +707,17 @@ mod tests {
                     .is_ok()
             );
             assert_eq!(
-                restricted.resolve("/files/a%2fb", &http::Method::GET),
-                Err(ResolveError::Structural(crate::StructuralClass::Separator))
+                *restricted
+                    .resolve("/files/a%2fb", &http::Method::GET)
+                    .expect("same GET rule")
+                    .rule(),
+                "files"
+            );
+            assert!(
+                restricted
+                    .resolve("/files/a%2fb", &http::Method::POST)
+                    .expect("uniform default")
+                    .is_default()
             );
             assert_eq!(
                 *restricted
@@ -818,8 +830,8 @@ mod tests {
         assert!(denied(&r, "/files/../b"), "climb escapes the subtree");
         assert!(!denied(&r, "/files/clean"));
 
-        // Route-table monotonicity, at unit scale: registering anything under the
-        // subtree breaks its uniformity, flipping the tolerated byte back to a deny.
+        // Adding a nested rule breaks this subtree's uniformity, flipping the
+        // tolerated byte back to a deny. Other additions can restore uniformity.
         let r = router(
             &[
                 ("/files", 0),

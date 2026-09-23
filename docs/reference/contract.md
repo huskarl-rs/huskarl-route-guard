@@ -4,7 +4,7 @@
 
 For every request accepted by the active guard, every interpretation in the
 configured downstream parsing model selects the **same rule identity** as the raw
-path, using this route table.
+path for the request method, using this route table.
 
 The default rule has a distinct identity. A change from the default to a
 registration, from a registration to the default, or between registrations is a
@@ -40,7 +40,7 @@ method fall-through, and registration identity.
 
 | Check | Acceptance condition |
 |---|---|
-| Structural ambiguity | Every path and method in the conservatively analyzed region selects the raw path's rule identity |
+| Structural ambiguity | Every path in the conservatively analyzed region selects the raw path's rule identity for the request method |
 | ASCII case folding | Lowercasing selects the same rule for the request method |
 | Whole-path percent-decoding | Each configured complete decode result selects the same rule for the request method; results are also lowercased when configured |
 | NUL | Always rejected while the guard is active |
@@ -73,8 +73,11 @@ configured model.
 
 1. **Stricter settings only add denials.** Within the supported model, enabling more
    checks or increasing decode depth cannot turn a denial into acceptance.
-2. **Adding registrations only adds denials.** A new registration has its own
-   identity, even if its rule value equals an existing value.
+2. **Route-table changes preserve rule agreement, not previous decisions.** Adding
+   registrations can change both the selected rule and whether a path is accepted.
+   Every accepted path must still satisfy rule agreement under the configured
+   parsing model. A new registration has its own identity, even if its rule value
+   equals an existing value.
 3. **Canonical request paths pass built-in ambiguity checks.** Here, canonical means
    a slash-prefixed path with no recognized structural form, no percent escape,
    and no uppercase ASCII when case folding is configured. Custom probes may

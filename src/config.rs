@@ -102,7 +102,7 @@ pub enum GuardMode {
     /// Check whether downstream parsing could select a different rule. The default.
     ///
     /// This mode accepts structural forms such as encoded slashes
-    /// when every path and method in the analyzed region selects the same rule.
+    /// when every path in the analyzed region selects the same rule for the request method.
     /// Structural analysis is conservative and may reject more than actual parsing
     /// would require. Case folding and percent-decoding compare the resulting rules
     /// directly for the request method. NUL is always rejected.

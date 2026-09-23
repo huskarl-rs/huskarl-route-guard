@@ -288,8 +288,8 @@ fn unescape_braces(s: &str) -> String {
 /// Which HTTP method(s) a registration applies to. `Any` (the default) matches every
 /// method; `OneOf` matches the listed methods — all under the registration's **single
 /// rule id**, so "this rule for GET and HEAD" is one registration, not two. Method is
-/// **orthogonal to path**: it is consulted solely at terminal resolution, never during
-/// path traversal or the structural verdict.
+/// **orthogonal to path**: path traversal is method-independent; terminal resolution
+/// and structural coverage use the request method.
 ///
 /// Builder methods taking `impl Into<MethodMatch>` accept a bare [`http::Method`], an
 /// array, or a `Vec` of them. An empty `OneOf` matches nothing and is rejected at
@@ -346,44 +346,27 @@ impl MethodSlot {
         self.any.is_none() && self.exact.is_empty()
     }
 
-    /// Resolve a rule. `None` (method-blind) returns a stable **representative** for
-    /// structural path-zone comparisons. `Some(m)` resolves specific-method → wildcard.
-    fn get(&self, method: Option<&http::Method>) -> Option<RuleId> {
-        match method {
-            None => self.any.or_else(|| self.exact.first().map(|(_, id)| *id)),
-            Some(m) => self
-                .exact
-                .iter()
-                .find(|(em, _)| em == m)
-                .map(|(_, id)| *id)
-                .or(self.any),
-        }
+    /// Resolve specific-method → all-method rule → default.
+    fn get(&self, method: &http::Method) -> Option<RuleId> {
+        self.exact
+            .iter()
+            .find(|(registered, _)| registered == method)
+            .map(|(_, id)| *id)
+            .or(self.any)
     }
 
-    /// The [`Cover`] this slot contributes, over **all** methods — what makes the
-    /// method-blind structural verdict sound. A slot is uniformly `X` only when its
-    /// method-wildcard entry is `X` and every method-specific entry agrees; a slot
-    /// with *only* method-specific entries resolves every other method to the default
-    /// rule, so [`DEFAULT_RULE`] joins in (a method-qualified route inside an
-    /// otherwise-uniform subtree keeps that subtree non-uniform).
-    fn cover(&self) -> Cover {
-        match self.any {
-            Some(x) => {
-                if self.exact.iter().all(|(_, id)| *id == x) {
-                    Cover::Uniform(x)
-                } else {
-                    Cover::Mixed
-                }
-            }
-            None => self
-                .exact
-                .iter()
-                .fold(Cover::Empty, |c, (_, id)| c.with(*id))
-                .join(if self.exact.is_empty() {
-                    Cover::Empty
-                } else {
-                    Cover::Uniform(DEFAULT_RULE)
-                }),
+    /// Coverage for one method, or for all unregistered methods (`None`). An empty
+    /// slot contributes nothing, but a claimed path with no rule for this method
+    /// contributes the default: path matching must not fall back in that case.
+    fn cover(&self, method: Option<&http::Method>) -> Cover {
+        if self.is_empty() {
+            Cover::Empty
+        } else {
+            Cover::Uniform(
+                method
+                    .map_or(self.any, |m| self.get(m))
+                    .unwrap_or(DEFAULT_RULE),
+            )
         }
     }
 
@@ -428,18 +411,33 @@ struct Node {
     leaf_slash: MethodSlot,
     /// Trailing catch-all rules rooted here, keyed by method.
     catchall: MethodSlot,
-    /// Whether the catch-all was declared opaque (validated sibling-free at build). A
-    /// path property, uniform across methods.
-    catchall_opaque: bool,
-    /// [`Cover`] of every terminal at or below this node, **including** its own
-    /// [`leaf`](Node::leaf). Consulted when this node is entered from above (its whole
-    /// subtree is reachable) and at the **root** anchor, where the empty remainder is
-    /// the bare `/` — i.e. `root.leaf` (a `//` merge really can produce `/`).
-    cov_all: Cover,
-    /// Like [`cov_all`](Node::cov_all) but **excluding** this node's own `leaf`.
-    /// Consulted at a non-root anchor-depth node: no modeled transform deletes the
-    /// anchor's own clean trailing separator, so the bare no-slash form is unreachable.
-    cov_below: Cover,
+    /// Coverage for methods without an explicit registration anywhere in the table.
+    other_cover: RegionCover,
+    /// Coverage in the router's method-index order. Empty for all-method tables.
+    method_covers: Vec<RegionCover>,
+}
+
+/// Summaries for one method category at a node.
+#[derive(Clone, Copy, Default)]
+struct RegionCover {
+    /// All terminals, including the bare leaf (also used at the root anchor).
+    all: Cover,
+    /// Excludes the bare leaf: a non-root anchor retains its trailing separator.
+    below: Cover,
+}
+
+impl Node {
+    fn cover(&self, method_index: Option<usize>) -> RegionCover {
+        method_index.map_or(self.other_cover, |index| {
+            self.method_covers
+                .get(index)
+                .copied()
+                .unwrap_or(RegionCover {
+                    all: Cover::Mixed,
+                    below: Cover::Mixed,
+                })
+        })
+    }
 }
 
 /// Why building a [`Router`] failed.
@@ -452,8 +450,8 @@ pub(crate) enum BuildError {
         /// Index of the conflicting entry.
         index: usize,
     },
-    /// An opaque catch-all shares its node with a routing sibling (a literal or wildcard
-    /// child), so a boundary-shift byte in the blob could relocate into the sibling.
+    /// Another pattern can take precedence beneath an exclusive catch-all,
+    /// including through an overlapping literal or wildcard branch.
     OpaqueTailHasSibling {
         /// The literal path prefix of the offending catch-all's node (`*` stands for a
         /// wildcard segment).
@@ -468,14 +466,15 @@ struct SlotConflict;
 /// A `path -> RuleId` matcher over the owned grammar.
 pub(crate) struct Router {
     root: Node,
+    method_indices: HashMap<http::Method, usize>,
 }
 
 impl Router {
     /// Build a router from `(pattern, rule_id, opaque)` entries.
     ///
     /// `opaque` declares a pattern's trailing catch-all an opaque blob — a build-time
-    /// guarantee that nothing else routes beneath it ([`validate_opaque`]), which is
-    /// what keeps the subtree uniform for the scoped verdict; it is ignored for
+    /// guarantee that no more-specific path takes over beneath it ([`validate_opaque`]);
+    /// it is ignored for
     /// patterns without a catch-all and adds no runtime behavior of its own.
     ///
     /// # Errors
@@ -485,26 +484,36 @@ impl Router {
         entries: &[(Pattern, RuleId, bool, MethodMatch)],
     ) -> Result<Self, BuildError> {
         let mut root = Node::default();
-        for (i, (pat, id, opaque, method)) in entries.iter().enumerate() {
-            insert(
-                &mut root,
-                &pat.segments,
-                pat.trailing_slash,
-                *id,
-                *opaque,
-                method,
-            )
-            .map_err(|SlotConflict| BuildError::Conflict { index: i })?;
+        for (i, (pat, id, _, method)) in entries.iter().enumerate() {
+            insert(&mut root, &pat.segments, pat.trailing_slash, *id, method)
+                .map_err(|SlotConflict| BuildError::Conflict { index: i })?;
         }
-        validate_opaque(&root, &mut String::new())?;
-        compute_cover(&mut root);
-        Ok(Self { root })
+        validate_opaque(entries)?;
+        let mut method_indices = HashMap::new();
+        let mut methods = Vec::new();
+        for (_, _, _, selection) in entries {
+            if let MethodMatch::OneOf(exact) = selection {
+                for method in exact {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        method_indices.entry(method.clone())
+                    {
+                        entry.insert(methods.len());
+                        methods.push(method.clone());
+                    }
+                }
+            }
+        }
+        compute_cover(&mut root, &methods);
+        Ok(Self {
+            root,
+            method_indices,
+        })
     }
 
-    /// Match `path`, then resolve the claimed terminal with `method` (`None` = method-blind
-    /// representative). A path that claims a terminal but has no rule for `method` returns
+    /// Match `path`, then resolve the claimed terminal with `method`.
+    /// A path that claims a terminal but has no rule for `method` returns
     /// `None` — never a fall-back to a less-specific path.
-    fn at(&self, path: &[u8], method: Option<&http::Method>) -> Option<RuleId> {
+    fn at(&self, path: &[u8], method: &http::Method) -> Option<RuleId> {
         let body = path.strip_prefix(b"/")?;
         let slot = if body.is_empty() {
             // The bare root path `/` claims the root leaf.
@@ -516,10 +525,10 @@ impl Router {
         slot.get(method)
     }
 
-    /// The matched rule id, **method-blind** (a stable per-terminal representative) — for
-    /// structural path-zone comparisons and method-agnostic test oracles.
+    /// GET matching for method-agnostic test oracles.
+    #[cfg(test)]
     pub(crate) fn route_id(&self, path: &str) -> Option<RuleId> {
-        self.at(path.as_bytes(), None)
+        self.at(path.as_bytes(), &http::Method::GET)
     }
 
     /// [`route_id`](Self::route_id) for a **raw byte** path — what a percent-decode can
@@ -529,21 +538,21 @@ impl Router {
     /// ASCII `/` keeps every segment valid), so the two can never disagree.
     #[cfg(test)]
     pub(crate) fn route_id_bytes(&self, path: &[u8]) -> Option<RuleId> {
-        self.at(path, None)
+        self.at(path, &http::Method::GET)
     }
 
     /// The matched rule id for a raw-byte path and a specific method.
     pub(crate) fn resolve_bytes(&self, path: &[u8], method: &http::Method) -> Option<RuleId> {
-        self.at(path, Some(method))
+        self.at(path, method)
     }
 
     /// The matched rule id for a specific method (specific → wildcard → none).
     pub(crate) fn resolve(&self, path: &str, method: &http::Method) -> Option<RuleId> {
-        self.at(path.as_bytes(), Some(method))
+        self.at(path.as_bytes(), method)
     }
 
     /// The [`Cover`] of **every rule id reachable by any path extending `anchor`** — a
-    /// clean, `/`-terminated prefix (`"/"`, `"/files/"`, …). This is the scoped
+    /// clean, `/`-terminated prefix (`"/"`, `"/files/"`, …), for the request method. This is the scoped
     /// structural verdict's core question: if the answer is `Uniform(matched)`, no
     /// reinterpretation confined to the anchor's subtree can relocate the request.
     ///
@@ -555,11 +564,12 @@ impl Router {
     /// resolve to the default rule, so [`DEFAULT_RULE`] joins in unless the walk proves
     /// every suffix is covered (see [`walk_cover`]). The result is a superset of what
     /// concrete reinterpretations can reach — over-approximation only ever denies more.
-    pub(crate) fn anchor_cover(&self, anchor: &str) -> Cover {
+    pub(crate) fn anchor_cover(&self, anchor: &str, method: &http::Method) -> Cover {
+        let method_index = self.method_indices.get(method).copied();
         let mut segs = anchor.split('/').filter(|s| !s.is_empty());
         if let Some(first) = segs.next() {
             let rest: Vec<&str> = segs.collect();
-            let (cover, complete) = walk_cover(&self.root, first, &rest);
+            let (cover, complete) = walk_cover(&self.root, first, &rest, method, method_index);
             if complete {
                 cover
             } else {
@@ -571,28 +581,46 @@ impl Router {
             // Complete only if both the bare `/` and every non-empty body are covered.
             let complete = !self.root.leaf.is_empty() && !self.root.catchall.is_empty();
             if complete {
-                self.root.cov_all
+                self.root.cover(method_index).all
             } else {
-                self.root.cov_all.with(DEFAULT_RULE)
+                self.root.cover(method_index).all.with(DEFAULT_RULE)
             }
         }
     }
 }
 
-/// Fill [`Node::cov_all`] / [`Node::cov_below`] bottom-up: a child's whole subtree is
-/// reachable from its parent, so a child contributes its `cov_all`.
-fn compute_cover(node: &mut Node) {
-    let mut below = node.leaf_slash.cover().join(node.catchall.cover());
+/// Precompute coverage for each explicitly registered method and one shared
+/// category for every other method. All-method tables need no per-method vectors.
+fn compute_cover(node: &mut Node, methods: &[http::Method]) {
     for child in node.literals.values_mut() {
-        compute_cover(child);
-        below = below.join(child.cov_all);
+        compute_cover(child, methods);
     }
-    if let Some(w) = node.wildcard.as_deref_mut() {
-        compute_cover(w);
-        below = below.join(w.cov_all);
+    if let Some(child) = node.wildcard.as_deref_mut() {
+        compute_cover(child, methods);
     }
-    node.cov_below = below;
-    node.cov_all = below.join(node.leaf.cover());
+    node.other_cover = summarize(node, None, None);
+    node.method_covers = methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| summarize(node, Some(method), Some(index)))
+        .collect();
+}
+
+fn summarize(node: &Node, method: Option<&http::Method>, index: Option<usize>) -> RegionCover {
+    let mut below = node
+        .leaf_slash
+        .cover(method)
+        .join(node.catchall.cover(method));
+    for child in node.literals.values() {
+        below = below.join(child.cover(index).all);
+    }
+    if let Some(child) = node.wildcard.as_deref() {
+        below = below.join(child.cover(index).all);
+    }
+    RegionCover {
+        all: below.join(node.leaf.cover(method)),
+        below,
+    }
 }
 
 /// One step of the [`Router::anchor_cover`] descent: the cover reachable from `node`
@@ -604,15 +632,23 @@ fn compute_cover(node: &mut Node) {
 /// catch-all only when both dead-end — so once a tier is complete, later tiers are
 /// unreachable and must not join the cover (else a fully-registered subtree nested
 /// under a broader catch-all would falsely read as mixed). At anchor depth a node
-/// contributes `cov_below`, and its completeness requires its own catch-all (all
+/// contributes its method-specific `below` summary, and its completeness requires its own catch-all (all
 /// non-empty remainders) *and* `leaf_slash` (the empty remainder — a `;`-strip can
 /// produce exactly the anchor path). That conjunction is per-node rather than across
-/// tiers — cheaper, and wrong only toward denial.
-fn walk_cover(node: &Node, seg: &str, rest: &[&str]) -> (Cover, bool) {
+/// tiers — cheaper, and wrong only toward denial. Completeness remains method-blind:
+/// a claimed terminal with no rule for this method resolves to the default and blocks
+/// fallback, just as it does in `route`.
+fn walk_cover(
+    node: &Node,
+    seg: &str,
+    rest: &[&str],
+    method: &http::Method,
+    method_index: Option<usize>,
+) -> (Cover, bool) {
     let descend = |child: &Node| match rest.split_first() {
-        Some((next, tail)) => walk_cover(child, next, tail),
+        Some((next, tail)) => walk_cover(child, next, tail, method, method_index),
         None => (
-            child.cov_below,
+            child.cover(method_index).below,
             !child.catchall.is_empty() && !child.leaf_slash.is_empty(),
         ),
     };
@@ -631,7 +667,10 @@ fn walk_cover(node: &Node, seg: &str, rest: &[&str]) -> (Cover, bool) {
             return (cover, true);
         }
     }
-    (cover.join(node.catchall.cover()), !node.catchall.is_empty())
+    (
+        cover.join(node.catchall.cover(Some(method))),
+        !node.catchall.is_empty(),
+    )
 }
 
 /// Recursive insert. `matchit`-style catch-all is always the final segment (guaranteed
@@ -641,7 +680,6 @@ fn insert(
     segs: &[Segment],
     trailing_slash: bool,
     id: RuleId,
-    opaque: bool,
     method: &MethodMatch,
 ) -> Result<(), SlotConflict> {
     match segs.split_first() {
@@ -658,7 +696,6 @@ fn insert(
             rest,
             trailing_slash,
             id,
-            opaque,
             method,
         ),
         Some((Segment::Wildcard, rest)) => insert(
@@ -666,52 +703,72 @@ fn insert(
             rest,
             trailing_slash,
             id,
-            opaque,
             method,
         ),
         Some((Segment::CatchAll, _rest)) => {
             node.catchall.insert(method, id)?;
-            // Blob-ness is a path property: opaque if any registration declares it.
-            node.catchall_opaque |= opaque;
             Ok(())
         }
     }
 }
 
-/// Reject an opaque catch-all that shares its node with a routing sibling: a
-/// boundary-shift byte in the blob could then relocate into that sibling. This is the
-/// "surprise-live" footgun, promoted from a debug lint to a hard, fail-closed error on
-/// an explicit opt-in.
-///
-/// `prefix` accumulates the literal path down to the node under inspection, so the
-/// error can name where the offending blob is rooted.
-fn validate_opaque(node: &Node, prefix: &mut String) -> Result<(), BuildError> {
-    if !node.catchall.is_empty()
-        && node.catchall_opaque
-        && (!node.literals.is_empty() || node.wildcard.is_some())
-    {
-        return Err(BuildError::OpaqueTailHasSibling {
-            at: if prefix.is_empty() {
-                "/".to_owned()
-            } else {
-                prefix.clone()
-            },
-        });
-    }
-    for (seg, child) in &node.literals {
-        let len = prefix.len();
-        prefix.push('/');
-        prefix.push_str(seg);
-        validate_opaque(child, prefix)?;
-        prefix.truncate(len);
-    }
-    if let Some(w) = &node.wildcard {
-        let len = prefix.len();
-        prefix.push_str("/*");
-        validate_opaque(w, prefix)?;
-        prefix.truncate(len);
+/// Check parsed patterns rather than only tree descendants: a literal branch can
+/// override an exclusive wildcard branch even though neither node contains the other.
+/// Methods do not participate because path precedence is resolved first. Separate
+/// method slots at the same catch-all remain allowed.
+fn validate_opaque(entries: &[(Pattern, RuleId, bool, MethodMatch)]) -> Result<(), BuildError> {
+    for (pattern, _, opaque, _) in entries {
+        if !opaque {
+            continue;
+        }
+        let Some((Segment::CatchAll, prefix)) = pattern.segments.split_last() else {
+            continue;
+        };
+        if entries
+            .iter()
+            .any(|(other, _, _, _)| overrides_tail(prefix, &other.segments))
+        {
+            let mut at = String::new();
+            for segment in prefix {
+                at.push('/');
+                match segment {
+                    Segment::Literal(literal) => at.push_str(literal),
+                    Segment::Wildcard | Segment::CatchAll => at.push('*'),
+                }
+            }
+            if at.is_empty() {
+                at.push('/');
+            }
+            return Err(BuildError::OpaqueTailHasSibling { at });
+        }
     }
     Ok(())
+}
+
+/// Whether `candidate` can win for a path in the exclusive catch-all's tail.
+/// The first differing segment fixes precedence (literal > wildcard > catch-all).
+/// Later segments still have to overlap, but cannot reverse that precedence.
+fn overrides_tail(prefix: &[Segment], mut candidate: &[Segment]) -> bool {
+    let mut higher = false;
+    for protected in prefix {
+        let Some((next, rest)) = candidate.split_first() else {
+            // An exact ancestor or the bare prefix does not consume the tail.
+            return false;
+        };
+        match (protected, next) {
+            (Segment::Literal(a), Segment::Literal(b)) if a != b => return false,
+            (Segment::Wildcard, Segment::Literal(_)) => higher = true,
+            (Segment::Literal(_), Segment::Wildcard) if !higher => return false,
+            (_, Segment::CatchAll) => return higher,
+            _ => {}
+        }
+        candidate = rest;
+    }
+    match candidate {
+        [] => false,
+        [Segment::CatchAll] => higher,
+        _ => true,
+    }
 }
 
 /// Find the terminal `s` (a non-empty path body) claims under `node` — its method-slot,
@@ -997,12 +1054,18 @@ mod tests {
     #[test]
     fn anchor_cover_full_subtree_is_uniform() {
         let r = router(&[("/files", 0), ("/files/", 0), ("/files/*", 0)]);
-        assert_eq!(r.anchor_cover("/files/"), Cover::Uniform(0));
+        assert_eq!(
+            r.anchor_cover("/files/", &http::Method::GET),
+            Cover::Uniform(0)
+        );
         // Anchors deeper inside the catch-all stay uniform — the walk bottoms out at
         // the catch-all node, which covers everything beneath it.
-        assert_eq!(r.anchor_cover("/files/a/b/"), Cover::Uniform(0));
+        assert_eq!(
+            r.anchor_cover("/files/a/b/", &http::Method::GET),
+            Cover::Uniform(0)
+        );
         // The root anchor sees the default fall-through for paths outside /files.
-        assert_eq!(r.anchor_cover("/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/", &http::Method::GET), Cover::Mixed);
     }
 
     #[test]
@@ -1010,7 +1073,7 @@ mod tests {
         // Without `/files/` (leaf_slash), the empty remainder — reachable via e.g. a
         // `;`-strip emptying the tail — falls to the default rule: not uniform.
         let r = router(&[("/files/*", 0)]);
-        assert_eq!(r.anchor_cover("/files/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/files/", &http::Method::GET), Cover::Mixed);
     }
 
     #[test]
@@ -1018,7 +1081,10 @@ mod tests {
         // Nothing under /public and no ancestor catch-all: every path there resolves
         // to the default rule, which is itself a uniform outcome.
         let r = router(&[("/admin", 0)]);
-        assert_eq!(r.anchor_cover("/public/"), Cover::Uniform(DEFAULT_RULE));
+        assert_eq!(
+            r.anchor_cover("/public/", &http::Method::GET),
+            Cover::Uniform(DEFAULT_RULE)
+        );
     }
 
     #[test]
@@ -1027,7 +1093,7 @@ mod tests {
         // reachable under the /files/ anchor even though its pattern never spells
         // "files" — the walk must follow the wildcard branch alongside the literal.
         let r = router(&[("/files/*/deep", 0), ("/*/c", 1)]);
-        assert_eq!(r.anchor_cover("/files/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/files/", &http::Method::GET), Cover::Mixed);
     }
 
     #[test]
@@ -1042,10 +1108,16 @@ mod tests {
             ("/", 1),
             ("/*", 1),
         ]);
-        assert_eq!(r.anchor_cover("/files/"), Cover::Uniform(0));
+        assert_eq!(
+            r.anchor_cover("/files/", &http::Method::GET),
+            Cover::Uniform(0)
+        );
         // But an *incomplete* subtree leaks into the ancestor catch-all: mixed.
         let leaky = router(&[("/files/*", 0), ("/", 1), ("/*", 1)]);
-        assert_eq!(leaky.anchor_cover("/files/"), Cover::Mixed);
+        assert_eq!(
+            leaky.anchor_cover("/files/", &http::Method::GET),
+            Cover::Mixed
+        );
     }
 
     #[test]
@@ -1054,17 +1126,17 @@ mod tests {
         // bare `/` (root.leaf), which slash-merging really can produce. A table whose
         // `/` and `/{*rest}` carry different rules must read Mixed at "/".
         let r = router(&[("/", 1), ("/*", 0)]);
-        assert_eq!(r.anchor_cover("/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/", &http::Method::GET), Cover::Mixed);
         // Same table with one shared rule id is uniform — and complete (leaf +
         // catch-all), so the default never joins.
         let uni = router(&[("/", 0), ("/*", 0)]);
-        assert_eq!(uni.anchor_cover("/"), Cover::Uniform(0));
+        assert_eq!(uni.anchor_cover("/", &http::Method::GET), Cover::Uniform(0));
     }
 
     #[test]
     fn anchor_cover_method_gap_injects_default() {
-        // A method-qualified terminal resolves other methods to the default rule, so
-        // it can never make a subtree uniform on its own.
+        // GET stays uniform, but POST selects the default at the GET-only leaf
+        // instead of falling back to the surrounding all-method catch-all.
         let entries = vec![
             (
                 parse_pattern("/x/y").expect("pat"),
@@ -1086,18 +1158,21 @@ mod tests {
             ),
         ];
         let r = Router::build(&entries).expect("build");
-        assert_eq!(r.anchor_cover("/x/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/x/", &http::Method::GET), Cover::Uniform(0));
+        assert_eq!(r.anchor_cover("/x/", &http::Method::POST), Cover::Mixed);
         // The same shape with a method-wildcard terminal is uniform.
         let all = router(&[("/x/y", 0), ("/x/", 0), ("/x/*", 0)]);
-        assert_eq!(all.anchor_cover("/x/"), Cover::Uniform(0));
+        assert_eq!(
+            all.anchor_cover("/x/", &http::Method::GET),
+            Cover::Uniform(0)
+        );
     }
 
     #[test]
     fn multi_method_slot_resolves_each_and_stays_method_gapped() {
         // A OneOf registration claims each listed method under its single rule id;
-        // unlisted methods still resolve to the default rule, so the terminal keeps
-        // injecting the default into cover exactly like a single-method one — the
-        // method-blind structural verdict stays sound for multi-method rules.
+        // unlisted methods resolve uniformly to the default, while listed methods
+        // have default-rule gaps outside the registered path.
         let entries = vec![(
             parse_pattern("/x").expect("pat"),
             0,
@@ -1108,7 +1183,12 @@ mod tests {
         assert_eq!(r.resolve("/x", &http::Method::GET), Some(0));
         assert_eq!(r.resolve("/x", &http::Method::HEAD), Some(0));
         assert_eq!(r.resolve("/x", &http::Method::POST), None);
-        assert_eq!(r.anchor_cover("/"), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/", &http::Method::GET), Cover::Mixed);
+        assert_eq!(r.anchor_cover("/", &http::Method::HEAD), Cover::Mixed);
+        assert_eq!(
+            r.anchor_cover("/", &http::Method::POST),
+            Cover::Uniform(DEFAULT_RULE)
+        );
     }
 
     // ── matching: precedence + backtracking (the load-bearing behavior) ───────

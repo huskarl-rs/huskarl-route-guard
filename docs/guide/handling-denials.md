@@ -47,7 +47,7 @@ than switching a check off.
 ## 3. Can the routes be redesigned to handle it?
 
 For a structural denial, check whether the affected area should select one rule
-for every path and method. If so, make that grouping explicit in the table. Work
+for every path using the request method. If so, make that grouping explicit in the table. Work
 through these checks before changing the parsing configuration:
 
 **Register the area as a whole subtree, not fragments.** An exact
@@ -57,7 +57,7 @@ reachable *other* rule, so encoded keys deny.
 [`subtree("/files", …)`](crate::RuleRouterBuilder::subtree) registers the bare
 path, the trailing slash, and the catch-all under **one rule id** — gap-free, so
 all those paths select the same rule and keys like `/files/a%2fb` can be accepted.
-This assumes no nested registrations or method restrictions divide the area.
+This assumes no nested registration changes the rule for the request method.
 
 **One policy, one registration.** Rule identity is per registration call: two
 `route` calls are two rules *even with identical policy values*, and the boundary
@@ -79,8 +79,10 @@ resolves *other* methods to the default rule unless that path also has an
 all-method rule. Different identities in either case prevent the structural check
 from accepting the area as one rule. Consider moving the method-specific endpoint
 outside the file-key prefix.
-This also applies to a lone method-qualified subtree or blob subtree: a GET-only
-blob denies structural keys even for GET because unlisted methods leave gaps.
+A lone GET-only subtree can accept GET encoded keys: unlisted methods do not
+participate in GET coverage. Adding a POST rule at the same subtree patterns also
+leaves GET coverage unchanged; adding a new, more-specific POST-only terminal does
+not.
 
 **Declare blobs when you want the guarantee.**
 [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) behaves like `subtree` at
@@ -89,7 +91,7 @@ prevent a later nested registration from making encoded keys start failing.
 It does not remove method restrictions.
 
 **Know what redesign cannot fix.** A recognized structural form in the *first* segment
-requires analysis from the root, where the whole table must select one rule
+requires analysis from the root, where the whole table must select one rule for the request method
 — so on any real multi-rule table, `/%2fadmin`-style spellings deny regardless of
 shape. Earlier escapes or uppercase under case folding can also expand the
 analyzed region, but only as far as the earlier stable prefix requires; they do

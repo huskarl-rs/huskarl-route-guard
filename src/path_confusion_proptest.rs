@@ -70,12 +70,21 @@ const CATALOG: &[(char, &str)] = &[
     // structural bytes under these flow, and every modeled normalization must agree.
     ('s', "/blob"),
     ('s', "/deep/nested"),
+    // Overlapping wildcard and literal subtrees exercise precedence changes:
+    // a new literal subtree can shadow a wildcard branch and restore uniformity.
+    ('s', "/{tenant}/private"),
+    ('s', "/files"),
+    ('s', "/{tenant}/shared"),
+    ('s', "/files/{folder}"),
 ];
 
 /// Path-segment vocabulary, mixing names that hit the catalog with structural
 /// mutators (literal and encoded separators, dot-segments, matrix-params,
 /// backslashes, NULs, overlong/double-encoded forms, and case variants).
 const VOCAB: &[&str] = &[
+    "files",
+    "private",
+    "shared",
     "admin",
     "public",
     "api",
@@ -893,17 +902,42 @@ proptest! {
         (classes, layers, case) in config_strategy(),
         path in path_strategy(),
         order_seed in any::<u64>(),
+        method_qualified in any::<bool>(),
+        method_masks in prop::collection::vec(0u8..32, CATALOG.len()),
+        request_method in 0u8..6,
     ) {
         // Under a case-folding backend the catalog (lowercase) builds fine; an
         // unbuildable subset (matchit conflict) is simply skipped.
-        let Ok(router) = build_router(&specs, classes.clone(), layers, case) else {
+        let method = if request_method == 5 {
+            http::Method::from_bytes(b"CUSTOM").expect("valid method")
+        } else {
+            method_from_index(request_method)
+        };
+        let registrations = specs.iter().zip(&method_masks).enumerate().map(|(id, ((kind, path), mask))| {
+            let registration = if *kind == 's' {
+                Registration::subtree(path, id)
+            } else {
+                Registration::route(*path, id)
+            };
+            if !method_qualified || *mask == 0 {
+                registration
+            } else {
+                registration.for_methods((0u8..5).filter(|bit| mask & (1 << bit) != 0)
+                    .map(method_from_index).collect::<Vec<_>>())
+            }
+        });
+        let Ok(router) = RuleRouter::from_registrations(
+            usize::MAX,
+            GuardConfig::new(case, layers).with_structural_classes(classes.clone()),
+            registrations,
+        ) else {
             return Ok(());
         };
 
         // Rule identity via `id()`: the default rule (`None`) participates as a rule
         // of its own, so relocations onto or off it are caught like any other.
-        let raw_rule = router.raw_match_for_test(&path, &http::Method::GET).id();
-        if router.denial_for_test(&path, &http::Method::GET).is_some() {
+        let raw_rule = router.raw_match_for_test(&path, &method).id();
+        if router.denial_for_test(&path, &method).is_some() {
             return Ok(()); // denied — sound regardless of any backend
         }
 
@@ -924,14 +958,14 @@ proptest! {
                 if normalized == path {
                     continue;
                 }
-                let reloc_rule = router.raw_match_for_test(&normalized, &http::Method::GET).id();
+                let reloc_rule = router.raw_match_for_test(&normalized, &method).id();
                 prop_assert_eq!(
                     reloc_rule,
                     raw_rule,
                     "BYPASS: guard allowed {:?} (rule {:?}) but backend {:?} applying {:?} \
                      normalizes it to {:?}, which routes to rule {:?} — table {:?}, \
-                     classes {:?}, case {:?}",
-                    path, raw_rule, backend, order, normalized, reloc_rule, specs, classes, case
+                     classes {:?}, case {:?}, method {:?}, method masks {:?}",
+                    path, raw_rule, backend, order, normalized, reloc_rule, specs, classes, case, method, method_masks
                 );
             }
         }
@@ -1054,38 +1088,6 @@ proptest! {
                 );
             }
         }
-    }
-
-    /// Route-table monotonicity: **adding a registration never turns a deny into an
-    /// allow** — the protection scoped denial derives from the table only ever
-    /// tightens as the table grows. The proof hinge: a fresh-id registration that
-    /// completes a subtree's coverage (removing the default fall-through from its
-    /// reachable set) necessarily joins its *own* id into that set instead, so it can
-    /// never manufacture uniformity for an existing rule.
-    #[test]
-    fn adding_a_registration_never_relaxes(
-        specs in specs_strategy(),
-        (classes, layers, case) in config_strategy(),
-        path in path_strategy(),
-    ) {
-        if specs.len() < 2 {
-            return Ok(());
-        }
-        // `build_router` assigns ids in order, so dropping the *last* registration
-        // leaves the smaller table's ids identical to the larger one's prefix.
-        let smaller = &specs[..specs.len() - 1];
-        let (Ok(small), Ok(big)) = (
-            build_router(smaller, classes.clone(), layers, case),
-            build_router(&specs, classes, layers, case),
-        ) else {
-            return Ok(()); // an unbuildable subset (matchit conflict) — skip
-        };
-        prop_assert!(
-            small.denial_for_test(&path, &http::Method::GET).is_none()
-                || big.denial_for_test(&path, &http::Method::GET).is_some(),
-            "adding {:?} turned a deny into an allow on {:?} (table {:?})",
-            specs.last(), path, specs
-        );
     }
 
     /// Robustness: building with an arbitrary pattern, and matching/judging an

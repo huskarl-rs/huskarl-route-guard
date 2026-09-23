@@ -35,8 +35,16 @@ regression coverage, not a formal proof over arbitrary paths and orders.
 
 The owned route matcher is tested independently against `matchit`. The end-to-end
 property tests then compare raw and transformed paths using that matcher. Additional
-properties check that stricter configurations only add denials, adding a registration
-never turns a denial into an allow, and clean paths continue to flow.
+properties check that stricter configurations only add denials and clean paths
+continue to flow. Generated route tables include overlapping literal and wildcard
+subtrees, with all-method rules and generated method restrictions. The relocation
+property holds the request method fixed while transforming the path, including a
+custom method absent from the registrations. Regression tests cover uniform
+method-specific subtrees, same-path method overrides, and default-rule gaps created
+by more-specific paths. A regression test checks that adding a literal subtree can turn a denial
+into acceptance by shadowing a wildcard branch, while preserving agreement between
+the raw and decoded paths. Exclusive-subtree tests cover overriding paths, unrelated
+routes, and lower-priority fallbacks in both registration orders.
 
 Coverage-guided fuzz targets exercise the scanner, the matcher differential, and the
 end-to-end relocation property. Committed regression inputs keep previously discovered

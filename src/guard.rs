@@ -84,7 +84,7 @@ impl PathConfusionGuard {
         match self.mode {
             GuardMode::Disabled => None,
             GuardMode::RejectAmbiguous => self
-                .positional_deny(path)
+                .positional_deny(path, method)
                 .or_else(|| self.case_fold_deny(path, method))
                 .or_else(|| self.content_decode_deny(path, method))
                 .or_else(|| self.custom_probe_deny(path)),
@@ -137,7 +137,7 @@ impl PathConfusionGuard {
     /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
     /// [`case_fold_deny`](Self::case_fold_deny) instead, so an uppercase byte alone
     /// never denies positionally (only an actual fold relocation does).
-    fn positional_deny(&self, path: &str) -> Option<ResolveError> {
+    fn positional_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
         let enabled = self.enabled.without(ClassSet::CASE);
         let scan = scan(path, enabled, self.enc);
         let present = scan.classes.intersect(enabled);
@@ -156,8 +156,8 @@ impl PathConfusionGuard {
             return Some(ResolveError::Structural(primary_class(present)));
         };
         let anchor = self.anchor_for(path, &scan, offset);
-        let matched = self.router.route_id(path).unwrap_or(DEFAULT_RULE);
-        if self.router.anchor_cover(anchor) == Cover::Uniform(matched) {
+        let matched = self.router.resolve(path, method).unwrap_or(DEFAULT_RULE);
+        if self.router.anchor_cover(anchor, method) == Cover::Uniform(matched) {
             None
         } else {
             Some(ResolveError::Structural(primary_class(present)))
@@ -598,9 +598,8 @@ mod tests {
     }
 
     /// A method-qualified route inside an otherwise-uniform subtree resolves other
-    /// methods to the default rule, so the subtree is not uniform and boundary-shift
-    /// bytes keep denying — the guard is method-blind, and this is what keeps that
-    /// sound.
+    /// methods to the default rule at that path. Its new identity for POST and its
+    /// default-rule gap for GET both keep the surrounding region mixed.
     #[test]
     fn method_only_route_keeps_subtree_denying() {
         let entries = vec![

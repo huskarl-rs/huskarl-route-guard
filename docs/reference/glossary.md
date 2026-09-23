@@ -77,8 +77,8 @@ the *anchor*. See
 [How the guard decides](crate::_docs::explanation::decision) for its calculation.
 
 **Structural ambiguity check / scoped structural check** — reject a recognized
-structural form unless every path and method in the analyzed region selects the
-same rule. The analyzed region can be broader than actual parsing results, so
+structural form unless every path in the analyzed region selects the
+same rule for the request method. The analyzed region can be broader than actual parsing results, so
 this check can reject requests that would keep their rule.
 
 **Exact rule-change check** — apply a supported interpretation to a copy of the

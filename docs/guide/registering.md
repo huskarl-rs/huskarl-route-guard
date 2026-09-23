@@ -50,16 +50,55 @@ for the executable example and precedence rules.
 
 ## Register areas that accept encoded keys
 
-If one rule applies to an entire file-key prefix for all methods, use
+If one rule applies to an entire file-key prefix for the methods it serves, use
 `exclusive_subtree("/files", rule)`. Encoded slashes such as `/files/a%2fb` can then be
 accepted when every supported interpretation stays in that rule. The exclusive
-declaration prevents later registrations from adding more-specific paths beneath
-it. Use `subtree` instead if nested routes are intentional.
+declaration rejects more-specific paths that can take precedence beneath it,
+regardless of registration order. This includes overlaps between literal and
+wildcard branches: `exclusive_subtree("/{tenant}", rule)` cannot coexist with
+`route("/files/private", other_rule)`. Unrelated routes and lower-priority fallback
+routes remain valid. Method-specific rules at the same path patterns remain valid;
+exclusivity restricts nested paths, not method slots. Use `subtree` instead if nested
+routes are intentional.
 
-Check method restrictions before relying on this tolerance. A GET-only subtree,
-including a GET-only exclusive subtree, denies structural keys even for GET: other methods fall
-through to the default, so the region is not covered by one rule for every method.
-Only register an all-method rule when its policy is appropriate for every method.
+Restrict the registration to the methods its policy serves. Structural checks use
+the request method, so a GET-only subtree can accept GET encoded keys. For example:
+
+```rust
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+
+let router = RuleRouter::builder("default", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .register(Registration::exclusive_subtree("/files", "read-files").for_methods([http::Method::GET, http::Method::HEAD]))
+    .build()
+    .expect("valid routes");
+assert_eq!(*router.resolve("/files/a%2fb", &http::Method::GET).unwrap().rule(), "read-files");
+assert!(router.resolve("/files/a%2fb", &http::Method::POST).unwrap().is_default());
+```
+
+An accepted POST in this example still requires enforcement of the default policy.
+Adding a POST rule at the same subtree patterns does not change GET coverage.
+Adding a more-specific POST-only path under an ordinary subtree can change GET
+coverage: GET selects the default at that path, rather than the ancestor's GET rule.
+
+## Correct a route-table build error
+
+Use the pattern and reason in the build error to locate the registration. Consult
+the [forbidden-registration examples](crate::_docs::reference::routing) for the
+exact restrictions.
+
+- For a grammar error, use whole-segment parameters and put catch-alls last. Escape
+  literal braces as `{{` and `}}`.
+- For a duplicate path/method slot, remove the duplicate or combine its method sets
+  without repetitions. Changing a parameter name or repeating the same rule value
+  does not make a second registration distinct at that routing position.
+- For an empty pattern or method set, fix the input that generated it or omit the
+  registration.
+- For a non-canonical literal, register the canonical spelling that the configured
+  parsing model expects. Keep uppercase parameter names if useful; only literal
+  request-path bytes participate in this check.
+- For an exclusive-subtree conflict, remove or move the overlapping route. If the
+  exception is intentional, change the exclusive declaration to `subtree`, then
+  recheck encoded-key requests because the new rule boundary can add denials.
 
 ## Verify the table through `resolve`
 
