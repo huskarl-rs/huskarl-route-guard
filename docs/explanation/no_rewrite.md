@@ -40,7 +40,7 @@ allowed. This crate therefore does not offer a “normalize and forward” mode.
 
 When the downstream behavior is uncertain, declare the broader supported
 interpretation set or use
-[`reject_non_canonical`](crate::path_confusion::PathConfusion::reject_non_canonical)
+[`RequireCanonical`](crate::config::GuardMode::RequireCanonical)
 if legitimate traffic permits it. That strict mode reduces exposure to recognized
 non-canonical forms; it does not certify an otherwise unknown deployment. See
 [Supported path interpretations](crate::_docs::reference::coverage) for the boundary

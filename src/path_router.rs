@@ -17,19 +17,15 @@
 //!
 //! [`RuleRouter::builder`] is the intended way to construct one: its
 //! [`route`](RuleRouterBuilder::route) / [`subtree`](RuleRouterBuilder::subtree) /
-//! [`blob_subtree`](RuleRouterBuilder::blob_subtree) methods expand subtree patterns
-//! internally. The registration-level [`RuleRouter::build`] remains for callers that
+//! [`exclusive_subtree`](RuleRouterBuilder::exclusive_subtree) methods expand subtree patterns
+//! internally. The registration-level [`RuleRouter::from_registrations`] remains for callers that
 //! assemble [`Registration`]s inside a builder of their own (as huskarl-pingora's
 //! `Guard`/`LoginProxy` do); rule ids are assigned from registration order, so the
 //! rule-granularity contract holds by construction on both paths.
 
-use bon::bon;
-
 use crate::{
+    config::{GuardConfig, GuardMode, ResolveError},
     guard::PathConfusionGuard,
-    path_confusion::{
-        CaseSensitivity, DecodeLayers, DenyReason, GuardConfig, PathConfusion, StructuralClasses,
-    },
     route_tree::{BuildError, LowerError, MethodMatch, Router, Segment, lower_matchit},
     structural::{classes_present, enabled_classes, enabled_encodings},
 };
@@ -104,7 +100,7 @@ pub enum RuleRouterError {
         pattern: String,
     },
     /// A registered pattern contains ASCII uppercase under
-    /// [`CaseSensitivity::Insensitive`]. A case-folding backend resolves it to lowercase,
+    /// [`CaseSensitivity::Insensitive`](crate::CaseSensitivity::Insensitive). A case-folding backend resolves it to lowercase,
     /// so a differently-cased request could reach it without the matched rule's checks.
     NonCanonicalCase {
         /// The offending pattern.
@@ -138,7 +134,7 @@ impl std::fmt::Display for RuleRouterError {
                 "route pattern {pattern:?} is non-canonical — it carries a recognized structural form \
                  (%2F, .., //, ;, …) the path-confusion guard treats as route structure, so \
                  requests to it would always be denied; register the canonical pattern, or \
-                 disable path_confusion"
+                 set GuardMode::Disabled only if checks are enforced elsewhere"
             ),
             Self::NonCanonicalCase { pattern } => write!(
                 f,
@@ -163,31 +159,43 @@ impl std::fmt::Display for RuleRouterError {
 impl std::error::Error for RuleRouterError {}
 
 /// One registration: a group of patterns sharing one rule — the crate's unit of **rule
-/// identity**. [`RuleRouter::build`] assigns each registration the rule id equal to its
+/// identity**. [`RuleRouter::from_registrations`] assigns each registration the rule id equal to its
 /// position, so identity is a fact of the input's shape rather than a contract the
 /// caller must uphold: patterns in one registration can never end up under different
 /// rules, and a rule can never be silently detached from its patterns.
 ///
 /// Construct via [`route`](Self::route) / [`subtree`](Self::subtree) /
-/// [`blob_subtree`](Self::blob_subtree) (mirroring the builder methods), qualified with
-/// [`for_methods`](Self::for_methods) where the rule is method-specific — or fill the
-/// fields directly for full control.
+/// [`exclusive_subtree`](Self::exclusive_subtree) (mirroring the builder methods), qualified with
+/// [`for_methods`](Self::for_methods) where the rule is method-specific — or
+/// use [`patterns`](Self::patterns) to group several patterns under one identity.
 #[derive(Clone, Debug)]
 pub struct Registration<R> {
     /// The `matchit`-style patterns this registration covers, all under one rule id.
     /// Must contain at least one pattern; an empty list is rejected at build time.
-    pub patterns: Vec<String>,
+    pub(crate) patterns: Vec<String>,
     /// The rule every pattern resolves to.
-    pub rule: R,
-    /// Declares the catch-all tail an **opaque** blob key space (see
-    /// [`RuleRouterBuilder::blob_subtree`]). Ignored for patterns without a catch-all.
-    pub opaque: bool,
+    pub(crate) rule: R,
+    /// Forbids nested paths beneath a catch-all. Set only by `exclusive_subtree`.
+    pub(crate) opaque: bool,
     /// Which method(s) the rule applies to. Path precedence is resolved before this
     /// value; see [`MethodMatch`].
-    pub method: MethodMatch,
+    pub(crate) method: MethodMatch,
 }
 
 impl<R> Registration<R> {
+    /// Groups patterns under one rule identity.
+    ///
+    /// Unlike separate registrations, changes between these patterns do not
+    /// cross a rule boundary. An empty iterator is rejected when building.
+    pub fn patterns(patterns: impl IntoIterator<Item = impl Into<String>>, rule: R) -> Self {
+        Self {
+            patterns: patterns.into_iter().map(Into::into).collect(),
+            rule,
+            opaque: false,
+            method: MethodMatch::Any,
+        }
+    }
+
     /// A single exact-match pattern (the row-level [`RuleRouterBuilder::route`]).
     pub fn route(pattern: impl Into<String>, rule: R) -> Self {
         Self {
@@ -210,9 +218,10 @@ impl<R> Registration<R> {
         }
     }
 
-    /// Like [`subtree`](Self::subtree), with the catch-all tail declared an opaque
-    /// blob key space (the row-level [`RuleRouterBuilder::blob_subtree`]).
-    pub fn blob_subtree(path: &str, rule: R) -> Self {
+    /// Like [`subtree`](Self::subtree), but rejects nested paths at build time.
+    /// Request-time checks are unchanged. Method restrictions can still introduce
+    /// default-rule gaps; see [`for_methods`](Self::for_methods).
+    pub fn exclusive_subtree(path: &str, rule: R) -> Self {
         Self {
             opaque: true,
             ..Self::subtree(path, rule)
@@ -223,7 +232,7 @@ impl<R> Registration<R> {
     /// an array, or a `Vec` of them — all under the registration's single rule id.
     /// Path precedence is resolved before method matching; see [`MethodMatch`].
     /// Structural coverage spans all methods: restricting a subtree (including a
-    /// blob subtree) introduces default-rule gaps for other methods, so structural
+    /// exclusive subtree) introduces default-rule gaps for other methods, so structural
     /// keys can be denied even for a listed method. See
     /// [Registering routes](crate::_docs::guide::registering).
     #[must_use]
@@ -249,72 +258,59 @@ impl<R> std::fmt::Debug for RuleRouter<R> {
 }
 
 impl<R> RuleRouter<R> {
-    /// Builds the router from [`Registration`]s. Each registration's patterns share
-    /// one rule id — its position in `registrations` — so rule identity holds by
-    /// construction; there is no id contract for the caller to get wrong.
+    /// Starts a route table with an explicit default rule and guard configuration.
     ///
-    /// This is the **registration-level** entry point, for callers that assemble
-    /// [`Registration`]s inside a builder of their own (as huskarl-pingora's
-    /// `Guard`/`LoginProxy` do). Everyone else should prefer [`RuleRouter::builder`],
-    /// whose methods construct the registrations internally.
-    /// Use [`build_with_config`](Self::build_with_config) to pass deployment
-    /// settings as a reusable [`GuardConfig`].
+    /// Both required parsing assumptions are supplied through [`GuardConfig::new`].
+    /// Add paths with the builder's helpers or [`register`](RuleRouterBuilder::register).
     ///
-    /// Runs the build-time canonical-pattern checks unless the guard is `Off`: a pattern
-    /// that itself carries an enabled structural form is rejected
-    /// ([`RuleRouterError::NonCanonical`]), and under [`CaseSensitivity::Insensitive`] an
-    /// uppercase pattern is rejected ([`RuleRouterError::NonCanonicalCase`]). Each pattern
-    /// is then lowered into the route grammar; an unrepresentable pattern is a
-    /// [`RuleRouterError::Route`].
+    /// ```
+    /// use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
     ///
-    /// # Errors
-    ///
-    /// Returns a [`RuleRouterError`] for an invalid, conflicting, or non-canonical
-    /// pattern, a registration with no patterns ([`RuleRouterError::EmptyPatternSet`]),
-    /// or one with an empty [`MethodMatch::OneOf`]
-    /// ([`RuleRouterError::EmptyMethodSet`]) — either of which would silently match
-    /// nothing.
-    pub fn build(
-        registrations: Vec<Registration<R>>,
-        default: R,
-        path_confusion: PathConfusion,
-        structural_classes: StructuralClasses,
-        decode_layers: DecodeLayers,
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Self, RuleRouterError> {
-        Self::build_with_config(
-            registrations,
+    /// let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+    /// let router = RuleRouter::builder("public", config)
+    ///     .subtree("/admin", "admin")
+    ///     .build()
+    ///     .expect("valid routes");
+    /// assert_eq!(
+    ///     *router
+    ///         .resolve("/admin/users", &http::Method::GET)
+    ///         .unwrap()
+    ///         .rule(),
+    ///     "admin"
+    /// );
+    /// ```
+    pub fn builder(default: R, config: GuardConfig) -> RuleRouterBuilder<R> {
+        RuleRouterBuilder {
+            registrations: Vec::new(),
             default,
-            GuardConfig {
-                path_confusion,
-                structural_classes,
-                decode_layers,
-                case_sensitivity,
-            },
-        )
+            config,
+        }
     }
 
-    /// Builds from registrations and a reusable deployment configuration.
+    /// Builds a route table from an iterator of registrations.
     ///
-    /// Equivalent to [`build`](Self::build), with the four guard settings grouped
-    /// into one value. Clone the configuration to share assumptions across routers.
+    /// Each registration receives one identity, shared by all its patterns.
+    /// This is equivalent to `builder(default, config).register_all(registrations).build()`.
     ///
     /// # Errors
     ///
-    /// Returns the same registration and canonical-pattern errors as [`build`](Self::build).
-    pub fn build_with_config(
-        registrations: Vec<Registration<R>>,
+    /// Rejects invalid or conflicting patterns, empty pattern or method sets,
+    /// and nested paths beneath an exclusive subtree. When checks are enabled,
+    /// also rejects structural forms in literals and uppercase literals under
+    /// case-insensitive parsing.
+    pub fn from_registrations(
         default: R,
         config: GuardConfig,
+        registrations: impl IntoIterator<Item = Registration<R>>,
     ) -> Result<Self, RuleRouterError> {
         let GuardConfig {
-            path_confusion,
+            mode,
             ref structural_classes,
-            decode_layers,
+            decode_depth,
             case_sensitivity,
         } = config;
         let byte_enabled = enabled_classes(structural_classes);
-        let enc = enabled_encodings(structural_classes, decode_layers);
+        let enc = enabled_encodings(structural_classes, decode_depth);
 
         let mut tree_entries = Vec::new();
         // Patterns parallel to `tree_entries`, kept so a tree build failure can be
@@ -350,7 +346,7 @@ impl<R> RuleRouter<R> {
                 // never present it as written. Parameter names are route metadata, not
                 // request-path bytes, so inspect the lowered literals rather than the
                 // source pattern.
-                if path_confusion != PathConfusion::Off {
+                if mode != GuardMode::Disabled {
                     let literals = lowered.segments.iter().filter_map(|segment| match segment {
                         Segment::Literal(literal) => Some(literal.as_str()),
                         Segment::Wildcard | Segment::CatchAll => None,
@@ -393,11 +389,9 @@ impl<R> RuleRouter<R> {
     /// `Ok` carries the [`RuleMatch`]: the matched registration's rule,
     /// or the default rule for a path no registration covers.
     ///
-    /// This is the intended entry point for request handling: it cannot be called
-    /// without the guard running. [`match_rule_unchecked`](Self::match_rule_unchecked) and
-    /// [`ambiguous`](Self::ambiguous) expose the two halves separately for callers
-    /// that need them apart (e.g. logging the raw-path rule even on a denial) — if you
-    /// use those, *you* are responsible for consulting both on every request.
+    /// This is the request-handling entry point and always runs the configured checks.
+    /// Use [`inspect_raw`](Self::inspect_raw) only to log the original path's match,
+    /// including when this method denies the request.
     ///
     /// # The path argument
     ///
@@ -405,26 +399,26 @@ impl<R> RuleRouter<R> {
     /// request-target. Input is validated before the guard runs: it must start with `/`
     /// (or be the special `*` request target) and must not contain `?` or `#`. Passing a
     /// full request-target such as `/admin?x=1`, or an absolute URI, returns
-    /// [`DenyReason::InvalidPathInput`] rather than falling through to the default rule.
+    /// [`ResolveError::InvalidPathInput`] rather than falling through to the default rule.
     ///
     /// # Errors
     ///
-    /// The guard's [`DenyReason`] names the check and byte class that fired.
-    /// [`message`](DenyReason::message) is the short static string for the denial
+    /// The guard's [`ResolveError`] names the check and byte class that fired.
+    /// [`message`](ResolveError::message) is the short static string for the denial
     /// response body; its `Display` is the attributed line for the *log*, so an
     /// operator can trace a `400` to the configuration knob or registration that
     /// governs it. See [Handling a denial](crate::_docs::guide::handling_denials)
     /// for the response to each reason.
     ///
-    /// [`DenyReason::InvalidRuleId`] indicates an internal invariant violation
+    /// [`ResolveError::InvalidRuleId`] indicates an internal invariant violation
     /// and should be reported as a server error, not a client `400`.
     pub fn resolve(
         &self,
         path: &str,
         method: &http::Method,
-    ) -> Result<RuleMatch<'_, R>, DenyReason> {
+    ) -> Result<RuleMatch<'_, R>, ResolveError> {
         if !is_request_path(path) {
-            return Err(DenyReason::InvalidPathInput);
+            return Err(ResolveError::InvalidPathInput);
         }
         match self.guard.verdict(path, method) {
             Some(reason) => Err(reason),
@@ -432,60 +426,59 @@ impl<R> RuleRouter<R> {
         }
     }
 
-    /// Matches `path`, returning the [`RuleMatch`]: the matched registration's rule,
-    /// or the default rule for a path no registration covers.
+    /// Inspects raw path matching for diagnostics, without checking ambiguity.
     ///
-    /// This is the raw match half only — it performs neither input validation nor a
-    /// path-confusion check. Prefer [`resolve`](Self::resolve), which does both. The
-    /// `_unchecked` suffix is intentional: this method can authorize a path the backend
-    /// interprets differently, and exists for diagnostics, tests, and callers that have
-    /// already performed both checks themselves.
+    /// Use this to log which rule the original spelling selects, including on a
+    /// denied request. A successful inspection is **not** permission to authorize
+    /// or forward: request handling must use [`resolve`](Self::resolve).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the route tree returns an invalid rule ID, which indicates an
-    /// internal invariant violation. [`resolve`](Self::resolve) returns
-    /// [`DenyReason::InvalidRuleId`] for that failure instead.
-    #[expect(
-        clippy::expect_used,
-        reason = "the unchecked diagnostic API cannot return an error; an invalid ID must never authorize the default rule"
-    )]
-    pub fn match_rule_unchecked(&self, path: &str, method: &http::Method) -> RuleMatch<'_, R> {
+    /// Returns [`ResolveError::InvalidPathInput`] for a non-path input or
+    /// [`ResolveError::InvalidRuleId`] for an internal invariant failure.
+    pub fn inspect_raw(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Result<RuleMatch<'_, R>, ResolveError> {
+        if !is_request_path(path) {
+            return Err(ResolveError::InvalidPathInput);
+        }
         self.matched_rule(path, method)
-            .expect("route tree returned an invalid rule ID")
+    }
+
+    // The reference backend needs to route transformed inputs even when they are
+    // outside the public request-path boundary.
+    #[cfg(test)]
+    pub(crate) fn raw_match_for_test(&self, path: &str, method: &http::Method) -> RuleMatch<'_, R> {
+        self.matched_rule(path, method)
+            .expect("valid test rule table")
     }
 
     fn matched_rule(
         &self,
         path: &str,
         method: &http::Method,
-    ) -> Result<RuleMatch<'_, R>, DenyReason> {
+    ) -> Result<RuleMatch<'_, R>, ResolveError> {
         match self.guard.resolve(path, method) {
             Some(id) => self
                 .rules
                 .get(id as usize)
                 .map(|rule| RuleMatch::Matched { id, rule })
-                .ok_or(DenyReason::InvalidRuleId),
+                .ok_or(ResolveError::InvalidRuleId),
             None => Ok(RuleMatch::Default {
                 rule: &self.default,
             }),
         }
     }
 
-    /// Path-confusion verdict. Returns `Some(reason)` if `path` should be denied for
-    /// `method`. The verdict re-routes the path internally, so the caller's matched rule
-    /// id is not needed.
-    ///
-    /// The verdict half only — pair it with
-    /// [`match_rule_unchecked`](Self::match_rule_unchecked), or use
-    /// [`resolve`](Self::resolve), which runs both. This method performs the same input
-    /// validation as `resolve`.
-    pub fn ambiguous(&self, path: &str, method: &http::Method) -> Option<DenyReason> {
-        if is_request_path(path) {
-            self.guard.verdict(path, method)
-        } else {
-            Some(DenyReason::InvalidPathInput)
-        }
+    #[cfg(test)]
+    pub(crate) fn denial_for_test(
+        &self,
+        path: &str,
+        method: &http::Method,
+    ) -> Option<ResolveError> {
+        self.resolve(path, method).err()
     }
 
     /// The anchor the structural verdict reasons over for `path` — the prefix no
@@ -503,221 +496,90 @@ fn is_request_path(path: &str) -> bool {
     (path.starts_with('/') || path == "*") && !path.bytes().any(|b| matches!(b, b'?' | b'#'))
 }
 
-#[bon]
-impl<R> RuleRouter<R> {
-    /// Builds the router configured on this builder — the terminal step of
-    /// [`RuleRouter::builder`].
-    ///
-    /// Register rules with the builder's [`route`](RuleRouterBuilder::route),
-    /// [`subtree`](RuleRouterBuilder::subtree), and
-    /// [`blob_subtree`](RuleRouterBuilder::blob_subtree) methods (plus their
-    /// method-qualified `*_for` variants, which take one method or several — all under
-    /// that registration's single rule id). Each call is one [`Registration`]: subtree
-    /// patterns expand internally, and rule ids are registration positions, so rule
-    /// identity holds by construction.
+/// A route table under construction.
+///
+/// Create with [`RuleRouter::builder`]. Configuration and the default are required
+/// up front, so every builder can be finished or extended in a loop.
+pub struct RuleRouterBuilder<R> {
+    registrations: Vec<Registration<R>>,
+    default: R,
+    config: GuardConfig,
+}
+
+impl<R> RuleRouterBuilder<R> {
+    /// Adds one registration. Its patterns and methods share one rule identity.
     ///
     /// ```
     /// use huskarl_route_guard::{
-    ///     RuleRouter,
-    ///     path_confusion::{CaseSensitivity, DecodeLayers},
+    ///     CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter,
     /// };
     ///
-    /// let router = RuleRouter::builder()
-    ///     .default("default-rule")
-    ///     .case_sensitivity(CaseSensitivity::Sensitive)
-    ///     .decode_layers(DecodeLayers::Single)
-    ///     .subtree("/admin", "admin-rule")
-    ///     .route("/health", "health-rule")
-    ///     .build()
-    ///     .expect("valid route table");
-    ///
-    /// let matched = router
-    ///     .resolve("/admin/users", &http::Method::GET)
-    ///     .expect("clean path");
-    /// assert_eq!(*matched.rule(), "admin-rule");
+    /// let router = RuleRouter::builder(
+    ///     "default",
+    ///     GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+    /// )
+    /// .register(
+    ///     Registration::route("/health", "health")
+    ///         .for_methods([http::Method::GET, http::Method::HEAD]),
+    /// )
+    /// .register(Registration::patterns(["/ready", "/live"], "probes"))
+    /// .build()
+    /// .expect("valid routes");
+    /// assert_eq!(
+    ///     router.resolve("/ready", &http::Method::GET).unwrap().id(),
+    ///     router.resolve("/live", &http::Method::GET).unwrap().id()
+    /// );
     /// ```
+    #[must_use]
+    pub fn register(mut self, registration: Registration<R>) -> Self {
+        self.registrations.push(registration);
+        self
+    }
+
+    /// Adds registrations in iteration order, preserving each one's identity.
+    #[must_use]
+    pub fn register_all(
+        mut self,
+        registrations: impl IntoIterator<Item = Registration<R>>,
+    ) -> Self {
+        self.registrations.extend(registrations);
+        self
+    }
+
+    /// Registers an exact path or whole-segment pattern, such as `/users/{id}`.
+    /// Use [`subtree`](Self::subtree) to include descendants.
+    #[must_use]
+    pub fn route(self, pattern: impl Into<String>, rule: R) -> Self {
+        self.register(Registration::route(pattern, rule))
+    }
+
+    /// Registers a prefix and its descendants under one rule identity.
     ///
-    /// A table whose size is only known at runtime — a config file, a tenant list —
-    /// registers in bulk via [`routes`](RuleRouterBuilder::routes) /
-    /// [`subtrees`](RuleRouterBuilder::subtrees). And because every registration method
-    /// is **state-preserving** (generic over the builder's typestate), mixed-kind
-    /// dynamic tables can also just reassign the builder in a loop:
+    /// `/files` includes `/files`, `/files/`, and descendants.
+    /// A trailing slash in the input excludes the bare path. More-specific
+    /// registrations take precedence. See [Routing behavior](crate::_docs::reference::routing).
+    #[must_use]
+    pub fn subtree(self, path: &str, rule: R) -> Self {
+        self.register(Registration::subtree(path, rule))
+    }
+
+    /// Registers a subtree and forbids more-specific paths beneath it.
     ///
-    /// ```
-    /// # use huskarl_route_guard::{
-    /// #     RuleRouter,
-    /// #     path_confusion::{CaseSensitivity, DecodeLayers},
-    /// # };
-    /// let configured = vec![("/admin", "admin-rule"), ("/api", "api-rule")];
-    ///
-    /// let router = RuleRouter::builder()
-    ///     .default("default-rule")
-    ///     .case_sensitivity(CaseSensitivity::Sensitive)
-    ///     .decode_layers(DecodeLayers::Single)
-    ///     .subtrees(configured)
-    ///     .build()
-    ///     .expect("valid route table");
-    /// # assert!(router.resolve("/api/v1", &http::Method::GET).is_ok());
-    /// ```
+    /// Exclusivity is checked at build time; request-time checks are the same as
+    /// [`subtree`](Self::subtree). It does not disable checks or guarantee tolerance
+    /// when method restrictions introduce other rule identities.
+    #[must_use]
+    pub fn exclusive_subtree(self, path: &str, rule: R) -> Self {
+        self.register(Registration::exclusive_subtree(path, rule))
+    }
+
+    /// Validates the registrations and constructs the router.
     ///
     /// # Errors
     ///
-    /// Returns a [`RuleRouterError`] for an invalid, conflicting, or non-canonical
-    /// pattern — the same build-time checks as [`RuleRouter::build`].
-    #[builder(state_mod(vis = "pub"))]
-    pub fn new(
-        #[builder(field)] registrations: Vec<Registration<R>>,
-        /// The rule for paths that match no registered route.
-        default: R,
-        /// Which path-confusion guard to apply. Defaults to
-        /// [`PathConfusion::RejectStructural`].
-        #[builder(default)]
-        path_confusion: PathConfusion,
-        /// The structural classes and encodings the guard recognises beyond the
-        /// always-on quartet. Defaults to [`StructuralClasses::new`].
-        #[builder(default)]
-        structural_classes: StructuralClasses,
-        /// Whether more than one percent-decode pass can happen behind this layer
-        /// (a CDN/WAF/proxy decoding in front of the origin) — a **required**
-        /// declaration with no default (see [`DecodeLayers`]). When unsure, declare
-        /// [`UpToTwo`](DecodeLayers::UpToTwo): within the supported model it can only
-        /// add denials.
-        decode_layers: DecodeLayers,
-        /// Whether the upstream resolves paths case-sensitively — a **required**
-        /// declaration with no default (see [`CaseSensitivity`]).
-        case_sensitivity: CaseSensitivity,
-    ) -> Result<Self, RuleRouterError> {
-        Self::build(
-            registrations,
-            default,
-            path_confusion,
-            structural_classes,
-            decode_layers,
-            case_sensitivity,
-        )
-    }
-}
-
-impl<R, S: rule_router_builder::State> RuleRouterBuilder<R, S> {
-    /// Registers a single exact-match route pattern with an associated rule.
-    ///
-    /// Patterns use `matchit` syntax (`/users/{id}`, `/files/{*rest}`). This matches the
-    /// given path *exactly* — `route("/admin", …)` does not cover `/admin/` or
-    /// `/admin/users`. To apply a rule to a path and everything beneath it (the usual
-    /// intent for an authorization layer), prefer [`subtree`](Self::subtree).
-    pub fn route(self, pattern: impl Into<String>, rule: R) -> Self {
-        self.push(Registration::route(pattern, rule))
-    }
-
-    /// Like [`route`](Self::route), but the rule applies only to the given `method`(s)
-    /// — a bare [`http::Method`], an array, or a `Vec` of them, all under this one
-    /// registration's rule id (so `[GET, HEAD]` is one rule, not two). Other methods
-    /// on the same path fall through to any method-wildcard rule registered for it,
-    /// else the default rule. Path precedence is resolved first: a method mismatch on
-    /// this route does **not** fall back to a less-specific wildcard or catch-all route.
-    /// See [`MethodMatch`] for the complete rule.
-    pub fn route_for(
-        self,
-        method: impl Into<MethodMatch>,
-        pattern: impl Into<String>,
-        rule: R,
-    ) -> Self {
-        self.push(Registration::route(pattern, rule).for_methods(method))
-    }
-
-    /// Registers a batch of [`route`](Self::route)s — one `(pattern, rule)` registration
-    /// per item, each under its own rule id. For route tables whose size is only known
-    /// at runtime (a config file, a tenant list).
-    pub fn routes<P>(mut self, routes: impl IntoIterator<Item = (P, R)>) -> Self
-    where
-        P: Into<String>,
-    {
-        for (pattern, rule) in routes {
-            self = self.push(Registration::route(pattern, rule));
-        }
-        self
-    }
-
-    /// Applies a rule to a path **and everything beneath it**.
-    ///
-    /// This is the recommended way to protect an area of the URL space: matching only an
-    /// exact path (via [`route`](Self::route)) is a common source of authorization gaps,
-    /// because a request to `/admin/` or `/admin/users` would otherwise fall through to
-    /// the default rule. The path expands via [`subtree_patterns`](crate::subtree_patterns),
-    /// every pattern sharing one rule id — so movement *within* the subtree is never a
-    /// relocation to the path-confusion guard:
-    ///
-    /// - `subtree("/admin", …)`  covers `/admin`, `/admin/`, and `/admin/...`
-    /// - `subtree("/admin/", …)` covers `/admin/` and `/admin/...` (not bare `/admin`)
-    /// - `subtree("/", …)` covers the entire path space
-    ///
-    /// A more-specific [`route`](Self::route) still takes precedence over the subtree's
-    /// catch-all, so exact carve-outs can be layered on top.
-    pub fn subtree(self, path: &str, rule: R) -> Self {
-        self.push(Registration::subtree(path, rule))
-    }
-
-    /// Like [`subtree`](Self::subtree), but the rule applies only to the given
-    /// `method`(s) — a bare [`http::Method`], an array, or a `Vec` of them, all under
-    /// this one registration's rule id. Path precedence is resolved before method
-    /// matching; see [`MethodMatch`].
-    ///
-    /// Structural coverage spans all methods, so unlisted methods introduce
-    /// default-rule gaps and structural keys can be denied even for listed methods.
-    /// See [`Registration::for_methods`].
-    pub fn subtree_for(self, method: impl Into<MethodMatch>, path: &str, rule: R) -> Self {
-        self.push(Registration::subtree(path, rule).for_methods(method))
-    }
-
-    /// Registers a batch of [`subtree`](Self::subtree)s — one `(path, rule)`
-    /// registration per item, each subtree under its own rule id. For route tables whose
-    /// size is only known at runtime (a config file, a tenant list).
-    pub fn subtrees<P>(mut self, subtrees: impl IntoIterator<Item = (P, R)>) -> Self
-    where
-        P: AsRef<str>,
-    {
-        for (path, rule) in subtrees {
-            self = self.push(Registration::subtree(path.as_ref(), rule));
-        }
-        self
-    }
-
-    /// Like [`subtree`](Self::subtree), but declares the subtree an **opaque** key
-    /// space whose uniformity is *guaranteed at build time*. Runtime tolerance is the
-    /// same for both — any fully-registered single-rule subtree tolerates
-    /// separator-like forms (`%2F`, `;`, `\`) in its keys, and dot-segments that stay
-    /// inside it, while climbs out and NUL truncation always deny.
-    /// The declaration is about *change over time*: registering a more-specific
-    /// [`route`](Self::route) or subtree **under a blob is a build error**
-    /// ([`RuleRouterError::Route`]), so a later registration cannot silently break
-    /// the uniformity and flip live opaque-key traffic to `400`s. Under a plain
-    /// [`subtree`](Self::subtree), a nested registration is allowed and (safely,
-    /// fail-closed) starts denying the affected structural keys.
-    ///
-    /// Prefer this over `subtree` for any prefix whose keys are known to carry
-    /// structural forms (object-store keys, …); use `subtree` where you may need
-    /// nested routes.
-    pub fn blob_subtree(self, path: &str, rule: R) -> Self {
-        self.push(Registration::blob_subtree(path, rule))
-    }
-
-    /// Like [`blob_subtree`](Self::blob_subtree), but the rule applies only to the
-    /// given `method`(s) — a bare [`http::Method`], an array, or a `Vec` of them, all
-    /// under this one registration's rule id. Path precedence is resolved before
-    /// method matching; see [`MethodMatch`].
-    ///
-    /// Structural coverage spans all methods. A method-qualified blob does not
-    /// guarantee encoded-key tolerance, even for its listed methods: unlisted
-    /// methods contribute default-rule gaps. The opaque flag prevents nested paths,
-    /// but does not remove those gaps. See [`Registration::for_methods`].
-    pub fn blob_subtree_for(self, method: impl Into<MethodMatch>, path: &str, rule: R) -> Self {
-        self.push(Registration::blob_subtree(path, rule).for_methods(method))
-    }
-
-    /// Push one registration; its rule id is its position, assigned at build.
-    fn push(mut self, registration: Registration<R>) -> Self {
-        self.registrations.push(registration);
-        self
+    /// Returns the errors documented on [`RuleRouter::from_registrations`].
+    pub fn build(self) -> Result<RuleRouter<R>, RuleRouterError> {
+        RuleRouter::from_registrations(self.default, self.config, self.registrations)
     }
 }
 
@@ -747,7 +609,7 @@ fn map_build_err(e: BuildError, patterns: &[String]) -> RuleRouterError {
         },
         BuildError::OpaqueTailHasSibling { at } => RuleRouterError::Route {
             pattern: at,
-            reason: "a blob_subtree has a nested route under it; remove the nested route or use subtree",
+            reason: "an exclusive_subtree has a nested route under it; remove the nested route or use subtree",
         },
     }
 }
@@ -755,12 +617,14 @@ fn map_build_err(e: BuildError, patterns: &[String]) -> RuleRouterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::path_confusion::{DenyReason, StructuralClass, StructuralClasses};
+    use crate::config::{
+        CaseSensitivity, DecodeDepth, ResolveError, StructuralClass, StructuralClasses,
+    };
 
     /// Build a router from `(pattern, rule)` rows, grouping consecutive rows with the
     /// same rule value into one [`Registration`] (rule ids are then positional, so a
     /// row's rule value equals its registration's id in these tests).
-    fn router(rows: &[(&str, u32)], pc: PathConfusion) -> Result<RuleRouter<u32>, RuleRouterError> {
+    fn router(rows: &[(&str, u32)], pc: GuardMode) -> Result<RuleRouter<u32>, RuleRouterError> {
         let mut regs: Vec<Registration<u32>> = Vec::new();
         for (pattern, rule) in rows {
             match regs.last_mut() {
@@ -768,33 +632,35 @@ mod tests {
                 _ => regs.push(Registration::route(*pattern, *rule)),
             }
         }
-        RuleRouter::build(
-            regs,
+        RuleRouter::from_registrations(
             u32::MAX,
-            pc,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
+            GuardConfig {
+                mode: pc,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            regs,
         )
     }
 
     fn denied(r: &RuleRouter<u32>, path: &str) -> bool {
-        r.ambiguous(path, &http::Method::GET).is_some()
+        r.denial_for_test(path, &http::Method::GET).is_some()
     }
 
     #[test]
     fn invalid_rule_id_denies_instead_of_authorizing_with_default() {
-        let mut r = RuleRouter::build_with_config(
-            vec![Registration::route("/admin", "protected")],
+        let mut r = RuleRouter::from_registrations(
             "public",
-            GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single),
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+            vec![Registration::route("/admin", "protected")],
         )
         .expect("build");
         // Inject an invariant violation that public construction cannot create.
         r.rules.clear();
         assert_eq!(
             r.resolve("/admin", &http::Method::GET),
-            Err(DenyReason::InvalidRuleId)
+            Err(ResolveError::InvalidRuleId)
         );
         assert!(
             r.resolve("/unmatched", &http::Method::GET)
@@ -804,30 +670,32 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "route tree returned an invalid rule ID")]
-    fn unchecked_match_does_not_hide_an_invalid_rule_id() {
-        let mut r = router(&[("/admin", 0)], PathConfusion::Off).expect("build");
+    fn raw_inspection_reports_an_invalid_rule_id() {
+        let mut r = router(&[("/admin", 0)], GuardMode::Disabled).expect("build");
         r.rules.clear();
-        let _ = r.match_rule_unchecked("/admin", &http::Method::GET);
+        assert_eq!(
+            r.inspect_raw("/admin", &http::Method::GET),
+            Err(ResolveError::InvalidRuleId)
+        );
     }
 
     #[test]
     fn method_qualified_subtrees_deny_structural_keys_for_listed_methods() {
         for registration in [
             Registration::subtree("/files", "files"),
-            Registration::blob_subtree("/files", "files"),
+            Registration::exclusive_subtree("/files", "files"),
         ] {
-            let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single);
-            let unrestricted = RuleRouter::build_with_config(
-                vec![registration.clone()],
+            let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+            let unrestricted = RuleRouter::from_registrations(
                 "default",
                 config.clone(),
+                vec![registration.clone()],
             )
             .expect("build");
-            let restricted = RuleRouter::build_with_config(
-                vec![registration.for_methods(http::Method::GET)],
+            let restricted = RuleRouter::from_registrations(
                 "default",
                 config,
+                vec![registration.for_methods(http::Method::GET)],
             )
             .expect("build");
             assert!(
@@ -837,7 +705,7 @@ mod tests {
             );
             assert_eq!(
                 restricted.resolve("/files/a%2fb", &http::Method::GET),
-                Err(DenyReason::Structural(crate::StructuralClass::Separator))
+                Err(ResolveError::Structural(crate::StructuralClass::Separator))
             );
             assert_eq!(
                 *restricted
@@ -853,7 +721,7 @@ mod tests {
     fn resolve_runs_verdict_then_match() {
         let r = router(
             &[("/admin", 0), ("/admin/", 0), ("/admin/{*rest}", 0)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
         )
         .expect("build");
         // Clean paths resolve to their rule (or the default).
@@ -870,9 +738,12 @@ mod tests {
         let denied = r.resolve("/admin%2fx", &http::Method::GET);
         assert_eq!(
             denied,
-            Err(DenyReason::Structural(StructuralClass::Separator))
+            Err(ResolveError::Structural(StructuralClass::Separator))
         );
-        assert_eq!(denied.err(), r.ambiguous("/admin%2fx", &http::Method::GET));
+        assert_eq!(
+            denied.err(),
+            r.denial_for_test("/admin%2fx", &http::Method::GET)
+        );
         // The response-body string stays coarse; the attribution is for the log.
         assert_eq!(
             denied.expect_err("denied").message(),
@@ -882,7 +753,7 @@ mod tests {
 
     #[test]
     fn resolve_rejects_non_path_input_even_when_guard_is_off() {
-        let r = router(&[("/admin", 0)], PathConfusion::Off).expect("build");
+        let r = router(&[("/admin", 0)], GuardMode::Disabled).expect("build");
         for input in [
             "/admin?x=1",
             "/admin#fragment",
@@ -892,19 +763,19 @@ mod tests {
         ] {
             assert_eq!(
                 r.resolve(input, &http::Method::GET),
-                Err(DenyReason::InvalidPathInput),
+                Err(ResolveError::InvalidPathInput),
                 "{input:?}"
             );
             assert_eq!(
-                r.ambiguous(input, &http::Method::GET),
-                Some(DenyReason::InvalidPathInput),
+                r.denial_for_test(input, &http::Method::GET),
+                Some(ResolveError::InvalidPathInput),
                 "{input:?}"
             );
         }
 
         assert!(r.resolve("*", &http::Method::OPTIONS).is_ok());
         assert!(
-            r.match_rule_unchecked("/admin?x=1", &http::Method::GET)
+            r.raw_match_for_test("/admin?x=1", &http::Method::GET)
                 .is_default(),
             "the explicitly unchecked API retains raw matcher semantics"
         );
@@ -914,19 +785,19 @@ mod tests {
     fn matches_and_defaults() {
         let r = router(
             &[("/admin", 0), ("/admin/", 0), ("/admin/{*rest}", 0)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
         )
         .expect("build");
         assert_eq!(
-            r.match_rule_unchecked("/admin", &http::Method::GET).id(),
+            r.raw_match_for_test("/admin", &http::Method::GET).id(),
             Some(0)
         );
         assert_eq!(
-            r.match_rule_unchecked("/admin/x", &http::Method::GET).id(),
+            r.raw_match_for_test("/admin/x", &http::Method::GET).id(),
             Some(0)
         );
         assert!(
-            r.match_rule_unchecked("/nope", &http::Method::GET)
+            r.raw_match_for_test("/nope", &http::Method::GET)
                 .is_default()
         );
     }
@@ -935,11 +806,11 @@ mod tests {
     fn uniform_subtree_scopes_encoded_slash() {
         // Scoped denial: a fully-registered single-rule subtree tolerates an encoded
         // slash beneath it (every reachable rule past the anchor is the matched one) —
-        // no blob_subtree declaration needed. Dot-segments anchor at the root, where
+        // no exclusive_subtree declaration needed. Dot-segments anchor at the root, where
         // this table is not uniform, so traversal still denies.
         let r = router(
             &[("/files", 0), ("/files/", 0), ("/files/{*rest}", 0)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
         )
         .expect("build");
         assert!(!denied(&r, "/files/a%2fb"));
@@ -956,7 +827,7 @@ mod tests {
                 ("/files/{*rest}", 0),
                 ("/files/secret", 1),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
         )
         .expect("build");
         assert!(denied(&r, "/files/a%2fb"));
@@ -964,7 +835,7 @@ mod tests {
 
     #[test]
     fn rejects_prefix_suffix_param() {
-        let err = router(&[("/v{ver}", 0)], PathConfusion::RejectStructural)
+        let err = router(&[("/v{ver}", 0)], GuardMode::RejectAmbiguous)
             .expect_err("prefix param rejected");
         assert!(matches!(err, RuleRouterError::Route { .. }));
     }
@@ -972,71 +843,73 @@ mod tests {
     #[test]
     fn rejects_invalid_matchit_params() {
         for pattern in ["/{}", "/{*}", "/{foo*bar}", "/files/{*rest}/"] {
-            let err = RuleRouter::builder()
-                .default(0)
-                .case_sensitivity(CaseSensitivity::Sensitive)
-                .decode_layers(DecodeLayers::Single)
-                .route(pattern, 1)
-                .build()
-                .expect_err("invalid matchit pattern must fail the build");
+            let err = RuleRouter::builder(
+                0,
+                GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+            )
+            .route(pattern, 1)
+            .build()
+            .expect_err("invalid matchit pattern must fail the build");
             assert!(matches!(err, RuleRouterError::Route { .. }), "{pattern}");
         }
     }
 
     #[test]
     fn canonicality_ignores_parameter_names() {
-        let router = RuleRouter::builder()
-            .default(0)
-            .case_sensitivity(CaseSensitivity::Insensitive)
-            .decode_layers(DecodeLayers::Single)
-            .route("/{UserId}", 1)
-            .route("/items/{x;y}", 2)
-            .build()
-            .expect("parameter names are metadata, not path bytes");
+        let router = RuleRouter::builder(
+            0,
+            GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
+        )
+        .route("/{UserId}", 1)
+        .route("/items/{x;y}", 2)
+        .build()
+        .expect("parameter names are metadata, not path bytes");
 
         assert_eq!(
             *router
-                .match_rule_unchecked("/value", &http::Method::GET)
+                .raw_match_for_test("/value", &http::Method::GET)
                 .rule(),
             1
         );
         assert_eq!(
             *router
-                .match_rule_unchecked("/items/value", &http::Method::GET)
+                .raw_match_for_test("/items/value", &http::Method::GET)
                 .rule(),
             2
         );
 
-        let err = RuleRouter::builder()
-            .default(0)
-            .case_sensitivity(CaseSensitivity::Insensitive)
-            .decode_layers(DecodeLayers::Single)
-            .route("/Admin/{UserId}", 1)
-            .build()
-            .expect_err("uppercase literal path bytes remain non-canonical");
+        let err = RuleRouter::builder(
+            0,
+            GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne),
+        )
+        .route("/Admin/{UserId}", 1)
+        .build()
+        .expect_err("uppercase literal path bytes remain non-canonical");
         assert!(matches!(err, RuleRouterError::NonCanonicalCase { .. }));
     }
 
     #[test]
     fn rejects_non_canonical_pattern() {
-        let err = router(&[("/a/../b", 0)], PathConfusion::RejectStructural)
+        let err = router(&[("/a/../b", 0)], GuardMode::RejectAmbiguous)
             .expect_err("non-canonical pattern rejected");
         assert!(matches!(err, RuleRouterError::NonCanonical { .. }));
     }
 
     #[test]
     fn opaque_blob_tolerates_separator_via_registration_flag() {
-        // The `opaque` registration flag (set by the builder's blob_subtree) reaches
+        // The `opaque` registration flag (set by the builder's exclusive_subtree) reaches
         // the tree as a build-time guarantee; runtime tolerance comes from the
         // subtree's uniformity — structural bytes in the tail flow, a climb out of it
         // denies.
-        let r = RuleRouter::build(
-            vec![Registration::blob_subtree("/files", 0)],
+        let r = RuleRouter::from_registrations(
             u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            vec![Registration::exclusive_subtree("/files", 0)],
         )
         .expect("build");
         assert!(!denied(&r, "/files/a%2fb"));
@@ -1046,16 +919,18 @@ mod tests {
 
     #[test]
     fn opaque_blob_with_sibling_is_build_error() {
-        let err = RuleRouter::build(
+        let err = RuleRouter::from_registrations(
+            u32::MAX,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
             vec![
-                Registration::blob_subtree("/files", 0),
+                Registration::exclusive_subtree("/files", 0),
                 Registration::route("/files/secret", 1),
             ],
-            u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
         )
         .expect_err("opaque blob with sibling");
         assert!(matches!(&err, RuleRouterError::Route { .. }));
@@ -1065,14 +940,14 @@ mod tests {
 
     #[test]
     fn error_display_names_the_pattern() {
-        let err = router(&[("/a/../b", 0)], PathConfusion::RejectStructural)
+        let err = router(&[("/a/../b", 0)], GuardMode::RejectAmbiguous)
             .expect_err("non-canonical pattern rejected");
         assert!(err.to_string().contains("/a/../b"));
     }
 
     #[test]
     fn conflict_error_names_the_pattern() {
-        let err = router(&[("/dup", 0), ("/dup", 1)], PathConfusion::RejectStructural)
+        let err = router(&[("/dup", 0), ("/dup", 1)], GuardMode::RejectAmbiguous)
             .expect_err("conflicting routes rejected");
         assert!(matches!(&err, RuleRouterError::Route { .. }));
         assert!(err.to_string().contains("/dup"));
@@ -1082,24 +957,26 @@ mod tests {
     fn rule_ids_are_registration_positions() {
         // Rule identity is positional: patterns in one registration share its index,
         // and there is no id for a caller to get wrong.
-        let r = RuleRouter::build(
+        let r = RuleRouter::from_registrations(
+            u32::MAX,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
             vec![
                 Registration::subtree("/admin", 10),
                 Registration::route("/health", 20),
             ],
-            u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
         )
         .expect("build");
         assert_eq!(
-            r.match_rule_unchecked("/admin/x", &http::Method::GET),
+            r.raw_match_for_test("/admin/x", &http::Method::GET),
             RuleMatch::Matched { id: 0, rule: &10 }
         );
         assert_eq!(
-            r.match_rule_unchecked("/health", &http::Method::GET),
+            r.raw_match_for_test("/health", &http::Method::GET),
             RuleMatch::Matched { id: 1, rule: &20 }
         );
     }
@@ -1108,13 +985,15 @@ mod tests {
     fn rejects_empty_method_set() {
         // An empty OneOf would match no request at all — its paths would silently
         // fall to the default rule.
-        let err = RuleRouter::build(
-            vec![Registration::route("/x", 0).for_methods(Vec::new())],
+        let err = RuleRouter::from_registrations(
             u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            vec![Registration::route("/x", 0).for_methods(Vec::new())],
         )
         .expect_err("empty method set rejected");
         assert!(matches!(&err, RuleRouterError::EmptyMethodSet { pattern } if pattern == "/x"));
@@ -1123,18 +1002,20 @@ mod tests {
 
     #[test]
     fn rejects_empty_pattern_set() {
-        let err = RuleRouter::build(
+        let err = RuleRouter::from_registrations(
+            u32::MAX,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
             vec![Registration {
                 patterns: Vec::new(),
                 rule: 0,
                 opaque: false,
                 method: MethodMatch::Any,
             }],
-            u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
         )
         .expect_err("empty pattern set rejected");
         assert!(matches!(err, RuleRouterError::EmptyPatternSet));
@@ -1142,13 +1023,15 @@ mod tests {
 
     #[test]
     fn duplicate_method_in_set_is_conflict() {
-        let err = RuleRouter::build(
-            vec![Registration::route("/x", 0).for_methods([http::Method::GET, http::Method::GET])],
+        let err = RuleRouter::from_registrations(
             u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            vec![Registration::route("/x", 0).for_methods([http::Method::GET, http::Method::GET])],
         )
         .expect_err("duplicate method in one set rejected");
         assert!(matches!(&err, RuleRouterError::Route { .. }));
@@ -1158,29 +1041,29 @@ mod tests {
 
     #[test]
     fn builder_assigns_grouped_ids() {
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .subtree("/admin", 10)
-            .route("/health", 20)
-            .build()
-            .expect("build");
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .subtree("/admin", 10)
+        .route("/health", 20)
+        .build()
+        .expect("build");
         // The whole subtree shares one rule id; the route gets the next.
         assert_eq!(
-            r.match_rule_unchecked("/admin", &http::Method::GET),
+            r.raw_match_for_test("/admin", &http::Method::GET),
             RuleMatch::Matched { id: 0, rule: &10 }
         );
         assert_eq!(
-            r.match_rule_unchecked("/admin/x/y", &http::Method::GET),
+            r.raw_match_for_test("/admin/x/y", &http::Method::GET),
             RuleMatch::Matched { id: 0, rule: &10 }
         );
         assert_eq!(
-            r.match_rule_unchecked("/health", &http::Method::GET),
+            r.raw_match_for_test("/health", &http::Method::GET),
             RuleMatch::Matched { id: 1, rule: &20 }
         );
         assert_eq!(
-            r.match_rule_unchecked("/nope", &http::Method::GET),
+            r.raw_match_for_test("/nope", &http::Method::GET),
             RuleMatch::Default { rule: &u32::MAX }
         );
     }
@@ -1189,80 +1072,83 @@ mod tests {
     fn builder_defaults_to_reject_structural() {
         // path_confusion / structural_classes are optional with safe defaults; the
         // guard runs without either being set.
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .subtree("/admin", 0)
-            .build()
-            .expect("build");
-        assert!(r.ambiguous("/admin%2fx", &http::Method::GET).is_some());
-        assert!(r.ambiguous("/admin/x", &http::Method::GET).is_none());
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .subtree("/admin", 0)
+        .build()
+        .expect("build");
+        assert!(
+            r.denial_for_test("/admin%2fx", &http::Method::GET)
+                .is_some()
+        );
+        assert!(r.denial_for_test("/admin/x", &http::Method::GET).is_none());
     }
 
     #[test]
     fn builder_blob_subtree_declares_opaque_tail() {
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .blob_subtree("/files", 0)
-            .build()
-            .expect("build");
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .exclusive_subtree("/files", 0)
+        .build()
+        .expect("build");
         assert!(
-            r.ambiguous("/files/a%2fb", &http::Method::GET).is_none(),
+            r.denial_for_test("/files/a%2fb", &http::Method::GET)
+                .is_none(),
             "encoded slash tolerated inside the blob key"
         );
         assert!(
-            r.ambiguous("/files/../b", &http::Method::GET).is_some(),
+            r.denial_for_test("/files/../b", &http::Method::GET)
+                .is_some(),
             "dot-segment climbing out of the blob still denied"
         );
         assert!(
-            r.ambiguous("/files/a/../b", &http::Method::GET).is_none(),
+            r.denial_for_test("/files/a/../b", &http::Method::GET)
+                .is_none(),
             "dot-segment resolving within the blob tolerated"
         );
     }
 
     #[test]
     fn builder_blob_subtree_with_nested_route_is_error() {
-        let err = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .blob_subtree("/files", 0)
-            .route("/files/secret", 1)
-            .build()
-            .expect_err("nested route under a blob");
+        let err = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .exclusive_subtree("/files", 0)
+        .route("/files/secret", 1)
+        .build()
+        .expect_err("nested route under a blob");
         assert!(matches!(err, RuleRouterError::Route { .. }));
     }
 
     #[test]
     fn builder_method_qualified_registrations() {
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .route_for(http::Method::GET, "/x", 0)
-            .route("/x", 1)
-            .subtree_for(http::Method::POST, "/api", 2)
-            .build()
-            .expect("build");
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .register(Registration::route("/x", 0).for_methods(http::Method::GET))
+        .route("/x", 1)
+        .register(Registration::subtree("/api", 2).for_methods(http::Method::POST))
+        .build()
+        .expect("build");
         // Specific method wins; other methods fall to the wildcard rule on that path.
+        assert_eq!(r.raw_match_for_test("/x", &http::Method::GET).id(), Some(0));
         assert_eq!(
-            r.match_rule_unchecked("/x", &http::Method::GET).id(),
-            Some(0)
-        );
-        assert_eq!(
-            r.match_rule_unchecked("/x", &http::Method::POST).id(),
+            r.raw_match_for_test("/x", &http::Method::POST).id(),
             Some(1)
         );
         // A method-only subtree leaves other methods on the default rule.
         assert_eq!(
-            r.match_rule_unchecked("/api/v1", &http::Method::POST).id(),
+            r.raw_match_for_test("/api/v1", &http::Method::POST).id(),
             Some(2)
         );
         assert!(
-            r.match_rule_unchecked("/api/v1", &http::Method::GET)
+            r.raw_match_for_test("/api/v1", &http::Method::GET)
                 .is_default()
         );
     }
@@ -1284,45 +1170,49 @@ mod tests {
             ]
         };
 
-        let decoded = RuleRouter::build(
-            registrations(),
+        let decoded = RuleRouter::from_registrations(
             u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Sensitive,
+            },
+            registrations(),
         )
         .expect("build");
         // `%61` moves POST from the wildcard registration to the literal one, while
         // GET stays on registration 0. The verdict must judge the requested method,
         // not GET's identical representative ids.
-        assert_eq!(decoded.ambiguous("/x/%61", &http::Method::GET), None);
+        assert_eq!(decoded.denial_for_test("/x/%61", &http::Method::GET), None);
         assert_eq!(
-            decoded.ambiguous("/x/%61", &http::Method::POST),
-            Some(DenyReason::DecodeRelocation)
+            decoded.denial_for_test("/x/%61", &http::Method::POST),
+            Some(ResolveError::DecodeRuleChange)
         );
         assert_eq!(
             decoded.resolve("/x/%61", &http::Method::POST),
-            Err(DenyReason::DecodeRelocation)
+            Err(ResolveError::DecodeRuleChange)
         );
 
-        let folded = RuleRouter::build(
-            registrations(),
+        let folded = RuleRouter::from_registrations(
             u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Insensitive,
+            GuardConfig {
+                mode: GuardMode::RejectAmbiguous,
+                structural_classes: StructuralClasses::new(),
+                decode_depth: DecodeDepth::UpToOne,
+                case_sensitivity: CaseSensitivity::Insensitive,
+            },
+            registrations(),
         )
         .expect("build");
-        assert_eq!(folded.ambiguous("/x/A", &http::Method::GET), None);
+        assert_eq!(folded.denial_for_test("/x/A", &http::Method::GET), None);
         assert_eq!(
-            folded.ambiguous("/x/A", &http::Method::POST),
-            Some(DenyReason::CaseFoldRelocation)
+            folded.denial_for_test("/x/A", &http::Method::POST),
+            Some(ResolveError::CaseFoldRuleChange)
         );
         assert_eq!(
             folded.resolve("/x/A", &http::Method::POST),
-            Err(DenyReason::CaseFoldRelocation)
+            Err(ResolveError::CaseFoldRuleChange)
         );
     }
 
@@ -1342,28 +1232,30 @@ mod tests {
             ]
         };
         let build = |layers| {
-            RuleRouter::build(
-                registrations(),
+            RuleRouter::from_registrations(
                 u32::MAX,
-                PathConfusion::RejectStructural,
-                StructuralClasses::new(),
-                layers,
-                CaseSensitivity::Sensitive,
+                GuardConfig {
+                    mode: GuardMode::RejectAmbiguous,
+                    structural_classes: StructuralClasses::new(),
+                    decode_depth: layers,
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                registrations(),
             )
             .expect("build")
         };
 
         let path = "/x/%2561";
-        let single = build(DecodeLayers::Single);
+        let single = build(DecodeDepth::UpToOne);
         assert_eq!(
-            single.ambiguous(path, &http::Method::GET),
-            Some(DenyReason::DecodeRelocation)
+            single.denial_for_test(path, &http::Method::GET),
+            Some(ResolveError::DecodeRuleChange)
         );
 
-        let up_to_two = build(DecodeLayers::UpToTwo);
+        let up_to_two = build(DecodeDepth::UpToTwo);
         assert_eq!(
-            up_to_two.ambiguous(path, &http::Method::GET),
-            Some(DenyReason::DecodeRelocation),
+            up_to_two.denial_for_test(path, &http::Method::GET),
+            Some(ResolveError::DecodeRuleChange),
             "checking a second pass must not erase the first-pass relocation"
         );
     }
@@ -1371,47 +1263,54 @@ mod tests {
     #[test]
     fn builder_supports_dynamic_registration() {
         // Runtime-sized tables register in bulk (`subtrees`/`routes`), and — because
-        // registration methods are state-preserving (generic over the builder's
-        // typestate) — by reassigning in a loop for mixed kinds. This test pins both.
+        // the builder has a single type and supports reassignment in a loop.
         let subtrees = vec![("/admin", 0_u32), ("/api", 1)];
         let routes = vec![("/health", 2_u32), ("/version", 3)];
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .subtrees(subtrees)
-            .routes(routes)
-            .build()
-            .expect("build");
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .register_all(
+            subtrees
+                .into_iter()
+                .map(|(path, rule)| Registration::subtree(path, rule)),
+        )
+        .register_all(
+            routes
+                .into_iter()
+                .map(|(path, rule)| Registration::route(path, rule)),
+        )
+        .build()
+        .expect("build");
         // Each item is its own registration: ids stay per-subtree/per-route.
         assert_eq!(
-            r.match_rule_unchecked("/admin/x", &http::Method::GET).id(),
+            r.raw_match_for_test("/admin/x", &http::Method::GET).id(),
             Some(0)
         );
         assert_eq!(
-            r.match_rule_unchecked("/api/v1", &http::Method::GET).id(),
+            r.raw_match_for_test("/api/v1", &http::Method::GET).id(),
             Some(1)
         );
         assert_eq!(
-            r.match_rule_unchecked("/health", &http::Method::GET).id(),
+            r.raw_match_for_test("/health", &http::Method::GET).id(),
             Some(2)
         );
         assert_eq!(
-            r.match_rule_unchecked("/version", &http::Method::GET).id(),
+            r.raw_match_for_test("/version", &http::Method::GET).id(),
             Some(3)
         );
 
         // The loop form for mixed-kind dynamic tables.
-        let mut b = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single);
+        let mut b = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        );
         for (path, rule) in [("/admin", 0_u32), ("/public", 1)] {
             b = b.subtree(path, rule);
         }
         let r = b.build().expect("build");
         assert_eq!(
-            r.match_rule_unchecked("/public/x", &http::Method::GET).id(),
+            r.raw_match_for_test("/public/x", &http::Method::GET).id(),
             Some(1)
         );
     }
@@ -1420,36 +1319,33 @@ mod tests {
     fn multi_method_registration_shares_one_rule_id() {
         // "This rule for GET and HEAD" is one registration → one rule id, so the two
         // methods can never drift apart and movement between them is not a relocation.
-        let r = RuleRouter::builder()
-            .default(u32::MAX)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
-            .route_for([http::Method::GET, http::Method::HEAD], "/x", 0)
-            .subtree_for(vec![http::Method::PUT, http::Method::POST], "/api", 1)
-            .build()
-            .expect("build");
+        let r = RuleRouter::builder(
+            u32::MAX,
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+        )
+        .register(Registration::route("/x", 0).for_methods([http::Method::GET, http::Method::HEAD]))
+        .register(
+            Registration::subtree("/api", 1)
+                .for_methods(vec![http::Method::PUT, http::Method::POST]),
+        )
+        .build()
+        .expect("build");
+        assert_eq!(r.raw_match_for_test("/x", &http::Method::GET).id(), Some(0));
         assert_eq!(
-            r.match_rule_unchecked("/x", &http::Method::GET).id(),
+            r.raw_match_for_test("/x", &http::Method::HEAD).id(),
             Some(0)
         );
+        assert!(r.raw_match_for_test("/x", &http::Method::POST).is_default());
         assert_eq!(
-            r.match_rule_unchecked("/x", &http::Method::HEAD).id(),
-            Some(0)
-        );
-        assert!(
-            r.match_rule_unchecked("/x", &http::Method::POST)
-                .is_default()
-        );
-        assert_eq!(
-            r.match_rule_unchecked("/api/v1", &http::Method::PUT).id(),
+            r.raw_match_for_test("/api/v1", &http::Method::PUT).id(),
             Some(1)
         );
         assert_eq!(
-            r.match_rule_unchecked("/api/v1", &http::Method::POST).id(),
+            r.raw_match_for_test("/api/v1", &http::Method::POST).id(),
             Some(1)
         );
         assert!(
-            r.match_rule_unchecked("/api/v1", &http::Method::DELETE)
+            r.raw_match_for_test("/api/v1", &http::Method::DELETE)
                 .is_default()
         );
     }

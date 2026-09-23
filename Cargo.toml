@@ -13,7 +13,6 @@ categories = ["authentication", "web-programming"]
 exclude = ["src/__fuzz__/**"]
 
 [dependencies]
-bon = "3.9"
 http = "1"
 
 [dev-dependencies]

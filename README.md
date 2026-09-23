@@ -23,19 +23,19 @@ discover or certify how your deployment handles paths.
 ```rust
 use huskarl_route_guard::{
     RuleRouter,
-    path_confusion::{CaseSensitivity, DecodeLayers},
+    config::{CaseSensitivity, DecodeDepth, GuardConfig},
 };
 
 // For this example, downstream routing distinguishes ASCII case and decodes
 // the path at most once. Set these assumptions for your actual deployment.
-let router = RuleRouter::builder()
-    .default("public")
-    .case_sensitivity(CaseSensitivity::Sensitive)
-    .decode_layers(DecodeLayers::Single)
-    .subtree("/admin", "admin")
-    .route("/health", "health")
-    .build()
-    .expect("valid route table");
+let router = RuleRouter::builder(
+    "public",
+    GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
+)
+.subtree("/admin", "admin")
+.route("/health", "health")
+.build()
+.expect("valid route table");
 
 let matched = router
     .resolve("/admin/users", &http::Method::GET)
@@ -66,8 +66,8 @@ The guard compares those identities.
 - Path matching happens before method lookup. A more-specific path with no rule
   for the request method uses an all-method rule at that path or the default;
   it does not fall back to a less-specific path.
-- The default mode, `RejectStructural`, accepts some structural forms when they
-  cannot cross a rule boundary. `blob_subtree` adds a build-time restriction on
+- The default mode, `RejectAmbiguous`, accepts some structural forms when they
+  cannot cross a rule boundary. `exclusive_subtree` adds a build-time restriction on
   nested paths; it does not disable checks.
 
 ## Documentation
@@ -83,7 +83,6 @@ The guard compares those identities.
   and [glossary](https://docs.rs/huskarl-route-guard/latest/huskarl_route_guard/_docs/reference/glossary/).
 
 This framework-independent crate powers `huskarl-pingora`'s `Guard` and
-`LoginProxy` route tables. Runtime dependencies are `http` and `bon` for builder
-code generation.
+`LoginProxy` route tables. Its only runtime dependency is `http`.
 
 License: MIT OR Apache-2.0

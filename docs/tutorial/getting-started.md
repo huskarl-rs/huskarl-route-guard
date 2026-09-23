@@ -18,14 +18,10 @@ your application to act on; the crate does not enforce their policies.
 ```rust
 use huskarl_route_guard::{
     RuleRouter,
-    path_confusion::{CaseSensitivity, DecodeLayers},
+    config::{CaseSensitivity, DecodeDepth, GuardConfig},
 };
 
-let router = RuleRouter::builder()
-    .default("public")
-    // These are statements about everything that may parse the path downstream.
-    .case_sensitivity(CaseSensitivity::Sensitive)
-    .decode_layers(DecodeLayers::Single)
+let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .subtree("/admin", "admin")
     .route("/health", "health")
     .build()
@@ -47,11 +43,8 @@ component that decodes `%2f` as `/` may instead route it as `/admin/users`. Beca
 those interpretations select different rules, `resolve` denies the request:
 
 ```rust
-# use huskarl_route_guard::{RuleRouter, path_confusion::{CaseSensitivity, DecodeLayers}};
-# let router = RuleRouter::builder()
-#     .default("public")
-#     .case_sensitivity(CaseSensitivity::Sensitive)
-#     .decode_layers(DecodeLayers::Single)
+# use huskarl_route_guard::{RuleRouter, config::{CaseSensitivity, DecodeDepth, GuardConfig}};
+# let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
 #     .subtree("/admin", "admin")
 #     .route("/health", "health")
 #     .build().unwrap();
@@ -68,21 +61,18 @@ client if you want a deliberately less revealing response.
 ## 3. Allow encoded slashes inside file keys
 
 Suppose `/files` forwards object keys unchanged and the entire prefix has one policy.
-Rebuild the router with `blob_subtree`. It covers the prefix like `subtree` and
+Rebuild the router with `exclusive_subtree`. It covers the prefix like `subtree` and
 also rejects configurations that put more-specific paths beneath it:
 
 ```rust
 use huskarl_route_guard::{
     RuleRouter,
-    path_confusion::{CaseSensitivity, DecodeLayers},
+    config::{CaseSensitivity, DecodeDepth, GuardConfig},
 };
 
-let router = RuleRouter::builder()
-    .default("public")
-    .case_sensitivity(CaseSensitivity::Sensitive)
-    .decode_layers(DecodeLayers::Single)
+let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .subtree("/admin", "admin")
-    .blob_subtree("/files", "files")
+    .exclusive_subtree("/files", "files")
     .build()
     .expect("valid route table");
 

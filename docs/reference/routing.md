@@ -21,10 +21,11 @@ not rule values or application policies.
 | `subtree("/files", rule)` | `/files`, `/files/`, and paths below `/files/` |
 | `subtree("/files/", rule)` | `/files/` and paths below it; excludes `/files` |
 | `subtree("/", rule)` | All slash-prefixed request paths |
-| `blob_subtree("/files", rule)` | Same paths as `subtree`; nested paths are rejected at build time |
+| `exclusive_subtree("/files", rule)` | Same paths as `subtree`; nested paths are rejected at build time |
 
-The `*_for` variants restrict the registration to selected HTTP methods.
-A blob declaration does not override method restrictions or disable any check.
+`Registration::for_methods` restricts a registration to selected HTTP methods.
+Add it with `builder.register(...)`. An exclusive subtree does not override
+method restrictions or disable any check.
 
 ## Path precedence comes before method matching
 
@@ -37,16 +38,13 @@ less-specific path pattern.
 
 ```rust
 use huskarl_route_guard::{
-    RuleRouter,
-    path_confusion::{CaseSensitivity, DecodeLayers},
+    Registration, RuleRouter,
+    config::{CaseSensitivity, DecodeDepth, GuardConfig},
 };
 
-let router = RuleRouter::builder()
-    .default("public")
-    .case_sensitivity(CaseSensitivity::Sensitive)
-    .decode_layers(DecodeLayers::Single)
+let router = RuleRouter::builder("public", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .route("/items/{id}", "generic-item")
-    .route_for(http::Method::GET, "/items/special", "get-special")
+    .register(Registration::route("/items/special", "get-special").for_methods(http::Method::GET))
     .build()
     .expect("valid route table");
 
@@ -78,4 +76,4 @@ Case-folding and percent-decoding compare rules for the request's actual method.
 Structural ambiguity checks require every path and **every method** in the analyzed
 region to select the same rule. A GET-only subtree leaves default-rule gaps for
 other methods, so `/files/a%2fb` is denied even for GET under a lone GET-only
-`/files` subtree. The same applies to `blob_subtree_for`.
+`/files` subtree. The same applies to an exclusive subtree with restricted methods.

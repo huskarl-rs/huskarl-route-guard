@@ -390,7 +390,7 @@ impl MethodSlot {
     /// Insert a rule for `method`; a duplicate `(position, method)` is a conflict
     /// ([`Router::build`] attributes it to the entry as [`BuildError::Conflict`]),
     /// including a method listed twice within one `OneOf`. An empty `OneOf` inserts
-    /// nothing (the terminal stays unclaimed); `RuleRouter::build` rejects it before
+    /// nothing (the terminal stays unclaimed); `RuleRouter::from_registrations` rejects it before
     /// the tree is ever built.
     fn insert(&mut self, method: &MethodMatch, id: RuleId) -> Result<(), SlotConflict> {
         match method {

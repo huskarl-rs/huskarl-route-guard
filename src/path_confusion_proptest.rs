@@ -21,10 +21,10 @@
 //! this path"; when they disagree it means something.
 //!
 //! The one rule that keeps it honest: the reference backend's transforms are
-//! **gated by the same [`StructuralClasses`]/[`DecodeLayers`]/[`CaseSensitivity`]**
+//! **gated by the same [`StructuralClasses`]/[`DecodeDepth`]/[`CaseSensitivity`]**
 //! the guard was built with. A relocation via a transform the config does not
 //! declare (e.g. `\`→`/` with `with_backslash()` off, or a second decode pass
-//! under `DecodeLayers::Single`) is operator under-declaration, not a guard bug,
+//! under `DecodeDepth::UpToOne`) is operator under-declaration, not a guard bug,
 //! so those transforms stay off in the sampled backends too. NUL truncation is
 //! always-on in the guard, so the truncating backend is always in the family.
 //!
@@ -42,8 +42,8 @@
 use proptest::prelude::*;
 
 use crate::{
-    path_confusion::{
-        CaseSensitivity, DecodeLayers, PathConfusion, StructuralChar, StructuralClasses,
+    config::{
+        CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, StructuralChar, StructuralClasses,
     },
     path_router::{Registration, RuleRouter, RuleRouterError},
     route_tree::MethodMatch,
@@ -131,7 +131,7 @@ const VOCAB: &[&str] = &[
     "%61pi",
     "v%31",
     // Fullwidth structural confusables (raw and percent-encoded) — exercise the
-    // `with_unicode_normalization` path (`／` folds to `/`, `．` to `.`).
+    // `with_fullwidth_structure` path (`／` folds to `/`, `．` to `.`).
     "a／b",
     "／admin",
     "..／admin",
@@ -154,7 +154,7 @@ const VOCAB: &[&str] = &[
 fn build_router(
     specs: &[(char, &str)],
     classes: StructuralClasses,
-    layers: DecodeLayers,
+    layers: DecodeDepth,
     case: CaseSensitivity,
 ) -> Result<RuleRouter<u32>, RuleRouterError> {
     // Rule ids are positional, so spec `i` gets rule id `i` — the rule value below
@@ -173,13 +173,15 @@ fn build_router(
             method: MethodMatch::Any,
         })
         .collect();
-    RuleRouter::build(
-        registrations,
+    RuleRouter::from_registrations(
         u32::MAX,
-        PathConfusion::RejectStructural,
-        classes,
-        layers,
-        case,
+        GuardConfig {
+            mode: GuardMode::RejectAmbiguous,
+            structural_classes: classes,
+            decode_depth: layers,
+            case_sensitivity: case,
+        },
+        registrations,
     )
 }
 
@@ -224,7 +226,7 @@ impl Backend {
 /// Every backend in the modeled family for `classes`/`case`: the power set of
 /// the available transforms. A transform is available only where the matching
 /// class is enabled (case folding under `Insensitive`, unicode folding under
-/// `with_unicode_normalization()`); the always-on quartet's transforms —
+/// `with_fullwidth_structure()`); the always-on quartet's transforms —
 /// including NUL truncation — are always available.
 fn modeled_backends(classes: &StructuralClasses, case: CaseSensitivity) -> Vec<Backend> {
     let case_avail = case.is_insensitive();
@@ -274,7 +276,7 @@ fn apply(
     t: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeLayers,
+    layers: DecodeDepth,
     case_insensitive: bool,
 ) -> String {
     match step {
@@ -375,7 +377,7 @@ fn normalize_ordered(
     path: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeLayers,
+    layers: DecodeDepth,
     case_insensitive: bool,
     order: &[Step],
 ) -> String {
@@ -399,7 +401,7 @@ fn normalize(
     path: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeLayers,
+    layers: DecodeDepth,
     case_insensitive: bool,
 ) -> String {
     normalize_ordered(
@@ -459,9 +461,9 @@ fn starts_ci(b: &[u8], i: usize, pat: &[u8]) -> bool {
 /// One percent-decoding pass for the modeled structural bytes only (never
 /// general unreserved octets — see the module-level discussion of why that is a
 /// deliberate scope line). Double-encoding is peeled one `%25` layer per pass
-/// (only under a declared [`DecodeLayers::UpToTwo`] model); the fixpoint loop
+/// (only under a declared [`DecodeDepth::UpToTwo`] model); the fixpoint loop
 /// re-runs the decode.
-fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeLayers) -> String {
+fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeDepth) -> String {
     let b = t.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -512,7 +514,7 @@ fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeL
 
 /// Percent-decode the *content* escapes — every complete `%XX` except those that
 /// decode to a structural byte (`/ . ; \ NUL`) or to the `%` double-encode wrapper.
-/// Single pass and idempotent (it produces no new `%`), so it composes safely inside
+/// One pass and idempotent (it produces no new `%`), so it composes safely inside
 /// the normalization fixpoint; the structural and double-decode forms are handled by
 /// their own steps so this never implies them.
 fn decode_unreserved(t: &str) -> String {
@@ -538,7 +540,7 @@ fn decode_unreserved(t: &str) -> String {
 }
 
 /// NFKC-fold the fullwidth structural confusables to their ASCII byte — the Phase-1
-/// `with_unicode_normalization` set. Letters and other compatibility forms are *not*
+/// `with_fullwidth_structure` set. Letters and other compatibility forms are *not*
 /// folded (Phase 1 is structural only), so the oracle never generates a content
 /// relocation the structural class cannot catch.
 fn fold_unicode(t: &str) -> String {
@@ -628,7 +630,7 @@ fn pop_last_segment(output: &mut String) {
 
 // ── Strategies ──────────────────────────────────────────────────────────────
 
-fn config_strategy() -> impl Strategy<Value = (StructuralClasses, DecodeLayers, CaseSensitivity)> {
+fn config_strategy() -> impl Strategy<Value = (StructuralClasses, DecodeDepth, CaseSensitivity)> {
     (
         any::<bool>(),
         any::<bool>(),
@@ -653,12 +655,12 @@ fn config_strategy() -> impl Strategy<Value = (StructuralClasses, DecodeLayers, 
                 c = c.with_overlong(overlong);
             }
             if uni {
-                c = c.with_unicode_normalization();
+                c = c.with_fullwidth_structure();
             }
             let layers = if up_to_two {
-                DecodeLayers::UpToTwo
+                DecodeDepth::UpToTwo
             } else {
-                DecodeLayers::Single
+                DecodeDepth::UpToOne
             };
             let case = if ci {
                 CaseSensitivity::Insensitive
@@ -684,7 +686,7 @@ fn path_strategy() -> impl Strategy<Value = String> {
 struct PreciseTransform {
     raw_leaf: &'static str,
     canonical_leaf: &'static str,
-    layers: DecodeLayers,
+    layers: DecodeDepth,
     case: CaseSensitivity,
     backend: Backend,
 }
@@ -694,7 +696,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "%61",
             canonical_leaf: "a",
-            layers: DecodeLayers::Single,
+            layers: DecodeDepth::UpToOne,
             case: CaseSensitivity::Sensitive,
             backend: Backend {
                 decode_unreserved: true,
@@ -704,7 +706,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "%61dmin",
             canonical_leaf: "admin",
-            layers: DecodeLayers::Single,
+            layers: DecodeDepth::UpToOne,
             case: CaseSensitivity::Sensitive,
             backend: Backend {
                 decode_unreserved: true,
@@ -714,7 +716,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "%2561dmin",
             canonical_leaf: "admin",
-            layers: DecodeLayers::UpToTwo,
+            layers: DecodeDepth::UpToTwo,
             case: CaseSensitivity::Sensitive,
             backend: Backend {
                 // The structural decode step peels the `%25` wrapper under a
@@ -727,7 +729,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "A",
             canonical_leaf: "a",
-            layers: DecodeLayers::Single,
+            layers: DecodeDepth::UpToOne,
             case: CaseSensitivity::Insensitive,
             backend: Backend {
                 case_fold: true,
@@ -737,7 +739,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "ADMIN",
             canonical_leaf: "admin",
-            layers: DecodeLayers::Single,
+            layers: DecodeDepth::UpToOne,
             case: CaseSensitivity::Insensitive,
             backend: Backend {
                 case_fold: true,
@@ -747,7 +749,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
         PreciseTransform {
             raw_leaf: "%41DMIN",
             canonical_leaf: "admin",
-            layers: DecodeLayers::Single,
+            layers: DecodeDepth::UpToOne,
             case: CaseSensitivity::Insensitive,
             backend: Backend {
                 decode_unreserved: true,
@@ -777,7 +779,7 @@ fn method_from_index(index: u8) -> http::Method {
 // the router's `HashMap`. Wire later via bolero/cargo-fuzz; the body is the engine.
 
 /// Decode a config from one byte's bits (mirrors [`config_strategy`]).
-fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeLayers, CaseSensitivity) {
+fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeDepth, CaseSensitivity) {
     let mut c = StructuralClasses::new();
     if bits & 1 != 0 {
         c = c.with_backslash();
@@ -793,12 +795,12 @@ fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeLayers, CaseSensitivi
         c = c.with_overlong(overlong);
     }
     let layers = if bits & 8 != 0 {
-        DecodeLayers::UpToTwo
+        DecodeDepth::UpToTwo
     } else {
-        DecodeLayers::Single
+        DecodeDepth::UpToOne
     };
     if bits & 16 != 0 {
-        c = c.with_unicode_normalization();
+        c = c.with_fullwidth_structure();
     }
     let case = if bits & 32 != 0 {
         CaseSensitivity::Insensitive
@@ -843,8 +845,8 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
     // Rule identity for the oracle: the matched registration's id, or `None` for the
     // default rule — which participates as a rule of its own (a relocation onto or off
     // the default rule is a bypass like any other).
-    let raw_rule = router.match_rule_unchecked(&path, &http::Method::GET).id();
-    if router.ambiguous(&path, &http::Method::GET).is_some() {
+    let raw_rule = router.raw_match_for_test(&path, &http::Method::GET).id();
+    if router.denial_for_test(&path, &http::Method::GET).is_some() {
         return; // denied — sound regardless of any backend
     }
     for backend in modeled_backends(&classes, case) {
@@ -853,7 +855,7 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
             continue;
         }
         let reloc_rule = router
-            .match_rule_unchecked(&normalized, &http::Method::GET)
+            .raw_match_for_test(&normalized, &http::Method::GET)
             .id();
         assert_eq!(
             reloc_rule, raw_rule,
@@ -900,8 +902,8 @@ proptest! {
 
         // Rule identity via `id()`: the default rule (`None`) participates as a rule
         // of its own, so relocations onto or off it are caught like any other.
-        let raw_rule = router.match_rule_unchecked(&path, &http::Method::GET).id();
-        if router.ambiguous(&path, &http::Method::GET).is_some() {
+        let raw_rule = router.raw_match_for_test(&path, &http::Method::GET).id();
+        if router.denial_for_test(&path, &http::Method::GET).is_some() {
             return Ok(()); // denied — sound regardless of any backend
         }
 
@@ -922,7 +924,7 @@ proptest! {
                 if normalized == path {
                     continue;
                 }
-                let reloc_rule = router.match_rule_unchecked(&normalized, &http::Method::GET).id();
+                let reloc_rule = router.raw_match_for_test(&normalized, &http::Method::GET).id();
                 prop_assert_eq!(
                     reloc_rule,
                     raw_rule,
@@ -964,14 +966,7 @@ proptest! {
             Registration::route(wildcard, 1).for_methods(actual.clone()),
             Registration::route(literal.clone(), 2).for_methods(actual.clone()),
         ];
-        let router = RuleRouter::build(
-            registrations,
-            u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            transform.layers,
-            transform.case,
-        )?;
+        let router = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: transform.layers, case_sensitivity: transform.case }, registrations)?;
 
         let normalized = normalize(
             &raw,
@@ -982,18 +977,18 @@ proptest! {
         );
         prop_assert_eq!(&normalized, &literal);
 
-        let raw_rule = router.match_rule_unchecked(&raw, &actual).id();
-        let normalized_rule = router.match_rule_unchecked(&normalized, &actual).id();
+        let raw_rule = router.raw_match_for_test(&raw, &actual).id();
+        let normalized_rule = router.raw_match_for_test(&normalized, &actual).id();
         prop_assert_ne!(raw_rule, normalized_rule);
         prop_assert!(
-            router.ambiguous(&raw, &representative).is_none(),
+            router.denial_for_test(&raw, &representative).is_none(),
             "representative method should stay within registration 0: raw={:?}, normalized={:?}, method={:?}",
             raw,
             normalized,
             representative,
         );
         prop_assert!(
-            router.ambiguous(&raw, &actual).is_some(),
+            router.denial_for_test(&raw, &actual).is_some(),
             "BYPASS: guard allowed {:?} for {:?} (rule {:?}), but the modeled backend normalized it to {:?} (rule {:?})",
             raw,
             actual,
@@ -1086,8 +1081,8 @@ proptest! {
             return Ok(()); // an unbuildable subset (matchit conflict) — skip
         };
         prop_assert!(
-            small.ambiguous(&path, &http::Method::GET).is_none()
-                || big.ambiguous(&path, &http::Method::GET).is_some(),
+            small.denial_for_test(&path, &http::Method::GET).is_none()
+                || big.denial_for_test(&path, &http::Method::GET).is_some(),
             "adding {:?} turned a deny into an allow on {:?} (table {:?})",
             specs.last(), path, specs
         );
@@ -1098,24 +1093,17 @@ proptest! {
     /// is `deny(clippy::panic)`, but that cannot see runtime slicing/UTF-8 edges).
     #[test]
     fn never_panics_on_arbitrary_input(pattern in ".*", path in ".*") {
-        let _ = RuleRouter::build(
-            vec![Registration::route(pattern, 0u32)],
-            u32::MAX,
-            PathConfusion::RejectStructural,
-            StructuralClasses::new(),
-            DecodeLayers::Single,
-            CaseSensitivity::Sensitive,
-        );
+        let _ = RuleRouter::from_registrations(u32::MAX, GuardConfig { mode: GuardMode::RejectAmbiguous, structural_classes: StructuralClasses::new(), decode_depth: DecodeDepth::UpToOne, case_sensitivity: CaseSensitivity::Sensitive }, vec![Registration::route(pattern, 0u32)]);
 
         let router = build_router(
             &[('s', "/admin"), ('e', "/users/{id}")],
             StructuralClasses::new().with_backslash(),
-            DecodeLayers::UpToTwo,
+            DecodeDepth::UpToTwo,
             CaseSensitivity::Insensitive,
         )
         .expect("fixed table builds");
-        let _ = router.match_rule_unchecked(&path, &http::Method::GET);
-        let _ = router.ambiguous(&path, &http::Method::GET);
+        let _ = router.raw_match_for_test(&path, &http::Method::GET);
+        let _ = router.denial_for_test(&path, &http::Method::GET);
     }
 }
 
@@ -1148,7 +1136,7 @@ mod reference_backend_tests {
             decode_dot: true,
             ..Backend::NONE
         };
-        let single = DecodeLayers::Single;
+        let single = DecodeDepth::UpToOne;
         assert_eq!(decode_pass("/a%2fb", all_decode, &c, single), "/a/b");
         assert_eq!(decode_pass("/a%2eb", all_decode, &c, single), "/a.b");
         // A non-structural unreserved escape is left intact — by design.
@@ -1160,7 +1148,7 @@ mod reference_backend_tests {
         // The %25 double-encode wrapper peels only under an UpToTwo declaration.
         assert_eq!(decode_pass("/a%252fb", all_decode, &c, single), "/a%252fb");
         assert_eq!(
-            decode_pass("/a%252fb", all_decode, &c, DecodeLayers::UpToTwo),
+            decode_pass("/a%252fb", all_decode, &c, DecodeDepth::UpToTwo),
             "/a%2fb"
         );
     }
@@ -1243,7 +1231,7 @@ mod transform_order_tests {
 
         // `normalize` merges `//` first, so the `..` climbs out of `/admin` entirely.
         assert_eq!(
-            normalize(path, backend, &c, DecodeLayers::Single, false),
+            normalize(path, backend, &c, DecodeDepth::UpToOne, false),
             "/b"
         );
         // A backend that resolves dot-segments on the raw path first has its `..`
@@ -1254,7 +1242,7 @@ mod transform_order_tests {
                 path,
                 backend,
                 &c,
-                DecodeLayers::Single,
+                DecodeDepth::UpToOne,
                 false,
                 &[Step::Strip, Step::Dots, Step::Merge],
             ),
@@ -1268,17 +1256,17 @@ mod transform_order_tests {
         let router = build_router(
             &[('s', "/admin"), ('e', "/b")],
             c,
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         )
         .expect("table builds");
-        assert!(router.ambiguous(path, &http::Method::GET).is_some());
+        assert!(router.denial_for_test(path, &http::Method::GET).is_some());
         // …and the two orders really do disagree about the rule, so the deny is
         // load-bearing rather than incidental.
         assert_ne!(
-            router.match_rule_unchecked("/b", &http::Method::GET).id(),
+            router.raw_match_for_test("/b", &http::Method::GET).id(),
             router
-                .match_rule_unchecked("/admin/b", &http::Method::GET)
+                .raw_match_for_test("/admin/b", &http::Method::GET)
                 .id(),
         );
     }
@@ -1322,7 +1310,7 @@ mod transform_order_tests {
         ];
 
         let classes = StructuralClasses::new().with_backslash();
-        let layers = DecodeLayers::UpToTwo;
+        let layers = DecodeDepth::UpToTwo;
         let case = CaseSensitivity::Insensitive;
         let router = build_router(CATALOG, classes.clone(), layers, case).expect("catalog builds");
         let paths: Vec<String> = PREFIXES
@@ -1338,11 +1326,11 @@ mod transform_order_tests {
         let mut allowed = 0usize;
         for path in &paths {
             // Denied paths are sound under any ordering — nothing is forwarded.
-            if router.ambiguous(path, &http::Method::GET).is_some() {
+            if router.denial_for_test(path, &http::Method::GET).is_some() {
                 continue;
             }
             allowed += 1;
-            let raw_rule = router.match_rule_unchecked(path, &http::Method::GET).id();
+            let raw_rule = router.raw_match_for_test(path, &http::Method::GET).id();
             for backend in &backends {
                 for order in permutations(&canonical_order(*backend)) {
                     let normalized =
@@ -1351,7 +1339,7 @@ mod transform_order_tests {
                         continue;
                     }
                     let reloc_rule = router
-                        .match_rule_unchecked(&normalized, &http::Method::GET)
+                        .raw_match_for_test(&normalized, &http::Method::GET)
                         .id();
                     assert_eq!(
                         reloc_rule, raw_rule,
@@ -1393,12 +1381,12 @@ mod over_approximation_tests {
         path: &str,
         classes: &StructuralClasses,
     ) -> Vec<String> {
-        let raw = router.match_rule_unchecked(path, &http::Method::GET).id();
+        let raw = router.raw_match_for_test(path, &http::Method::GET).id();
         modeled_backends(classes, CaseSensitivity::Sensitive)
             .into_iter()
-            .map(|b| normalize(path, b, classes, DecodeLayers::Single, false))
+            .map(|b| normalize(path, b, classes, DecodeDepth::UpToOne, false))
             .filter(|n| n != path)
-            .filter(|n| router.match_rule_unchecked(n, &http::Method::GET).id() != raw)
+            .filter(|n| router.raw_match_for_test(n, &http::Method::GET).id() != raw)
             .collect()
     }
 
@@ -1415,12 +1403,16 @@ mod over_approximation_tests {
         let router = build_router(
             &[('e', "/users/{id}")],
             classes.clone(),
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         )
         .expect("table builds");
 
-        assert!(router.ambiguous("/users/4;2", &http::Method::GET).is_some());
+        assert!(
+            router
+                .denial_for_test("/users/4;2", &http::Method::GET)
+                .is_some()
+        );
         assert_eq!(
             relocations(&router, "/users/4;2", &classes),
             Vec::<String>::new(),
@@ -1429,7 +1421,11 @@ mod over_approximation_tests {
 
         // Axiom 6 is what makes that cost escapable: the canonical spelling of the
         // same request is never denied.
-        assert!(router.ambiguous("/users/4", &http::Method::GET).is_none());
+        assert!(
+            router
+                .denial_for_test("/users/4", &http::Method::GET)
+                .is_none()
+        );
     }
 
     /// The documented remedy, and the reason it works: registering the prefix as a
@@ -1441,14 +1437,14 @@ mod over_approximation_tests {
         let router = build_router(
             &[('s', "/users")],
             classes.clone(),
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         )
         .expect("table builds");
 
         for path in ["/users/4;2", "/users/a%2fb", "/users/4/../x"] {
             assert!(
-                router.ambiguous(path, &http::Method::GET).is_none(),
+                router.denial_for_test(path, &http::Method::GET).is_none(),
                 "{path} should flow under a uniform subtree"
             );
             assert_eq!(
@@ -1469,32 +1465,32 @@ mod over_approximation_tests {
         let router = build_router(
             &[('s', "/blob"), ('e', "/health")],
             classes,
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         )
         .expect("table builds");
 
         assert!(
             router
-                .ambiguous("/blob/a%2fb", &http::Method::GET)
+                .denial_for_test("/blob/a%2fb", &http::Method::GET)
                 .is_none()
         );
         assert!(
             router
-                .ambiguous("/blob/k1/../k2", &http::Method::GET)
+                .denial_for_test("/blob/k1/../k2", &http::Method::GET)
                 .is_none()
         );
         // The same encoded separator against an exact route, where the anchored region
         // holds another rule and the default fall-through.
         assert!(
             router
-                .ambiguous("/health%2fx", &http::Method::GET)
+                .denial_for_test("/health%2fx", &http::Method::GET)
                 .is_some()
         );
         // NUL keeps its unconditional deny even where the anchor is uniform.
         assert!(
             router
-                .ambiguous("/blob/a%00b", &http::Method::GET)
+                .denial_for_test("/blob/a%00b", &http::Method::GET)
                 .is_some()
         );
     }
@@ -1509,7 +1505,7 @@ mod over_approximation_tests {
             build_router(
                 specs,
                 classes.clone(),
-                DecodeLayers::Single,
+                DecodeDepth::UpToOne,
                 CaseSensitivity::Sensitive,
             )
             .expect("table builds")
@@ -1517,12 +1513,12 @@ mod over_approximation_tests {
 
         assert!(
             build(&[('e', "/health")])
-                .ambiguous("/%61dmin", &http::Method::GET)
+                .denial_for_test("/%61dmin", &http::Method::GET)
                 .is_none()
         );
         assert!(
             build(&[('s', "/admin")])
-                .ambiguous("/%61dmin", &http::Method::GET)
+                .denial_for_test("/%61dmin", &http::Method::GET)
                 .is_some()
         );
     }

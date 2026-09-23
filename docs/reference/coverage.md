@@ -2,7 +2,7 @@
 
 This page is a reference for the built-in model. A row marked “default” means the
 active guard considers that interpretation without an opt-in; it does **not** mean
-that the library has detected the behavior in your deployment. `Off` disables these
+that the library has detected the behavior in your deployment. `Disabled` disables these
 checks. See the [security contract](crate::_docs::reference::contract) for how the
 modes use this model.
 
@@ -13,12 +13,12 @@ modes use this model.
 | path parameters (matrix parameters), such as `;version=2`, or encoded `%3B` | **default** | — |
 | `%00` / raw-NUL truncation (C-string backends) | **default** | — (always-on; NUL is unsupported path content) |
 | percent-decoding to a different literal (`/%61dmin`) | **default** | — |
-| double percent-decoding `%252F` (CDN/WAF → origin) | **required** declaration | [`DecodeLayers::UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo) |
-| case folding `/ADMIN` ≡ `/admin` | **required** declaration | [`CaseSensitivity::Insensitive`](crate::path_confusion::CaseSensitivity::Insensitive) |
-| `\` / `%5C` as a separator (Windows / IIS) | opt-in | [`with_backslash`](crate::path_confusion::StructuralClasses::with_backslash) |
-| overlong UTF-8 `%C0%AF` / `%C0%AE` (legacy decoders) | opt-in | [`with_overlong`](crate::path_confusion::StructuralClasses::with_overlong) |
-| fullwidth/NFKC structural confusables (`／`→`/`, …) | opt-in | [`with_unicode_normalization`](crate::path_confusion::StructuralClasses::with_unicode_normalization) |
-| a novel structural form (fresh CVE, vendor quirk) | custom detector | [`with_probe`](crate::path_confusion::StructuralClasses::with_probe) |
+| double percent-decoding `%252F` (CDN/WAF → origin) | **required** declaration | [`DecodeDepth::UpToTwo`](crate::config::DecodeDepth::UpToTwo) |
+| case folding `/ADMIN` ≡ `/admin` | **required** declaration | [`CaseSensitivity::Insensitive`](crate::config::CaseSensitivity::Insensitive) |
+| `\` / `%5C` as a separator (Windows / IIS) | opt-in | [`with_backslash`](crate::config::StructuralClasses::with_backslash) |
+| overlong UTF-8 `%C0%AF` / `%C0%AE` (legacy decoders) | opt-in | [`with_overlong`](crate::config::StructuralClasses::with_overlong) |
+| fullwidth/NFKC structural confusables (`／`→`/`, …) | opt-in | [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure) |
+| a novel structural form (fresh CVE, vendor quirk) | custom detector | [`with_probe`](crate::config::StructuralClasses::with_probe) |
 
 “Default” interpretations are always considered. “Required” values must be supplied
 to the builder. “Opt-in” interpretations are absent until enabled. A custom detector
@@ -41,16 +41,16 @@ not seen at all:
   the exception: always-on, because its legitimate-use rate is nil.)
 - **Unicode *content* confusables and non-NFKC look-alikes.** The structural NFKC
   confusables (`／`→`/`, `．`→`.`, `；`→`;`, `＼`→`\`) *are* covered, opt-in, by
-  [`with_unicode_normalization`](crate::path_confusion::StructuralClasses::with_unicode_normalization).
+  [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure).
   What remains uncovered: fullwidth *letters* that NFKC-fold onto a different literal
   route (`/ＡＤＭＩＮ` → `/ADMIN` → `/admin` — a content relocation with no built-in
   class), and visual look-alikes NFKC does **not** decompose (U+2044 fraction slash,
   U+2215 division slash). For these, deny non-ASCII paths with a
-  [`StructuralProbe`](crate::path_confusion::StructuralProbe) — blunt but monotonic,
+  [`StructuralProbe`](crate::config::StructuralProbe) — blunt but monotonic,
   since a probe can only add denials:
 
   ```
-  use huskarl_route_guard::path_confusion::{StructuralClasses, StructuralProbe};
+  use huskarl_route_guard::config::{StructuralClasses, StructuralProbe};
 
   struct RejectNonAscii;
   impl StructuralProbe for RejectNonAscii {
@@ -83,18 +83,18 @@ not seen at all:
   a traversal from bytes the model considers inert — `....//` becomes `../` after one
   deletion pass — including inside a single-rule subtree the scoped check tolerates.
   If you must front such a backend, add a
-  [`StructuralProbe`](crate::path_confusion::StructuralProbe) for the shapes its
+  [`StructuralProbe`](crate::config::StructuralProbe) for the shapes its
   sanitizer reacts to (e.g. any `../` substring after one deletion pass), or run
-  [`reject_non_canonical`](crate::path_confusion::PathConfusion::reject_non_canonical).
+  [`RequireCanonical`](crate::config::GuardMode::RequireCanonical).
 - **Forms with no class and no probe.** A structural form outside the built-in
   alphabet — including a future CVE — is invisible until you add a
-  [`with_probe`](crate::path_confusion::StructuralClasses::with_probe) for it or a
+  [`with_probe`](crate::config::StructuralClasses::with_probe) for it or a
   release ships it.
 - **Path only.** Pass `uri.path()`, never a full request-target.
   [`resolve`](crate::RuleRouter::resolve) validates this boundary: the input must begin
   with `/` (or be the special `*` request target) and contain no `?` or `#`. A full
   request-target such as `/admin?x=1`, or an absolute URI, is denied with
-  [`InvalidPathInput`](crate::DenyReason::InvalidPathInput) rather than being routed.
+  [`InvalidPathInput`](crate::ResolveError::InvalidPathInput) rather than being routed.
 - **Detection, not sanitisation.** The guard returns a rule or a denial. The caller
   forwards allowed requests with their paths unchanged. This is a condition of
   the contract — see

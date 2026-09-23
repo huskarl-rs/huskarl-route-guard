@@ -1,13 +1,13 @@
-//! Configure the downstream parsing behaviors that the guard checks.
+//! Configure downstream parsing assumptions and enforcement.
 //!
-//! Use [`GuardConfig`] with [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config),
-//! or set the options individually on [`RuleRouter::builder`](crate::RuleRouter::builder).
+//! Use [`GuardConfig`] with [`RuleRouter::from_registrations`](crate::RuleRouter::from_registrations),
+//! or pass it to [`RuleRouter::builder`](crate::RuleRouter::builder).
 //!
 //! | Setting | Purpose | Default |
 //! |---|---|---|
-//! | [`PathConfusion`] | Choose checks based on possible rule changes, strict rejection, or off | [`RejectStructural`](PathConfusion::RejectStructural) |
+//! | [`GuardMode`] | Choose checks based on possible rule changes, strict rejection, or off | [`RejectAmbiguous`](GuardMode::RejectAmbiguous) |
 //! | [`CaseSensitivity`] | Declare whether downstream routing folds ASCII case | Required |
-//! | [`DecodeLayers`] | Declare the maximum supported percent-decode depth | Required |
+//! | [`DecodeDepth`] | Declare the maximum supported percent-decode depth | Required |
 //! | [`StructuralClasses`] | Enable additional structural forms and custom detectors | Built-in classes only |
 //!
 //! These settings describe possible downstream behaviors; the crate does not detect
@@ -20,8 +20,8 @@
 //! [supported parsing behaviors](crate::_docs::reference::coverage).
 //! [How the guard decides](crate::_docs::explanation::decision) explains the algorithm.
 //!
-//! A rejected request carries a [`DenyReason`]. Its [`Display`](std::fmt::Display)
-//! gives the log detail; [`message()`](DenyReason::message) gives a short response
+//! A rejected request carries a [`ResolveError`]. Its [`Display`](std::fmt::Display)
+//! gives the log detail; [`message()`](ResolveError::message) gives a short response
 //! message. The calling application sends the response and must not forward a
 //! rejected request.
 
@@ -32,19 +32,19 @@ use std::sync::Arc;
 /// Case sensitivity and decode depth are required; there is deliberately no
 /// `Default` implementation. The mode and structural classes start with their
 /// conservative built-in defaults and can be customized before construction.
-/// Use with [`RuleRouter::build_with_config`](crate::RuleRouter::build_with_config).
+/// Use with [`RuleRouter::from_registrations`](crate::RuleRouter::from_registrations).
 ///
 /// ```
 /// use huskarl_route_guard::{
 ///     Registration, RuleRouter,
-///     path_confusion::{CaseSensitivity, DecodeLayers, GuardConfig},
+///     config::{CaseSensitivity, DecodeDepth, GuardConfig},
 /// };
 ///
-/// let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single);
-/// let router = RuleRouter::build_with_config(
-///     vec![Registration::subtree("/admin", "protected")],
+/// let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+/// let router = RuleRouter::from_registrations(
 ///     "public",
 ///     config,
+///     [Registration::subtree("/admin", "protected")],
 /// )
 /// .expect("valid routes");
 /// assert!(
@@ -56,11 +56,11 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct GuardConfig {
     /// Enforcement mode; defaults to checking for possible rule changes.
-    pub path_confusion: PathConfusion,
+    pub mode: GuardMode,
     /// Additional structural classes and custom probes.
     pub structural_classes: StructuralClasses,
     /// Declared maximum whole-path percent-decode depth.
-    pub decode_layers: DecodeLayers,
+    pub decode_depth: DecodeDepth,
     /// Whether downstream path interpretation folds ASCII case.
     pub case_sensitivity: CaseSensitivity,
 }
@@ -68,13 +68,27 @@ pub struct GuardConfig {
 impl GuardConfig {
     /// Declare the required deployment assumptions with default enforcement settings.
     #[must_use]
-    pub fn new(case_sensitivity: CaseSensitivity, decode_layers: DecodeLayers) -> Self {
+    pub fn new(case_sensitivity: CaseSensitivity, decode_depth: DecodeDepth) -> Self {
         Self {
-            path_confusion: PathConfusion::default(),
+            mode: GuardMode::default(),
             structural_classes: StructuralClasses::default(),
-            decode_layers,
+            decode_depth,
             case_sensitivity,
         }
+    }
+
+    /// Selects enforcement without changing the declared parsing assumptions.
+    #[must_use]
+    pub fn with_mode(mut self, mode: GuardMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Sets additional structural forms and custom probes.
+    #[must_use]
+    pub fn with_structural_classes(mut self, classes: StructuralClasses) -> Self {
+        self.structural_classes = classes;
+        self
     }
 }
 
@@ -84,10 +98,10 @@ impl GuardConfig {
 /// recognized non-canonical form, even when the rule would stay the same.
 /// See the [security contract](crate::_docs::reference::contract) for exact behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PathConfusion {
+pub enum GuardMode {
     /// Check whether downstream parsing could select a different rule. The default.
     ///
-    /// Despite the name, this mode accepts structural forms such as encoded slashes
+    /// This mode accepts structural forms such as encoded slashes
     /// when every path and method in the analyzed region selects the same rule.
     /// Structural analysis is conservative and may reject more than actual parsing
     /// would require. Case folding and percent-decoding compare the resulting rules
@@ -95,40 +109,17 @@ pub enum PathConfusion {
     ///
     /// See [How the guard decides](crate::_docs::explanation::decision).
     #[default]
-    RejectStructural,
+    RejectAmbiguous,
     /// Reject every enabled structural form, every complete percent escape, and
     /// uppercase ASCII when case-insensitive parsing is configured.
     ///
     /// Applies everywhere, including blob subtrees, without checking whether the
     /// rule would change. This can reject legitimate encoded keys. Recognition is
     /// still limited to the configured [`StructuralClasses`] and parsing model.
-    RejectNonCanonical,
+    RequireCanonical,
     /// Disable ambiguity checks and custom probes. [`resolve`](crate::RuleRouter::resolve)
     /// still validates the path input and checks internal rule IDs.
-    Off,
-}
-
-impl PathConfusion {
-    /// Check for possible rule changes; see [`RejectStructural`](Self::RejectStructural).
-    /// This is the default mode.
-    #[must_use]
-    pub fn reject_structural() -> Self {
-        Self::RejectStructural
-    }
-
-    /// Deny any path this mode considers non-canonical — strict hygiene, including
-    /// every recognized structural form and every percent escape (see
-    /// [`RejectNonCanonical`](Self::RejectNonCanonical)).
-    #[must_use]
-    pub fn reject_non_canonical() -> Self {
-        Self::RejectNonCanonical
-    }
-
-    /// Disable the path-confusion guard.
-    #[must_use]
-    pub fn off() -> Self {
-        Self::Off
-    }
+    Disabled,
 }
 
 /// Whether the upstream resolves paths case-sensitively — a declaration consuming
@@ -180,7 +171,7 @@ impl CaseSensitivity {
 /// decoded `%252e%252e` once to `%2e%2e` and let it past a no-auth prefix, then
 /// Apache decoded *again* to `..` and traversed into a protected script.
 ///
-/// - [`Single`](Self::Single) — no more than one decode pass happens behind this layer.
+/// - [`UpToOne`](Self::UpToOne) — no more than one decode pass happens behind this layer.
 ///   `%252F` reaches the application as the literal
 ///   content `%2F`, so double-encoded forms are not treated as structure.
 /// - [`UpToTwo`](Self::UpToTwo) — the whole path may receive one or two decode
@@ -193,7 +184,7 @@ impl CaseSensitivity {
 /// literal `%25XX` sequence as genuine content (e.g. a percent-encoded URL embedded
 /// in a path segment). Inside a uniform single-rule subtree
 /// ([`subtree`](crate::RuleRouterBuilder::subtree) /
-/// [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree)), double-encoded
+/// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)), double-encoded
 /// *separators* in opaque keys stay tolerated even under `UpToTwo`.
 ///
 /// Scope: this models the **canonical** double-encoding, where the `%` itself is
@@ -204,16 +195,16 @@ impl CaseSensitivity {
 /// decoder-leniency form is a [`StructuralClasses::with_probe`] (custom detector)
 /// case, not something `UpToTwo` implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeLayers {
+pub enum DecodeDepth {
     /// At most one percent-decode pass happens behind this layer.
-    Single,
+    UpToOne,
     /// The whole path may receive one or two decode passes — for example because
     /// the exact behaviour of a CDN, WAF, proxy chain, or origin is uncertain.
     /// Both possible complete-path results are checked.
     UpToTwo,
 }
 
-impl DecodeLayers {
+impl DecodeDepth {
     /// Whether this is [`UpToTwo`](Self::UpToTwo).
     pub(crate) fn is_up_to_two(self) -> bool {
         matches!(self, Self::UpToTwo)
@@ -221,7 +212,7 @@ impl DecodeLayers {
 }
 
 /// The structural-form class that triggered a denial — the attribution carried by
-/// [`DenyReason`], mapping a `400` back to the byte family (and so to the
+/// [`ResolveError`], mapping a `400` back to the byte family (and so to the
 /// configuration knob or registration that governs it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -235,7 +226,7 @@ pub enum StructuralClass {
     /// Denied unless every rule reachable past its anchor is the matched rule —
     /// tolerated under a fully-registered single-rule subtree
     /// ([`subtree`](crate::RuleRouterBuilder::subtree) /
-    /// [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree)).
+    /// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree)).
     Separator,
     /// A `;`/`%3B` matrix path-parameter. Scoped like
     /// [`Separator`](Self::Separator).
@@ -249,9 +240,9 @@ pub enum StructuralClass {
     Backslash,
     /// ASCII uppercase under a declared case-folding backend
     /// ([`CaseSensitivity::Insensitive`]) — reported only by the strict
-    /// [`RejectNonCanonical`](PathConfusion::RejectNonCanonical) mode's presence
+    /// [`RequireCanonical`](GuardMode::RequireCanonical) mode's presence
     /// deny; the default mode judges case by relocation instead
-    /// ([`DenyReason::CaseFoldRelocation`]).
+    /// ([`ResolveError::CaseFoldRuleChange`]).
     Uppercase,
 }
 
@@ -273,14 +264,14 @@ impl std::fmt::Display for StructuralClass {
 ///
 /// The attribution is what makes a `400` actionable instead of a dead end: each
 /// variant names the check, and its documentation names the sanctioned remedy (a
-/// [`blob_subtree`](crate::RuleRouterBuilder::blob_subtree) registration for opaque
+/// [`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) registration for opaque
 /// keys, a configuration declaration to review, …). Use [`Display`](std::fmt::Display)
 /// for an attributed log line; use [`message`](Self::message) for the short static
 /// string suitable for the denial response body (it deliberately does not vary with
 /// the attribution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum DenyReason {
+pub enum ResolveError {
     /// The route tree returned an ID absent from the rule table. This indicates an
     /// internal invariant violation, not invalid client input. Deny the request and
     /// report an internal server error; never authorize it using the default rule.
@@ -293,7 +284,7 @@ pub enum DenyReason {
     /// relocate the request — some rule other than the matched one is reachable
     /// within the byte's anchored scope. Remedies: if the prefix legitimately
     /// carries opaque keys, register it as a whole single-rule subtree
-    /// (`subtree`/`blob_subtree`) so its uniformity is visible; a NUL has no remedy
+    /// (`subtree`/`exclusive_subtree`) so its uniformity is visible; a NUL has no remedy
     /// by design. The full triage procedure is
     /// [Handling a denial](crate::_docs::guide::handling_denials).
     Structural(StructuralClass),
@@ -301,13 +292,13 @@ pub enum DenyReason {
     /// *different* rule than the raw path matched (backend declared
     /// [`CaseSensitivity::Insensitive`]). Not an over-approximation — a fold that
     /// stays within its own rule is allowed.
-    CaseFoldRelocation,
+    CaseFoldRuleChange,
     /// The precise content-decode check: one of the possible completely decoded
-    /// forms (one pass, plus two under [`DecodeLayers::UpToTwo`], lowercased under
+    /// forms (one pass, plus two under [`DecodeDepth::UpToTwo`], lowercased under
     /// a case-folding backend) relocates the path to a *different* rule. Not an
     /// over-approximation — same-rule decodes (`/foo%20bar`) are allowed.
-    DecodeRelocation,
-    /// The strict [`RejectNonCanonical`](PathConfusion::RejectNonCanonical) mode's
+    DecodeRuleChange,
+    /// The strict [`RequireCanonical`](GuardMode::RequireCanonical) mode's
     /// presence deny: a structural form of this class, anywhere in the path.
     NonCanonical(StructuralClass),
     /// The strict mode's escape rule: the path carries a percent-escape at all.
@@ -320,7 +311,7 @@ pub enum DenyReason {
     TooLong,
 }
 
-impl DenyReason {
+impl ResolveError {
     /// The short, static denial message for the HTTP response body. Deliberately
     /// coarse — it does not vary with the attribution, so a response leaks nothing
     /// about the route table; put [`Display`](std::fmt::Display) in the *log* instead.
@@ -330,8 +321,8 @@ impl DenyReason {
             Self::InvalidRuleId => "Internal routing error",
             Self::InvalidPathInput => "Invalid request path",
             Self::Structural(_)
-            | Self::CaseFoldRelocation
-            | Self::DecodeRelocation
+            | Self::CaseFoldRuleChange
+            | Self::DecodeRuleChange
             | Self::Probe(_) => "Ambiguous request path",
             Self::NonCanonical(_) | Self::NonCanonicalEscape => "Non-canonical request path",
             Self::TooLong => "Request path too long",
@@ -339,7 +330,9 @@ impl DenyReason {
     }
 }
 
-impl std::fmt::Display for DenyReason {
+impl std::error::Error for ResolveError {}
+
+impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRuleId => {
@@ -354,10 +347,10 @@ impl std::fmt::Display for DenyReason {
                     "ambiguous request path: {c} in a route-relevant position"
                 )
             }
-            Self::CaseFoldRelocation => {
+            Self::CaseFoldRuleChange => {
                 f.write_str("ambiguous request path: case-folding relocates it to a different rule")
             }
-            Self::DecodeRelocation => f.write_str(
+            Self::DecodeRuleChange => f.write_str(
                 "ambiguous request path: percent-decoding relocates it to a different rule",
             ),
             Self::NonCanonical(c) => write!(f, "non-canonical request path: {c}"),
@@ -399,7 +392,7 @@ pub enum StructuralChar {
 ///
 /// `matches` must be **pure, deterministic, and ~O(n)** — it runs on every request.
 /// The check is **whole-path**: presence *anywhere* denies, even inside an opaque
-/// `blob_subtree` tail that tolerates the built-in separator-like forms. That is the
+/// `exclusive_subtree` tail that tolerates the built-in separator-like forms. That is the
 /// monotonic, blunt semantics of a custom detector — by construction it can only
 /// ever deny *more*, never fewer, at the
 /// cost of also rejecting legitimate content that carries the form. Scope the
@@ -423,7 +416,7 @@ pub trait StructuralProbe: Send + Sync {
 /// equivalent:
 ///
 /// ```
-/// # use huskarl_route_guard::path_confusion::{StructuralClasses, StructuralChar};
+/// # use huskarl_route_guard::config::{StructuralClasses, StructuralChar};
 /// // A Windows/IIS-style backend that also decodes overlong UTF-8.
 /// let classes = StructuralClasses::new()
 ///     .with_backslash()
@@ -433,7 +426,7 @@ pub trait StructuralProbe: Send + Sync {
 /// Each toggle is a per-deployment **security** decision: enabling a class makes the
 /// guard treat that form as route structure (so it checks wherever a wildcard or
 /// catch-all matched it); leaving it off assumes the backend does not. Two declarations are **not**
-/// here, deliberately: case ([`CaseSensitivity`]) and decode depth ([`DecodeLayers`])
+/// here, deliberately: case ([`CaseSensitivity`]) and decode depth ([`DecodeDepth`])
 /// are required, separate declarations on the builder rather than opt-ins, because
 /// every deployment must answer them.
 // Each field is an independent, orthogonal class/encoding toggle — a flat set of
@@ -501,7 +494,7 @@ impl StructuralClasses {
     /// (U+2044 fraction slash, U+2215 division slash). For either, use a
     /// [`with_probe`](Self::with_probe) — e.g. one that denies non-ASCII paths.
     #[must_use]
-    pub fn with_unicode_normalization(mut self) -> Self {
+    pub fn with_fullwidth_structure(mut self) -> Self {
         self.unicode = true;
         self
     }
@@ -547,11 +540,7 @@ mod tests {
     #[test]
     fn builders_toggle_their_field() {
         assert!(StructuralClasses::new().with_backslash().backslash);
-        assert!(
-            StructuralClasses::new()
-                .with_unicode_normalization()
-                .unicode
-        );
+        assert!(StructuralClasses::new().with_fullwidth_structure().unicode);
 
         let both =
             StructuralClasses::new().with_overlong([StructuralChar::Slash, StructuralChar::Dot]);
@@ -564,34 +553,34 @@ mod tests {
     fn deny_reason_messages_stay_static_and_coarse() {
         // The response-body string is deliberately coarse (no attribution leaks into
         // the response); the attributed detail lives in Display for logs.
-        let d = DenyReason::Structural(StructuralClass::Separator);
+        let d = ResolveError::Structural(StructuralClass::Separator);
         assert_eq!(d.message(), "Ambiguous request path");
         assert!(d.to_string().contains("separator"));
         assert_eq!(
-            DenyReason::CaseFoldRelocation.message(),
+            ResolveError::CaseFoldRuleChange.message(),
             "Ambiguous request path"
         );
         assert_eq!(
-            DenyReason::DecodeRelocation.message(),
+            ResolveError::DecodeRuleChange.message(),
             "Ambiguous request path"
         );
-        assert_eq!(DenyReason::Probe("p").message(), "Ambiguous request path");
+        assert_eq!(ResolveError::Probe("p").message(), "Ambiguous request path");
         assert_eq!(
-            DenyReason::NonCanonical(StructuralClass::DotSegment).message(),
+            ResolveError::NonCanonical(StructuralClass::DotSegment).message(),
             "Non-canonical request path"
         );
         assert_eq!(
-            DenyReason::NonCanonicalEscape.message(),
+            ResolveError::NonCanonicalEscape.message(),
             "Non-canonical request path"
         );
-        assert_eq!(DenyReason::TooLong.message(), "Request path too long");
+        assert_eq!(ResolveError::TooLong.message(), "Request path too long");
         assert_eq!(
-            DenyReason::InvalidPathInput.message(),
+            ResolveError::InvalidPathInput.message(),
             "Invalid request path"
         );
         // The probe's name reaches the log line.
         assert!(
-            DenyReason::Probe("reject-non-ascii")
+            ResolveError::Probe("reject-non-ascii")
                 .to_string()
                 .contains("reject-non-ascii")
         );

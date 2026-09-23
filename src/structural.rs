@@ -13,7 +13,7 @@
 //! [`route_tree`](crate::route_tree)'s owned segment-tree matcher and
 //! `PathConfusionGuard`, which call [`scan`] here. [`enabled_classes`] /
 //! [`enabled_encodings`] derive the scan's masks from the configured
-//! [`StructuralClasses`](crate::path_confusion::StructuralClasses).
+//! [`StructuralClasses`](crate::config::StructuralClasses).
 
 use crate::percent::{byte_at, double_byte_at, fullwidth_at, overlong_at};
 
@@ -24,7 +24,7 @@ use crate::percent::{byte_at, double_byte_at, fullwidth_at, overlong_at};
 ///
 /// The default classes — separator, dot-segment, param, truncation — are the byte
 /// forms covered by
-/// [`StructuralClasses::new`](crate::path_confusion::StructuralClasses::new).
+/// [`StructuralClasses::new`](crate::config::StructuralClasses::new).
 /// [`BACKSLASH`](ClassSet::BACKSLASH) is opt-in (it maps one-for-one to
 /// `with_backslash` and is turned on by [`enabled_classes`] when configured), and
 /// [`CASE`](ClassSet::CASE) comes from the required `CaseSensitivity` declaration.
@@ -42,7 +42,7 @@ impl ClassSet {
     /// *single* literal `/` is not here: the router already saw it. Backslash
     /// (`\`/`%5C`) is deliberately **not** in this class — treating `\` as a
     /// separator is Windows/IIS-specific, so it gets its own opt-in class (mirroring
-    /// [`StructuralClasses::with_backslash`](crate::path_confusion::StructuralClasses::with_backslash),
+    /// [`StructuralClasses::with_backslash`](crate::config::StructuralClasses::with_backslash),
     /// excluded from the default) rather than riding on this default-on class.
     pub(crate) const SEPARATOR: ClassSet = ClassSet(1 << 0);
     /// A `.`/`..` segment (literal) or an encoded dot (`%2E`) that could form one —
@@ -61,7 +61,7 @@ impl ClassSet {
     /// shifts segment boundaries exactly as [`SEPARATOR`](Self::SEPARATOR) does. Its
     /// own class (not folded into `SEPARATOR`) so the default `/` separator never
     /// silently turns on Windows-specific `\` handling. Opt-in, mirroring
-    /// [`StructuralClasses::with_backslash`](crate::path_confusion::StructuralClasses::with_backslash).
+    /// [`StructuralClasses::with_backslash`](crate::config::StructuralClasses::with_backslash).
     pub(crate) const BACKSLASH: ClassSet = ClassSet(1 << 5);
 
     /// The empty set.
@@ -128,7 +128,7 @@ impl std::fmt::Debug for ClassSet {
 /// unless the matching opt-in normalization is configured (their decoded forms are
 /// not a differential for a standards-conforming backend), so a default config pays
 /// nothing and never rejects them. Derived from the route's
-/// [`StructuralClasses`](crate::path_confusion::StructuralClasses) by
+/// [`StructuralClasses`](crate::config::StructuralClasses) by
 /// [`enabled_encodings`].
 // Each field is an independent, orthogonal alternate-encoding toggle — a flat set of
 // booleans is the clearest representation here.
@@ -137,21 +137,21 @@ impl std::fmt::Debug for ClassSet {
 pub(crate) struct Encodings {
     /// Recognise overlong UTF-8 forms of `/` (`%C0%AF`, `%E0%80%AF`, …) as
     /// [`SEPARATOR`](ClassSet::SEPARATOR). From
-    /// [`OverlongUtf8 { slash: true, .. }`](crate::path_confusion::StructuralClasses::with_overlong).
+    /// [`OverlongUtf8 { slash: true, .. }`](crate::config::StructuralClasses::with_overlong).
     pub(crate) overlong_slash: bool,
     /// Recognise overlong UTF-8 forms of `.` (`%C0%AE`, …) as
     /// [`DOT_SEGMENT`](ClassSet::DOT_SEGMENT). From
-    /// [`OverlongUtf8 { dot: true, .. }`](crate::path_confusion::StructuralClasses::with_overlong).
+    /// [`OverlongUtf8 { dot: true, .. }`](crate::config::StructuralClasses::with_overlong).
     pub(crate) overlong_dot: bool,
     /// Recognise double-percent-encoded structural bytes (`%252F` → `/`, `%253B`
     /// → `;`, …) as their class. From the required
-    /// [`DecodeLayers`](crate::path_confusion::DecodeLayers) declaration
-    /// ([`UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo)).
+    /// [`DecodeDepth`](crate::config::DecodeDepth) declaration
+    /// ([`UpToTwo`](crate::config::DecodeDepth::UpToTwo)).
     pub(crate) double_decode: bool,
     /// Recognise the fullwidth-form structural confusables (`／`→`/`, `．`→`.`, `；`→`;`,
     /// `＼`→`\`) that NFKC normalization folds to a delimiter, in raw or percent-encoded
     /// form. From
-    /// [`with_unicode_normalization`](crate::path_confusion::StructuralClasses::with_unicode_normalization).
+    /// [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure).
     pub(crate) unicode: bool,
 }
 
@@ -329,7 +329,7 @@ fn double_encoded_class(b: &[u8], i: usize) -> ClassSet {
 ///   [`PARAM`](ClassSet::PARAM)** — literal `;`, `%3B`, double-encoded `%253B`, and the
 ///   fullwidth `；` — so an *encoded* matrix param reveals the dot-segment exactly as a
 ///   literal one does. (Without this, `..%3bx` would flag only `PARAM`, which an opaque
-///   `blob_subtree` tolerates, letting traversal escape the blob.)
+///   `exclusive_subtree` tolerates, letting traversal escape the blob.)
 /// - **separator decode** turns `a%2f..%2fadmin` into `a/../admin` — the literal `..` is
 ///   flanked by *encoded* slashes, so it is not a whole literal segment, yet a backend
 ///   that decodes `%2F` and resolves dot-segments climbs out of the matched rule.
@@ -536,26 +536,26 @@ fn delimiter_at(
     None
 }
 
-/// The structural classes a [`StructuralClasses`](crate::path_confusion::StructuralClasses)
+/// The structural classes a [`StructuralClasses`](crate::config::StructuralClasses)
 /// set makes dangerous — the `structural_enabled` mask for the structural modes.
 ///
 /// The default quartet (separator, dot-segment, param, truncation) is **always on**;
 /// the opt-in backslash toggle adds its mirror class one-for-one:
-/// [`with_backslash`](crate::path_confusion::StructuralClasses::with_backslash) →
+/// [`with_backslash`](crate::config::StructuralClasses::with_backslash) →
 /// [`BACKSLASH`](ClassSet::BACKSLASH). The [`CASE`](ClassSet::CASE) class is **not**
 /// derived here — the structural guard adds it from the required
-/// [`CaseSensitivity`](crate::path_confusion::CaseSensitivity) declaration, where it
+/// [`CaseSensitivity`](crate::config::CaseSensitivity) declaration, where it
 /// gates the strict mode's presence-deny and triggers the precise case-fold check
 /// (it is masked out of the default mode's positional scan).
 ///
 /// The *alternate encodings* those classes can also arrive in — overlong-UTF-8 and
 /// double-percent forms — are recognised by the scanner only when the matching
 /// toggle/declaration is set; see [`enabled_encodings`]. A custom
-/// [`StructuralProbe`](crate::path_confusion::StructuralProbe) is opaque to the class
+/// [`StructuralProbe`](crate::config::StructuralProbe) is opaque to the class
 /// machinery and instead reaches the structural modes through the whole-path
 /// break-glass scan in [`RuleRouter`](crate::path_router); it does not refine the
 /// class masks computed here.
-pub(crate) fn enabled_classes(classes: &crate::path_confusion::StructuralClasses) -> ClassSet {
+pub(crate) fn enabled_classes(classes: &crate::config::StructuralClasses) -> ClassSet {
     // The always-on quartet, then the opt-in backslash class (case is added
     // separately by the router from the CaseSensitivity declaration).
     let mut enabled =
@@ -571,11 +571,11 @@ pub(crate) fn enabled_classes(classes: &crate::path_confusion::StructuralClasses
 /// that decodes them is being modelled. The companion to [`enabled_classes`]: that
 /// picks *which classes* deny, this picks *which encoded forms* of them the scanner
 /// even looks at. Double-percent forms come from the required
-/// [`DecodeLayers`](crate::path_confusion::DecodeLayers)
+/// [`DecodeDepth`](crate::config::DecodeDepth)
 /// declaration, not from the opt-in class set.
 pub(crate) fn enabled_encodings(
-    classes: &crate::path_confusion::StructuralClasses,
-    layers: crate::path_confusion::DecodeLayers,
+    classes: &crate::config::StructuralClasses,
+    layers: crate::config::DecodeDepth,
 ) -> Encodings {
     Encodings {
         overlong_slash: classes.overlong_slash,
@@ -585,13 +585,13 @@ pub(crate) fn enabled_encodings(
     }
 }
 
-/// The [`StructuralClass`](crate::path_confusion::StructuralClass) reported for a
+/// The [`StructuralClass`](crate::config::StructuralClass) reported for a
 /// denying [`ClassSet`] — the attribution carried by
-/// [`DenyReason`](crate::path_confusion::DenyReason). More than one class can be
+/// [`ResolveError`](crate::config::ResolveError). More than one class can be
 /// present; the most consequential is reported, in the fixed order dot-segment >
 /// truncation > separator > param > backslash > case.
-pub(crate) fn primary_class(present: ClassSet) -> crate::path_confusion::StructuralClass {
-    use crate::path_confusion::StructuralClass;
+pub(crate) fn primary_class(present: ClassSet) -> crate::config::StructuralClass {
+    use crate::config::StructuralClass;
     if present.contains_any(ClassSet::DOT_SEGMENT) {
         StructuralClass::DotSegment
     } else if present.contains_any(ClassSet::TRUNCATION) {
@@ -1080,7 +1080,7 @@ mod tests {
         assert!(
             classes_present("/a%f0%80%80%afb", all_enabled(), on).contains_any(ClassSet::SEPARATOR)
         );
-        // Off by default: a standards-conforming backend doesn't decode overlong.
+        // Disabled by default: a standards-conforming backend doesn't decode overlong.
         assert!(!present("/a%c0%afb").contains_any(ClassSet::SEPARATOR));
         assert!(!present("/a%c0%aeb").contains_any(ClassSet::DOT_SEGMENT));
     }
@@ -1118,7 +1118,7 @@ mod tests {
         assert!(classes_present("/a%253bb", all_enabled(), on).contains_any(ClassSet::PARAM));
         assert!(classes_present("/a%255cb", all_enabled(), on).contains_any(ClassSet::BACKSLASH));
         assert!(classes_present("/a%2500b", all_enabled(), on).contains_any(ClassSet::TRUNCATION));
-        // Off by default: a single backend pass leaves `%252f` as `%2f`.
+        // Disabled by default: a single backend pass leaves `%252f` as `%2f`.
         assert!(!present("/a%252fb").contains_any(ClassSet::SEPARATOR));
         // A plain single-encoded `%2f` is still detected without double_decode.
         assert!(present("/a%2fb").contains_any(ClassSet::SEPARATOR));
@@ -1141,7 +1141,7 @@ mod tests {
         assert!(
             classes_present("/a%ef%bc%8fb", all_enabled(), on).contains_any(ClassSet::SEPARATOR)
         );
-        // Off by default: a backend that doesn't normalize sees opaque bytes.
+        // Disabled by default: a backend that doesn't normalize sees opaque bytes.
         assert!(!present("/a／b").contains_any(ClassSet::SEPARATOR));
         assert!(!present("/a%ef%bc%8fb").contains_any(ClassSet::SEPARATOR));
     }
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[test]
     fn enabled_classes_default_is_the_quartet() {
-        use crate::path_confusion::StructuralClasses;
+        use crate::config::StructuralClasses;
         let e = enabled_classes(&StructuralClasses::new());
         assert!(e.contains_any(ClassSet::SEPARATOR));
         assert!(e.contains_any(ClassSet::DOT_SEGMENT));
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn opt_in_classes_enable_their_class() {
-        use crate::path_confusion::StructuralClasses;
+        use crate::config::StructuralClasses;
         // CASE is not derived from StructuralClasses (it comes from CaseSensitivity);
         // the backslash opt-in is.
         assert!(
@@ -1193,7 +1193,7 @@ mod tests {
 
     #[test]
     fn probes_and_encodings_enable_no_extra_class() {
-        use crate::path_confusion::{StructuralClasses, StructuralProbe};
+        use crate::config::{StructuralClasses, StructuralProbe};
 
         struct Noop;
         impl StructuralProbe for Noop {
@@ -1215,7 +1215,7 @@ mod tests {
             enabled_classes(
                 &StructuralClasses::new()
                     .with_probe(Noop)
-                    .with_overlong([crate::path_confusion::StructuralChar::Slash])
+                    .with_overlong([crate::config::StructuralChar::Slash])
             ),
             quartet
         );
@@ -1223,31 +1223,31 @@ mod tests {
 
     #[test]
     fn enabled_encodings_derived_from_config() {
-        use crate::path_confusion::{DecodeLayers, StructuralChar, StructuralClasses};
+        use crate::config::{DecodeDepth, StructuralChar, StructuralClasses};
 
-        // Default set + Single models no overlong / double-decoding backend.
+        // Default set + UpToOne models no overlong / double-decoding backend.
         assert_eq!(
-            enabled_encodings(&StructuralClasses::new(), DecodeLayers::Single),
+            enabled_encodings(&StructuralClasses::new(), DecodeDepth::UpToOne),
             Encodings::none()
         );
 
         let overlong = enabled_encodings(
             &StructuralClasses::new().with_overlong([StructuralChar::Slash]),
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
         );
         assert!(overlong.overlong_slash);
         assert!(!overlong.overlong_dot, "only slash was requested");
         assert!(!overlong.double_decode);
 
-        // The double-percent scan comes from the DecodeLayers declaration alone.
-        let up_to_two = enabled_encodings(&StructuralClasses::new(), DecodeLayers::UpToTwo);
+        // The double-percent scan comes from the DecodeDepth declaration alone.
+        let up_to_two = enabled_encodings(&StructuralClasses::new(), DecodeDepth::UpToTwo);
         assert!(up_to_two.double_decode);
         assert!(!up_to_two.overlong_slash);
     }
 
     #[test]
     fn primary_class_reports_most_consequential() {
-        use crate::path_confusion::StructuralClass;
+        use crate::config::StructuralClass;
         let all = all_enabled();
         assert_eq!(
             primary_class(ClassSet::DOT_SEGMENT | ClassSet::SEPARATOR),

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::{
-    path_confusion::{DenyReason, GuardConfig, PathConfusion, StructuralProbe},
+    config::{GuardConfig, GuardMode, ResolveError, StructuralProbe},
     route_tree::{Cover, DEFAULT_RULE, Router, RuleId},
     structural::{
         ClassSet, Encodings, ScanResult, classes_present, enabled_classes, enabled_encodings,
@@ -41,7 +41,7 @@ const MAX_PATH_LEN: usize = 8192;
 /// checks are exact, is [`crate::_docs::explanation::decision`].
 pub(crate) struct PathConfusionGuard {
     router: Router,
-    mode: PathConfusion,
+    mode: GuardMode,
     /// Byte classes that deny, derived from the configured classes plus (when the backend
     /// folds case) [`ClassSet::CASE`].
     enabled: ClassSet,
@@ -58,9 +58,9 @@ impl PathConfusionGuard {
     /// Build a guard over `router` for the given mode and structural configuration.
     pub(crate) fn new(router: Router, config: GuardConfig) -> Self {
         let GuardConfig {
-            path_confusion: mode,
+            mode,
             structural_classes: classes,
-            decode_layers: layers,
+            decode_depth: layers,
             case_sensitivity: case,
         } = config;
         let mut enabled = enabled_classes(&classes);
@@ -78,21 +78,21 @@ impl PathConfusionGuard {
     }
 
     /// The deny reason for `path`, or `None` to allow — the attributed core used by
-    /// the router. [`DenyReason::message`] gives the static response-body string;
+    /// the router. [`ResolveError::message`] gives the static response-body string;
     /// its `Display` gives the attributed log line.
-    pub(crate) fn verdict(&self, path: &str, method: &http::Method) -> Option<DenyReason> {
+    pub(crate) fn verdict(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
         match self.mode {
-            PathConfusion::Off => None,
-            PathConfusion::RejectStructural => self
+            GuardMode::Disabled => None,
+            GuardMode::RejectAmbiguous => self
                 .positional_deny(path)
                 .or_else(|| self.case_fold_deny(path, method))
                 .or_else(|| self.content_decode_deny(path, method))
                 .or_else(|| self.custom_probe_deny(path)),
             // Strict: every position live (opaque ignored) and any percent-escape is
             // itself non-canonical.
-            PathConfusion::RejectNonCanonical => self
+            GuardMode::RequireCanonical => self
                 .noncanonical_deny(path)
-                .or_else(|| escape_present(path).then_some(DenyReason::NonCanonicalEscape))
+                .or_else(|| escape_present(path).then_some(ResolveError::NonCanonicalEscape))
                 .or_else(|| self.custom_probe_deny(path)),
         }
     }
@@ -100,12 +100,12 @@ impl PathConfusionGuard {
     /// Break-glass verdict: deny if any registered custom probe recognises its form
     /// anywhere in `path`, attributing the probe by name. A no-op (one `is_empty`)
     /// when no probe is registered.
-    fn custom_probe_deny(&self, path: &str) -> Option<DenyReason> {
+    fn custom_probe_deny(&self, path: &str) -> Option<ResolveError> {
         let probe = self.probes.iter().find(|p| p.matches(path))?;
         if path.len() > MAX_PATH_LEN {
-            Some(DenyReason::TooLong)
+            Some(ResolveError::TooLong)
         } else {
-            Some(DenyReason::Probe(probe.name()))
+            Some(ResolveError::Probe(probe.name()))
         }
     }
 
@@ -121,7 +121,7 @@ impl PathConfusionGuard {
         self.router.resolve(path, method)
     }
 
-    /// Positional verdict for [`PathConfusion::RejectStructural`] — the **scoped
+    /// Positional verdict for [`GuardMode::RejectAmbiguous`] — the **scoped
     /// denial**. A clean path (no enabled structural byte) is the fast path and never
     /// walks the tree; a flagged path is denied unless every rule reachable past its
     /// anchor is the very rule it matched (see [`Router::anchor_cover`]).
@@ -137,7 +137,7 @@ impl PathConfusionGuard {
     /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
     /// [`case_fold_deny`](Self::case_fold_deny) instead, so an uppercase byte alone
     /// never denies positionally (only an actual fold relocation does).
-    fn positional_deny(&self, path: &str) -> Option<DenyReason> {
+    fn positional_deny(&self, path: &str) -> Option<ResolveError> {
         let enabled = self.enabled.without(ClassSet::CASE);
         let scan = scan(path, enabled, self.enc);
         let present = scan.classes.intersect(enabled);
@@ -145,22 +145,22 @@ impl PathConfusionGuard {
             return None;
         }
         if path.len() > MAX_PATH_LEN {
-            return Some(DenyReason::TooLong);
+            return Some(ResolveError::TooLong);
         }
         if present.contains_any(ClassSet::TRUNCATION) {
-            return Some(DenyReason::Structural(primary_class(present)));
+            return Some(ResolveError::Structural(primary_class(present)));
         }
         // `present` non-empty guarantees an offset (a fuzzed ScanResult invariant);
         // fail closed rather than panic if it ever doesn't.
         let Some(offset) = scan.earliest else {
-            return Some(DenyReason::Structural(primary_class(present)));
+            return Some(ResolveError::Structural(primary_class(present)));
         };
         let anchor = self.anchor_for(path, &scan, offset);
         let matched = self.router.route_id(path).unwrap_or(DEFAULT_RULE);
         if self.router.anchor_cover(anchor) == Cover::Uniform(matched) {
             None
         } else {
-            Some(DenyReason::Structural(primary_class(present)))
+            Some(ResolveError::Structural(primary_class(present)))
         }
     }
 
@@ -235,42 +235,42 @@ impl PathConfusionGuard {
     /// percent-decoding is covered by [`content_decode_deny`](Self::content_decode_deny),
     /// which folds the decoded path before re-routing. Only ASCII case is modeled,
     /// mirroring [`CaseSensitivity`].
-    fn case_fold_deny(&self, path: &str, method: &http::Method) -> Option<DenyReason> {
+    fn case_fold_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
         if !self.case_insensitive || !path.bytes().any(|b| b.is_ascii_uppercase()) {
             return None;
         }
         if path.len() > MAX_PATH_LEN {
-            return Some(DenyReason::TooLong);
+            return Some(ResolveError::TooLong);
         }
         let folded = path.to_ascii_lowercase();
         (self.router.resolve(&folded, method) != self.router.resolve(path, method))
-            .then_some(DenyReason::CaseFoldRelocation)
+            .then_some(ResolveError::CaseFoldRuleChange)
     }
 
-    /// Positional verdict for [`PathConfusion::RejectNonCanonical`]: every position live,
+    /// Positional verdict for [`GuardMode::RequireCanonical`]: every position live,
     /// opaque declarations ignored, so any enabled structural byte denies.
-    fn noncanonical_deny(&self, path: &str) -> Option<DenyReason> {
+    fn noncanonical_deny(&self, path: &str) -> Option<ResolveError> {
         let present = classes_present(path, self.enabled, self.enc).intersect(self.enabled);
         if present.is_empty() {
             return None;
         }
         if path.len() > MAX_PATH_LEN {
-            return Some(DenyReason::TooLong);
+            return Some(ResolveError::TooLong);
         }
-        Some(DenyReason::NonCanonical(primary_class(present)))
+        Some(ResolveError::NonCanonical(primary_class(present)))
     }
 
     /// Content-decode verdict: model every possible complete-path result — one decode
-    /// pass, plus two under [`DecodeLayers::UpToTwo`] — and deny if any possible result
+    /// pass, plus two under [`DecodeDepth::UpToTwo`] — and deny if any possible result
     /// **relocates** the path to a different rule than the raw path matched. Precise —
     /// results that all land on the same rule (`/foo%20bar`) are allowed, so opaque
     /// content flows.
-    fn content_decode_deny(&self, path: &str, method: &http::Method) -> Option<DenyReason> {
+    fn content_decode_deny(&self, path: &str, method: &http::Method) -> Option<ResolveError> {
         if !path.contains('%') {
             return None;
         }
         if path.len() > MAX_PATH_LEN {
-            return Some(DenyReason::TooLong);
+            return Some(ResolveError::TooLong);
         }
         let passes = if self.enc.double_decode { 2 } else { 1 };
         let raw = path.as_bytes();
@@ -286,7 +286,7 @@ impl PathConfusionGuard {
                 self.router.resolve_bytes(&decoded, method)
             };
             if decoded_rule != raw_rule {
-                return Some(DenyReason::DecodeRelocation);
+                return Some(ResolveError::DecodeRuleChange);
             }
         }
         None
@@ -337,7 +337,7 @@ fn raise(prefix: &str, k: usize) -> &str {
     p
 }
 
-/// Whether `path` carries any complete `%XX` escape — the [`PathConfusion::RejectNonCanonical`]
+/// Whether `path` carries any complete `%XX` escape — the [`GuardMode::RequireCanonical`]
 /// "any escape is non-canonical" rule.
 fn escape_present(path: &str) -> bool {
     let b = path.as_bytes();
@@ -380,24 +380,24 @@ mod tests {
 
     use super::*;
     use crate::{
-        path_confusion::{CaseSensitivity, DecodeLayers, StructuralClasses},
+        config::{CaseSensitivity, DecodeDepth, StructuralClasses},
         route_tree::{BuildError, MethodMatch, parse_pattern},
     };
 
     fn guard(
         rows: &[(&str, RuleId, bool)],
-        mode: PathConfusion,
+        mode: GuardMode,
         classes: StructuralClasses,
         case: CaseSensitivity,
     ) -> PathConfusionGuard {
-        guard_layers(rows, mode, classes, DecodeLayers::Single, case)
+        guard_layers(rows, mode, classes, DecodeDepth::UpToOne, case)
     }
 
     fn guard_layers(
         rows: &[(&str, RuleId, bool)],
-        mode: PathConfusion,
+        mode: GuardMode,
         classes: StructuralClasses,
-        layers: DecodeLayers,
+        layers: DecodeDepth,
         case: CaseSensitivity,
     ) -> PathConfusionGuard {
         let entries: Vec<_> = rows
@@ -407,9 +407,9 @@ mod tests {
         PathConfusionGuard::new(
             Router::build(&entries).expect("build"),
             GuardConfig {
-                path_confusion: mode,
+                mode,
                 structural_classes: classes,
-                decode_layers: layers,
+                decode_depth: layers,
                 case_sensitivity: case,
             },
         )
@@ -420,7 +420,7 @@ mod tests {
     fn clean_paths_allowed() {
         let g = guard(
             &[("/admin/*", 0, false), ("/users/*", 1, false)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -441,7 +441,7 @@ mod tests {
                 ("/files/", 0, false),
                 ("/files/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -484,12 +484,12 @@ mod tests {
     /// A lone catch-all pattern is **not** a uniform subtree: without its `/files/`
     /// (and `/files`) companions, the empty remainder — reachable via a `;`-strip —
     /// falls to the default rule, so boundary-shift bytes keep denying. Register the
-    /// full subtree (`subtree`/`blob_subtree` do) to get the relaxation.
+    /// full subtree (`subtree`/`exclusive_subtree` do) to get the relaxation.
     #[test]
     fn lone_catchall_is_not_uniform() {
         let g = guard(
             &[("/files/*", 0, true)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -508,7 +508,7 @@ mod tests {
                 ("/files/", 0, false),
                 ("/files/*", 0, true),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -534,7 +534,7 @@ mod tests {
     fn incomplete_coverage_denies_boundary_shift_everywhere() {
         let g = guard(
             &[("/files/*/*", 0, true)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -557,7 +557,7 @@ mod tests {
                 ("/admin/", 0, false),
                 ("/admin/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -580,7 +580,7 @@ mod tests {
     fn root_leaf_merge_relocation_denied() {
         let split = guard(
             &[("/", 1, false), ("/*", 0, false)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -590,7 +590,7 @@ mod tests {
         );
         let uniform = guard(
             &[("/", 0, false), ("/*", 0, false)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -631,7 +631,7 @@ mod tests {
         ];
         let g = PathConfusionGuard::new(
             Router::build(&entries).expect("build"),
-            GuardConfig::new(CaseSensitivity::Sensitive, DecodeLayers::Single),
+            GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne),
         );
         assert!(
             g.ambiguous("/files/a%2fb"),
@@ -644,7 +644,7 @@ mod tests {
     fn noncanonical_ignores_opaque_and_denies_escapes() {
         let g = guard(
             &[("/files/*", 0, true)],
-            PathConfusion::RejectNonCanonical,
+            GuardMode::RequireCanonical,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -659,7 +659,7 @@ mod tests {
         let rows = &[("/admin", 0, false)];
         let sensitive = guard(
             rows,
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -670,7 +670,7 @@ mod tests {
 
         let insensitive = guard(
             rows,
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Insensitive,
         );
@@ -694,7 +694,7 @@ mod tests {
                 ("/users/*", 1, false),
                 ("/users/admin", 2, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Insensitive,
         );
@@ -720,7 +720,7 @@ mod tests {
         // Strict mode stays blunt: any uppercase is non-canonical there.
         let strict = guard(
             &[("/files/*", 0, false)],
-            PathConfusion::RejectNonCanonical,
+            GuardMode::RequireCanonical,
             StructuralClasses::new(),
             CaseSensitivity::Insensitive,
         );
@@ -741,7 +741,7 @@ mod tests {
                 ("/files/", 0, false),
                 ("/files/*", 0, true),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Insensitive,
         );
@@ -766,7 +766,7 @@ mod tests {
     fn raw_nul_truncation_denied_by_default() {
         let g = guard(
             &[("/a", 0, false), ("/a/", 0, false), ("/a/*", 0, false)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -777,7 +777,7 @@ mod tests {
         // escapes any span.
         let blob = guard(
             &[("/files/*", 0, true)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -785,8 +785,8 @@ mod tests {
     }
 
     /// Up-to-two decode is a required declaration, not a class toggle: under
-    /// [`DecodeLayers::UpToTwo`] the double-encoded traversal that slips a single-pass
-    /// front (the CVE-2025-0108 shape) is denied; under `Single` a `%252e` reaches the
+    /// [`DecodeDepth::UpToTwo`] the double-encoded traversal that slips a single-pass
+    /// front (the CVE-2025-0108 shape) is denied; under `UpToOne` a `%252e` reaches the
     /// lone backend as the literal `%2e` and is not structure.
     #[test]
     fn decode_layers_gates_double_encoding() {
@@ -798,9 +798,9 @@ mod tests {
         ];
         let up_to_two = guard_layers(
             rows,
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
-            DecodeLayers::UpToTwo,
+            DecodeDepth::UpToTwo,
             CaseSensitivity::Sensitive,
         );
         assert!(
@@ -821,9 +821,9 @@ mod tests {
         );
         let single = guard_layers(
             rows,
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
-            DecodeLayers::Single,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         );
         assert!(
@@ -841,7 +841,7 @@ mod tests {
                 ("/admin/", 0, false),
                 ("/admin/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -864,7 +864,7 @@ mod tests {
                 ("/admin/", 0, false),
                 ("/admin/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -895,7 +895,7 @@ mod tests {
                 ("/admin/", 0, false),
                 ("/admin/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Insensitive,
         );
@@ -910,7 +910,7 @@ mod tests {
                 ("/admin/", 0, false),
                 ("/admin/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -920,12 +920,12 @@ mod tests {
         );
     }
 
-    /// `Off` disables the guard entirely.
+    /// `Disabled` disables the guard entirely.
     #[test]
     fn off_allows_everything() {
         let g = guard(
             &[("/files/*", 0, false)],
-            PathConfusion::Off,
+            GuardMode::Disabled,
             StructuralClasses::new(),
             CaseSensitivity::Sensitive,
         );
@@ -942,12 +942,12 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use crate::path_confusion::StructuralChar;
+    use crate::config::StructuralChar;
 
     /// A structural configuration, with a monotone `tighten` for the L2 law.
     #[derive(Clone, Debug)]
     struct Cfg {
-        mode: PathConfusion,
+        mode: GuardMode,
         insensitive: bool,
         backslash: bool,
         up_to_two: bool,
@@ -959,7 +959,7 @@ mod tests {
         /// The default-config baseline: positional reject, standard alphabet, sensitive.
         fn structural() -> Self {
             Self {
-                mode: PathConfusion::RejectStructural,
+                mode: GuardMode::RejectAmbiguous,
                 insensitive: false,
                 backslash: false,
                 up_to_two: false,
@@ -974,7 +974,7 @@ mod tests {
                 c = c.with_backslash();
             }
             if self.unicode {
-                c = c.with_unicode_normalization();
+                c = c.with_fullwidth_structure();
             }
             if self.overlong {
                 c = c.with_overlong([StructuralChar::Slash, StructuralChar::Dot]);
@@ -982,11 +982,11 @@ mod tests {
             c
         }
 
-        fn layers(&self) -> DecodeLayers {
+        fn layers(&self) -> DecodeDepth {
             if self.up_to_two {
-                DecodeLayers::UpToTwo
+                DecodeDepth::UpToTwo
             } else {
-                DecodeLayers::Single
+                DecodeDepth::UpToOne
             }
         }
 
@@ -1019,7 +1019,7 @@ mod tests {
                 Tighten::UpToTwo => c.up_to_two = true,
                 Tighten::Unicode => c.unicode = true,
                 Tighten::Overlong => c.overlong = true,
-                Tighten::NonCanonical => c.mode = PathConfusion::RejectNonCanonical,
+                Tighten::NonCanonical => c.mode = GuardMode::RequireCanonical,
             }
             c
         }
@@ -1036,8 +1036,8 @@ mod tests {
     fn arb_cfg() -> impl Strategy<Value = Cfg> {
         (
             prop_oneof![
-                Just(PathConfusion::RejectStructural),
-                Just(PathConfusion::RejectNonCanonical)
+                Just(GuardMode::RejectAmbiguous),
+                Just(GuardMode::RequireCanonical)
             ],
             any::<bool>(),
             any::<bool>(),
@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     /// A clean path: lowercase alphanumerics, no escape, no structural byte — clean under
-    /// every config, including `Insensitive` and `RejectNonCanonical`.
+    /// every config, including `Insensitive` and `RequireCanonical`.
     fn arb_clean_path() -> impl Strategy<Value = String> {
         proptest::collection::vec("[a-z][a-z0-9]{0,4}", 1..4)
             .prop_map(|segs| format!("/{}", segs.join("/")))
@@ -1161,7 +1161,7 @@ mod tests {
             );
 
             let enabled = enabled_classes(&StructuralClasses::new());
-            let enc = enabled_encodings(&StructuralClasses::new(), DecodeLayers::Single);
+            let enc = enabled_encodings(&StructuralClasses::new(), DecodeDepth::UpToOne);
             let present = classes_present(&path, enabled, enc).intersect(enabled);
             if !normal.ambiguous(&path) {
                 prop_assert!(
@@ -1171,7 +1171,7 @@ mod tests {
             }
         }
 
-        /// L4: a dot-segment is denied under RejectStructural regardless of placement —
+        /// L4: a dot-segment is denied under RejectAmbiguous regardless of placement —
         /// opaque cannot reopen traversal.
         #[test]
         fn l4_dot_segment_inviolable(path in arb_dotty_path()) {
@@ -1180,11 +1180,11 @@ mod tests {
             prop_assert!(guard_cfg(&files_rows(true), &cfg).ambiguous(&path), "blob: {:?}", path);
         }
 
-        /// L5: RejectNonCanonical denies a superset of RejectStructural (same classes).
+        /// L5: RequireCanonical denies a superset of RejectAmbiguous (same classes).
         #[test]
         fn l5_noncanonical_dominates(cfg in arb_cfg(), path in arb_request_path()) {
-            let rs = guard_cfg(GENERAL, &Cfg { mode: PathConfusion::RejectStructural, ..cfg.clone() });
-            let rn = guard_cfg(GENERAL, &Cfg { mode: PathConfusion::RejectNonCanonical, ..cfg });
+            let rs = guard_cfg(GENERAL, &Cfg { mode: GuardMode::RejectAmbiguous, ..cfg.clone() });
+            let rn = guard_cfg(GENERAL, &Cfg { mode: GuardMode::RequireCanonical, ..cfg });
             prop_assert!(!rs.ambiguous(&path) || rn.ambiguous(&path), "{:?}", path);
         }
 
@@ -1223,7 +1223,7 @@ mod tests {
                     ("/public/*", 0, opaque),
                     ("/admin", 1, false),
                 ],
-                PathConfusion::RejectStructural,
+                GuardMode::RejectAmbiguous,
                 classes.clone(),
                 CaseSensitivity::Sensitive,
             )
@@ -1237,7 +1237,7 @@ mod tests {
         // CVE-2021-31920 (Istio): `//admin` and `%2f`-escaped slashes bypass policy.
         let istio = guard(
             &[("/admin", 0, false)],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             classes.clone(),
             CaseSensitivity::Sensitive,
         );
@@ -1252,7 +1252,7 @@ mod tests {
                 ("/cgi-bin/*", 0, false),
                 ("/secret", 1, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             classes.clone(),
             CaseSensitivity::Sensitive,
         );
@@ -1260,7 +1260,7 @@ mod tests {
 
         // CVE-2025-0108 (PAN-OS): nginx decoded `%252e%252e` once and let it past a
         // no-auth prefix; Apache decoded again and traversed. The topology is declared
-        // (`DecodeLayers::UpToTwo`), and the double-encoded traversal is denied.
+        // (`DecodeDepth::UpToTwo`), and the double-encoded traversal is denied.
         let panos = guard_layers(
             &[
                 ("/unauth", 0, false),
@@ -1268,9 +1268,9 @@ mod tests {
                 ("/unauth/*", 0, false),
                 ("/php", 1, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             classes,
-            DecodeLayers::UpToTwo,
+            DecodeDepth::UpToTwo,
             CaseSensitivity::Sensitive,
         );
         assert!(panos.ambiguous("/unauth/%252e%252e/php"));
@@ -1293,7 +1293,7 @@ mod tests {
                     ("/auth/", 0, false),
                     ("/auth/*", 0, opaque),
                 ],
-                PathConfusion::RejectStructural,
+                GuardMode::RejectAmbiguous,
                 StructuralClasses::new(),
                 CaseSensitivity::Sensitive,
             )
@@ -1314,7 +1314,7 @@ mod tests {
             servlet(true).ambiguous("/auth;x=y/"),
             "opaque blob must not reopen the param strip at the anchor"
         );
-        // The double-encoded form is a topology fact, not a default: under `Single` a
+        // The double-encoded form is a topology fact, not a default: under `UpToOne` a
         // `%253b` never becomes a `;`, so it routes to the default rule and is allowed;
         // declaring the second decoder denies it.
         let servlet_two = guard_layers(
@@ -1323,9 +1323,9 @@ mod tests {
                 ("/auth/", 0, false),
                 ("/auth/*", 0, false),
             ],
-            PathConfusion::RejectStructural,
+            GuardMode::RejectAmbiguous,
             StructuralClasses::new(),
-            DecodeLayers::UpToTwo,
+            DecodeDepth::UpToTwo,
             CaseSensitivity::Sensitive,
         );
         assert!(!servlet(false).ambiguous("/auth%253bx=y/"));

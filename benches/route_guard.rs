@@ -2,7 +2,7 @@
 //!
 //! Request benchmarks build the router outside the measured loop. Build benchmarks
 //! generate their registration inputs outside the measured loop, then measure only
-//! `RuleRouter::build` and the allocations it performs.
+//! `RuleRouter::from_registrations` and the allocations it performs.
 
 use std::{hint::black_box, time::Duration};
 
@@ -12,8 +12,8 @@ use criterion::{
 };
 use http::Method;
 use huskarl_route_guard::{
-    Registration, RuleRouter,
-    path_confusion::{CaseSensitivity, DecodeLayers, PathConfusion, StructuralClasses},
+    GuardConfig, Registration, RuleRouter,
+    config::{CaseSensitivity, DecodeDepth, GuardMode, StructuralClasses},
 };
 
 const DEFAULT_RULE: u32 = u32::MAX;
@@ -21,7 +21,7 @@ const DEFAULT_RULE: u32 = u32::MAX;
 fn registrations() -> Vec<Registration<u32>> {
     vec![
         Registration::subtree("/admin", 0),
-        Registration::blob_subtree("/files", 1),
+        Registration::exclusive_subtree("/files", 1),
         Registration::route("/health", 2),
         Registration::route("/users/{id}", 3),
         Registration::route("/method", 4),
@@ -29,14 +29,16 @@ fn registrations() -> Vec<Registration<u32>> {
     ]
 }
 
-fn router(mode: PathConfusion, layers: DecodeLayers, case: CaseSensitivity) -> RuleRouter<u32> {
-    RuleRouter::build(
-        registrations(),
+fn router(mode: GuardMode, layers: DecodeDepth, case: CaseSensitivity) -> RuleRouter<u32> {
+    RuleRouter::from_registrations(
         DEFAULT_RULE,
-        mode,
-        StructuralClasses::new(),
-        layers,
-        case,
+        GuardConfig {
+            mode,
+            structural_classes: StructuralClasses::new(),
+            decode_depth: layers,
+            case_sensitivity: case,
+        },
+        registrations(),
     )
     .expect("benchmark route table is valid")
 }
@@ -70,8 +72,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "guard_off/literal_hit",
         router(
-            PathConfusion::Off,
-            DecodeLayers::Single,
+            GuardMode::Disabled,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/health",
@@ -81,8 +83,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "default_guard/literal_hit",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/health",
@@ -92,8 +94,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "default_guard/wildcard_hit",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/users/42",
@@ -103,8 +105,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "default_guard/catchall_hit",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/admin/users/42",
@@ -114,8 +116,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "default_guard/default_miss",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/public/missing",
@@ -125,8 +127,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "method/exact_hit",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/method",
@@ -136,8 +138,8 @@ fn clean_resolution(c: &mut Criterion) {
         &mut group,
         "method/method_wildcard_fallback",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/method",
@@ -154,8 +156,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "encoded_content_allowed",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/files/a%20b",
@@ -165,8 +167,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "encoded_separator_allowed",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/files/a%2fb",
@@ -176,8 +178,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "encoded_separator_denied",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/admin%2fusers",
@@ -187,8 +189,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "traversal_denied",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/files/../admin",
@@ -198,8 +200,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "double_decode_allowed",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::UpToTwo,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToTwo,
             CaseSensitivity::Sensitive,
         ),
         "/files/a%2520b",
@@ -209,8 +211,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "case_fold_allowed",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Insensitive,
         ),
         "/files/README",
@@ -220,8 +222,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "case_fold_denied",
         router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Insensitive,
         ),
         "/ADMIN",
@@ -231,8 +233,8 @@ fn suspicious_resolution(c: &mut Criterion) {
         &mut group,
         "strict_escape_denied",
         router(
-            PathConfusion::RejectNonCanonical,
-            DecodeLayers::Single,
+            GuardMode::RequireCanonical,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         ),
         "/files/a%20b",
@@ -248,8 +250,8 @@ fn path_length_scaling(c: &mut Criterion) {
     for len in [16_usize, 128, 1_024, 8_192] {
         let path = format!("/files/{}", "a".repeat(len - "/files/".len()));
         let router = router(
-            PathConfusion::RejectStructural,
-            DecodeLayers::Single,
+            GuardMode::RejectAmbiguous,
+            DecodeDepth::UpToOne,
             CaseSensitivity::Sensitive,
         );
         let method = Method::GET;
@@ -276,13 +278,15 @@ fn subtree_registrations(count: usize) -> Vec<Registration<u32>> {
 }
 
 fn build_router(registrations: Vec<Registration<u32>>) -> RuleRouter<u32> {
-    RuleRouter::build(
-        registrations,
+    RuleRouter::from_registrations(
         DEFAULT_RULE,
-        PathConfusion::RejectStructural,
-        StructuralClasses::new(),
-        DecodeLayers::Single,
-        CaseSensitivity::Sensitive,
+        GuardConfig {
+            mode: GuardMode::RejectAmbiguous,
+            structural_classes: StructuralClasses::new(),
+            decode_depth: DecodeDepth::UpToOne,
+            case_sensitivity: CaseSensitivity::Sensitive,
+        },
+        registrations,
     )
     .expect("generated benchmark route table is valid")
 }

@@ -16,7 +16,7 @@ registration. The guard does not detect trailing-slash equivalence for you.
 Keep patterns that should share an identity in one registration. Two calls with
 equal rule values still create different identities. If the helper methods cannot
 express your group of patterns, assemble a [`Registration`](crate::Registration)
-and use [`build_with_config`](crate::RuleRouter::build_with_config).
+and use [`from_registrations`](crate::RuleRouter::from_registrations).
 
 ## Set the default policy explicitly
 
@@ -26,8 +26,21 @@ Test unmatched requests as well as registered paths.
 
 ## Add method-specific rules
 
-Use `route_for`, `subtree_for`, or `blob_subtree_for` to select methods. Check each
-method you serve at an overlapping path: path matching happens before method lookup.
+Construct a registration and call `for_methods`, then add it with `register`:
+
+```rust
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, Registration, RuleRouter};
+
+let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+let router = RuleRouter::builder("default", config)
+    .register(Registration::route("/health", "health").for_methods([http::Method::GET, http::Method::HEAD]))
+    .build()
+    .expect("valid routes");
+assert!(router.resolve("/health", &http::Method::POST).unwrap().is_default());
+```
+
+Check each method you serve at an overlapping path: path matching happens before
+method lookup. `register_all` accepts an iterator for tables assembled dynamically.
 
 For example, with `/items/{id}` and a GET-only `/items/special`, POST to
 `/items/special` selects the default. It does not use `/items/{id}`. If POST needs a
@@ -38,13 +51,13 @@ for the executable example and precedence rules.
 ## Register areas that accept encoded keys
 
 If one rule applies to an entire file-key prefix for all methods, use
-`blob_subtree("/files", rule)`. Encoded slashes such as `/files/a%2fb` can then be
-accepted when every supported interpretation stays in that rule. The blob
+`exclusive_subtree("/files", rule)`. Encoded slashes such as `/files/a%2fb` can then be
+accepted when every supported interpretation stays in that rule. The exclusive
 declaration prevents later registrations from adding more-specific paths beneath
 it. Use `subtree` instead if nested routes are intentional.
 
 Check method restrictions before relying on this tolerance. A GET-only subtree,
-including a GET-only blob, denies structural keys even for GET: other methods fall
+including a GET-only exclusive subtree, denies structural keys even for GET: other methods fall
 through to the default, so the region is not covered by one rule for every method.
 Only register an all-method rule when its policy is appropriate for every method.
 

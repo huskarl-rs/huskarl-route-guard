@@ -12,7 +12,7 @@ operational procedure.*
 
 ## 1. Attribute the denial
 
-Every deny carries a [`DenyReason`](crate::DenyReason). Log its `Display` form —
+Every deny carries a [`ResolveError`](crate::ResolveError). Log its `Display` form —
 that is the attributed line naming the check and byte class; the response body
 (`message()`) is deliberately coarse and tells you nothing. Do not proceed on the
 response body alone.
@@ -23,21 +23,21 @@ triaging structural classes.
 
 ## 2. Triage by reason
 
-| `DenyReason` | What it means | What to do |
+| `ResolveError` | What it means | What to do |
 |---|---|---|
 | `InvalidRuleId` | An internal invariant failed: the matched ID is absent from the rule table | Deny authorization, report a server error (`500`), and investigate the library failure. Never substitute the default rule. |
 | `InvalidPathInput` | The supplied value was not a request path alone | Pass `uri.path()`; do not strip or reinterpret the input inside the authorization layer. |
 | `Structural(NulTruncation)` | A raw or `%00` NUL — no legitimate path carries one | Treat as hostile or corrupt. No remedy by design. |
 | `Structural(DotSegment)` | A `.`/`..` (in any enabled spelling) whose conservative reach extends outside the matched rule | Dot-segments that stay within a single-rule subtree already flow. A denial means another rule is reachable within the modeled bound, not that every backend would actually reach it. If legitimate keys carry `..`, see §3. |
 | `Structural(Separator)` / `Structural(MatrixParam)` / `Structural(Backslash)` | The analyzed region contains another rule, possibly the default; the guard cannot establish that parsing keeps the same rule | Use the route-redesign checks in §3. If the boundary reflects a real policy boundary, keep the denial and fix the client. |
-| `CaseFoldRelocation` | Lowercasing changes the selected rule, including changes to or from the default | Fix the client's casing, or group the paths in one registration if they should share a policy. |
-| `DecodeRelocation` | Percent-decoding the path lands on a *different* rule | Same shape: `/%61dmin` vs a registered `/admin`. Client fix, or rethink why two rules disagree about one resource. |
-| `NonCanonical(_)` / `NonCanonicalEscape` | The strict [`reject_non_canonical`](crate::path_confusion::PathConfusion::reject_non_canonical) mode: presence-deny, table never consulted | Working as declared. If you serve opaque keys or encoded content, this deployment wants [`reject_structural`](crate::path_confusion::PathConfusion::reject_structural) instead. |
-| `Probe(name)` | Your own [`StructuralProbe`](crate::path_confusion::StructuralProbe) matched | Your predicate, your call — scope it to the dangerous sequence if it over-fires. |
+| `CaseFoldRuleChange` | Lowercasing changes the selected rule, including changes to or from the default | Fix the client's casing, or group the paths in one registration if they should share a policy. |
+| `DecodeRuleChange` | Percent-decoding the path lands on a *different* rule | Same shape: `/%61dmin` vs a registered `/admin`. Client fix, or rethink why two rules disagree about one resource. |
+| `NonCanonical(_)` / `NonCanonicalEscape` | The strict [`RequireCanonical`](crate::config::GuardMode::RequireCanonical) mode: presence-deny, table never consulted | Working as declared. If you serve opaque keys or encoded content, this deployment wants [`RejectAmbiguous`](crate::config::GuardMode::RejectAmbiguous) instead. |
+| `Probe(name)` | Your own [`StructuralProbe`](crate::config::StructuralProbe) matched | Your predicate, your call — scope it to the dangerous sequence if it over-fires. |
 | `TooLong` | A path already flagged as suspicious exceeds the length cap | Hostile or broken client; clean paths are never length-checked. |
 
 Never respond to a `Structural(_)` denial by loosening a
-[`StructuralClasses`](crate::path_confusion::StructuralClasses) toggle or turning
+[`StructuralClasses`](crate::config::StructuralClasses) toggle or turning
 the guard off. If the assumption behind that change is wrong, the relevant behavior
 is no longer checked (see
 [Where the differential lives](crate::_docs::explanation::topology)). Every
@@ -74,7 +74,7 @@ sibling prefix (`/files-admin`, `/admin/files`). If the nesting is necessary, ke
 it and accept the extra denials.
 
 **Check method-specific rules too.** A
-[`route_for(POST, …)`](crate::RuleRouterBuilder::route_for) inside a subtree
+registration restricted with [`for_methods(POST)`](crate::Registration::for_methods) inside a subtree
 resolves *other* methods to the default rule unless that path also has an
 all-method rule. Different identities in either case prevent the structural check
 from accepting the area as one rule. Consider moving the method-specific endpoint
@@ -83,7 +83,7 @@ This also applies to a lone method-qualified subtree or blob subtree: a GET-only
 blob denies structural keys even for GET because unlisted methods leave gaps.
 
 **Declare blobs when you want the guarantee.**
-[`blob_subtree`](crate::RuleRouterBuilder::blob_subtree) behaves like `subtree` at
+[`exclusive_subtree`](crate::RuleRouterBuilder::exclusive_subtree) behaves like `subtree` at
 runtime but rejects configurations with nested paths at build time. Use it to
 prevent a later nested registration from making encoded keys start failing.
 It does not remove method restrictions.
@@ -102,13 +102,10 @@ Pin the intended behavior with a unit test against the real builder, so a table
 change that rejects previously accepted keys fails in CI:
 
 ```
-use huskarl_route_guard::{RuleRouter, path_confusion::{CaseSensitivity, DecodeLayers}};
+use huskarl_route_guard::{RuleRouter, config::{CaseSensitivity, DecodeDepth, GuardConfig}};
 
-let router = RuleRouter::builder()
-    .default("default")
-    .case_sensitivity(CaseSensitivity::Sensitive)
-    .decode_layers(DecodeLayers::Single)
-    .blob_subtree("/files", "files-rule")
+let router = RuleRouter::builder("default", GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+    .exclusive_subtree("/files", "files-rule")
     .route("/health", "health-rule")
     .build()
     .expect("valid table");

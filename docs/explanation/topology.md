@@ -25,8 +25,8 @@ the binding from a request to the backend that will actually serve it.
 That is why the configuration is global: it must include the relevant behavior of
 **every** upstream a request might reach. When it does, the union is conservative no
 matter where the request is routed. The required
-[`CaseSensitivity`](crate::path_confusion::CaseSensitivity) declaration and the
-[`StructuralClasses`](crate::path_confusion::StructuralClasses) toggles are facts you
+[`CaseSensitivity`](crate::config::CaseSensitivity) declaration and the
+[`StructuralClasses`](crate::config::StructuralClasses) toggles are facts you
 assert about *the backends behind you, collectively*; the guard then applies them
 everywhere because it cannot tell which one any given request will hit.
 
@@ -42,7 +42,7 @@ tightening and relaxing, and it is drawn by this layer's blindness to the upstre
   that *depends* on the rule→upstream binding being what you assumed — and this layer
   cannot confirm it. "This zone is Unix, stop checking `\`" becomes a clean relocation
   bypass the moment any of that zone's traffic is routed to a Windows backend. Unlike
-  the uniform-subtree tolerance (`subtree`/`blob_subtree`) — which is **bounded** by
+  the uniform-subtree tolerance (`subtree`/`exclusive_subtree`) — which is **bounded** by
   construction: it exists only where no other rule is reachable, and still denies
   NUL, any climb out, and any fold or decode that relocates, so even misuse cannot
   escape it — disabling a structural class removes that check when the guess turns
@@ -52,6 +52,6 @@ So a global profile should conservatively combine the behavior of all reachable
 upstreams. Add per-rule denials if needed; do not remove a global interpretation on
 the strength of an upstream binding this layer cannot verify.
 
-Whether you register a rule with `subtree`, `blob_subtree`, or `route` is a related
+Whether you register a rule with `subtree`, `exclusive_subtree`, or `route` is a related
 security decision, documented on the route-registration builders of the consuming
 authorization layer (e.g. huskarl-pingora's `Guard` and `LoginProxy`).

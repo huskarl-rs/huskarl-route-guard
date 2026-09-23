@@ -14,8 +14,8 @@ select its rule. An encoded slash does not by itself require rejection: what
 matters is whether parsing could cross a rule boundary.
 
 This explanation describes the default
-[`RejectStructural`](crate::path_confusion::PathConfusion::RejectStructural)
-mode. Despite its name, it allows structural forms where the checks establish
+[`RejectAmbiguous`](crate::config::GuardMode::RejectAmbiguous)
+mode. It allows structural forms where the checks establish
 that the rule cannot change. The
 [security contract](crate::_docs::reference::contract) states the precise guarantee,
 and the [coverage reference](crate::_docs::reference::coverage) lists supported
@@ -87,7 +87,7 @@ actually produce `/users/4` and keep the rule. This is an intentional extra
 denial, not evidence that a backend necessarily changes the rule.
 
 By contrast, a complete all-method `subtree("/files", rule)` covers
-`/files/a%2fb` and every result in its analyzed region. A `blob_subtree` has the
+`/files/a%2fb` and every result in its analyzed region. A `exclusive_subtree` has the
 same request-time behavior; its extra protection is a build-time error if someone
 adds more-specific paths beneath it. Method restrictions can still prevent
 uniform coverage.
@@ -100,7 +100,7 @@ rule, such as `/files/ReadMe.TXT` to `/files/readme.txt`, is accepted.
 
 The percent-decoding check compares the raw rule against the result after one
 complete decode pass, and also after two passes under
-[`DecodeLayers::UpToTwo`](crate::path_confusion::DecodeLayers::UpToTwo).
+[`DecodeDepth::UpToTwo`](crate::config::DecodeDepth::UpToTwo).
 Each candidate is lowercased too when case folding is configured. This catches
 escapes that reveal uppercase letters, such as `/%41dmin`.
 
@@ -119,11 +119,11 @@ NUL is unsupported path content and is always rejected when the guard is active.
 Custom probes also reject on presence: they can add denials but cannot make a
 request pass another check.
 
-[`RejectNonCanonical`](crate::path_confusion::PathConfusion::RejectNonCanonical)
+[`RequireCanonical`](crate::config::GuardMode::RequireCanonical)
 rejects every enabled structural form and every complete percent escape, plus
 uppercase ASCII when case folding is configured. It does not use the route table
 to grant exceptions. A blob registration therefore provides no tolerance in this
-mode. `Off` disables these checks; public `resolve` still validates its path input
+mode. `Disabled` disables these checks; public `resolve` still validates its path input
 and checks the returned rule ID.
 
 ## Why route-table changes matter

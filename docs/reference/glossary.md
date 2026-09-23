@@ -14,7 +14,7 @@ crate does not interpret it.
 the selected rule value. Returning a rule does not itself authorize the request.
 
 **Registration** — a group of patterns, a method selection, and one rule value.
-Each `route`, `subtree`, or `blob_subtree` call creates a registration.
+Each `route`, `subtree`, or `exclusive_subtree` call creates a registration.
 
 **Rule identity / rule ID** — the identity assigned to a registration. All its
 patterns share that identity. Separate registrations have different identities
@@ -47,13 +47,13 @@ same request path differently. The guard is concerned with disagreement that
 could select a different rule.
 
 **Configured downstream parsing behaviors** — the built-in behaviors and opt-ins
-selected by `CaseSensitivity`, `DecodeLayers`, and `StructuralClasses`.
+selected by `CaseSensitivity`, `DecodeDepth`, and `StructuralClasses`.
 The contract calls their supported combinations the *declared interpretation set*.
 Behavior outside this set is not checked.
 
-**Rule change / relocation** — an interpretation selects a different rule identity
-from the raw path. “Relocation” appears in API names such as `DecodeRelocation`;
-it does not mean the guard redirects a request.
+**Rule change** — an interpretation selects a different rule identity from the raw
+path. Errors such as `DecodeRuleChange` report this comparison. The algorithm and
+tests also call it a *relocation*; the guard does not redirect the request.
 
 **Canonical path** — in this crate, a slash-prefixed path containing no recognized
 structural form, no percent escape, and no uppercase ASCII when case folding is
@@ -85,7 +85,7 @@ this check can reject requests that would keep their rule.
 path and compare rule identities for the request's method. Case-folding and
 percent-decoding use this approach.
 
-**Blob subtree** — a `blob_subtree` registration. It behaves like `subtree` during
+**Exclusive subtree** — an `exclusive_subtree` registration. It behaves like `subtree` during
 requests and additionally forbids more-specific paths beneath it at build time.
 It does not disable checks or remove method restrictions.
 
