@@ -78,6 +78,11 @@ fn normalize(bytes: &[u8]) -> Vec<u8> {
             remaining = tail;
         }
     }
+    // Dot removal preserves a trailing directory separator. Dropping an
+    // ordinary trailing slash would add an unmodeled content transformation.
+    let last = folded.rsplit(|b| *b == b'/').next().unwrap();
+    let last_bare = last.split(|b| *b == b';').next().unwrap();
+    let trailing_slash = matches!(last_bare, b"" | b"." | b"..");
     let mut segments = Vec::new();
     for segment in folded.split(|b| *b == b'/') {
         let bare = segment.split(|b| *b == b';').next().unwrap();
@@ -91,7 +96,22 @@ fn normalize(bytes: &[u8]) -> Vec<u8> {
     }
     let mut result = vec![b'/'];
     result.extend(segments.join(&b'/'));
+    if trailing_slash && result.last() != Some(&b'/') {
+        result.push(b'/');
+    }
     result
+}
+
+#[test]
+fn normalization_preserves_directory_separators() {
+    for (raw, expected) in [
+        ("/files/private/", "/files/private/"),
+        ("/files/private/.", "/files/private/"),
+        ("/files/private/child/..", "/files/private/"),
+        ("/files/private", "/files/private"),
+    ] {
+        assert_eq!(normalize(raw.as_bytes()), expected.as_bytes());
+    }
 }
 
 fn encode(bytes: &[u8], mask: &[bool]) -> String {
@@ -152,6 +172,81 @@ fn decoded_nul_denies_even_when_every_path_has_the_same_rule() {
             ResolveError::Structural(StructuralClass::NulTruncation)
         );
     }
+}
+
+#[test]
+fn normalization_between_decoders_preserves_policy_or_denies() {
+    let router = RuleRouter::builder("default", config(DecodeDepth::UpToTwo))
+        .register_subtree("/admin", |path| path.all("admin"))
+        .register_subtree("/files", |path| path.all("files"))
+        .build()
+        .unwrap();
+    for (raw, forwarded, destination, allowed) in [
+        (
+            "/files/a%2f..%2f%252e%252e/admin",
+            "/files/%2e%2e/admin",
+            "/admin",
+            false,
+        ),
+        ("/files/..%3bx/%2561dmin", "/%61dmin", "/admin", false),
+        (
+            "/files/a%5c..%5c%252e%252e/admin",
+            "/files/%2e%2e/admin",
+            "/admin",
+            false,
+        ),
+        (
+            "/files/a%EF%BC%8F..%EF%BC%8F%252e%252e/admin",
+            "/files/%2e%2e/admin",
+            "/admin",
+            false,
+        ),
+        (
+            "/files/a%2f%2fchild%252fleaf",
+            "/files/a/child%2fleaf",
+            "/files/a/child/leaf",
+            true,
+        ),
+    ] {
+        let first = normalize(&decode(raw.as_bytes()));
+        assert_eq!(first, forwarded.as_bytes(), "first server: {raw}");
+        let second = normalize(&decode(&first));
+        assert_eq!(second, destination.as_bytes(), "second server: {raw}");
+        let same_rule = router.inspect_raw(raw, &Method::GET).unwrap()
+            == router.inspect_raw(destination, &Method::GET).unwrap();
+        assert_eq!(same_rule, allowed, "policy boundary: {raw}");
+        assert_eq!(router.resolve(raw, &Method::GET).is_ok(), allowed, "{raw}");
+    }
+}
+
+/// Negative control: general NFKC is outside `with_fullwidth_structure`.
+/// Compatibility folding can manufacture escape syntax between decode passes.
+#[test]
+fn fullwidth_digits_between_decoders_are_outside_the_structural_model() {
+    let raw = "/%25%EF%BC%96%EF%BC%91dmin";
+    let once = String::from_utf8(decode(raw.as_bytes())).unwrap();
+    assert_eq!(once, "/%６１dmin");
+    // These two substitutions are the NFKC mappings for this fixture, not a
+    // general Unicode normalizer or part of the supported structural oracle.
+    let forwarded = once.replace('６', "6").replace('１', "1");
+    assert_eq!(forwarded, "/%61dmin");
+    let destination = String::from_utf8(decode(forwarded.as_bytes())).unwrap();
+    assert_eq!(destination, "/admin");
+
+    let router = router(DecodeDepth::UpToTwo);
+    assert!(router.resolve(raw, &Method::GET).is_ok());
+    assert_ne!(
+        router.inspect_raw(raw, &Method::GET).unwrap(),
+        router.inspect_raw(&destination, &Method::GET).unwrap()
+    );
+    let strict = RuleRouter::builder(
+        "default",
+        config(DecodeDepth::UpToTwo).with_mode(GuardMode::RequireCanonical),
+    )
+    .register_subtree("/admin", |path| path.all("admin"))
+    .build()
+    .unwrap();
+    assert!(strict.resolve(raw, &Method::GET).is_err());
 }
 
 #[test]
@@ -218,16 +313,52 @@ proptest! {
         let method = if post { Method::POST } else { Method::GET };
         let once = encode(&seed, &first);
         let raw = if twice { encode(once.as_bytes(), &second) } else { once };
-        let mut decoded = raw.as_bytes().to_vec();
-        for _ in 0..if twice { 2 } else { 1 } {
-            decoded = decode(&decoded);
-            let normalized = normalize(&decoded);
-            if let Ok(path) = std::str::from_utf8(&normalized)
-                && let Ok(allowed) = router.resolve(&raw, &method)
-            {
-                let downstream = router.inspect_raw(path, &method).unwrap();
-                prop_assert_eq!(downstream, router.inspect_raw(&raw, &method).unwrap(),
-                    "allowed {:?} as {:?}, transformed to {:?}", raw, allowed.id(), path);
+        for interleave in [false, true] {
+            let mut decoded = raw.as_bytes().to_vec();
+            for _ in 0..if twice { 2 } else { 1 } {
+                decoded = decode(&decoded);
+                let normalized = normalize(&decoded);
+                if let Ok(path) = std::str::from_utf8(&normalized)
+                    && let Ok(allowed) = router.resolve(&raw, &method)
+                {
+                    let downstream = router.inspect_raw(path, &method).unwrap();
+                    prop_assert_eq!(downstream, router.inspect_raw(&raw, &method).unwrap(),
+                        "allowed {:?} as {:?}, transformed to {:?}, interleave={}",
+                        raw, allowed.id(), path, interleave);
+                }
+                if interleave {
+                    decoded = normalized;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_depth_paths_remain_safe_through_two_normalizing_servers(
+        prefix in prop::sample::select(vec!["/", "/files/", "/admin/"]),
+        parts in prop::collection::vec(prop::sample::select(vec![
+            "admin", "files", "private", "a", "/", "//", ".", "..", ";x", "\\",
+            "%", "%25", "%2e", "%252e", "%2f", "%252f", "%3b", "%253b",
+            "%61", "%2561", "%5c", "%255c", "%00", "%2500", "%FF",
+            "．", "／", "；", "%EF%BC%8E", "%25EF%25BC%258E", "%C0%AE",
+        ]), 1..12),
+        post in any::<bool>(),
+    ) {
+        let raw = format!("{prefix}{}", parts.concat());
+        let router = router(DecodeDepth::UpToTwo);
+        let method = if post { Method::POST } else { Method::GET };
+        if let Ok(allowed) = router.resolve(&raw, &method) {
+            let mut forwarded = raw.as_bytes().to_vec();
+            for server in 1..=2 {
+                forwarded = normalize(&decode(&forwarded));
+                if let Ok(path) = std::str::from_utf8(&forwarded) {
+                    prop_assert_eq!(
+                        router.inspect_raw(path, &method).unwrap(),
+                        router.inspect_raw(&raw, &method).unwrap(),
+                        "allowed {:?} as {:?}, server {} reached {:?}",
+                        raw, allowed.id(), server, path
+                    );
+                }
             }
         }
     }
