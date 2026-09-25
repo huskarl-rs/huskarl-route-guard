@@ -32,7 +32,7 @@ pub struct Profile {
 const SENSITIVE: DeploymentSettings = DeploymentSettings {
     case: CaseSensitivity::Sensitive,
     decode: DecodeDepth::UpToOne,
-    backslash: false,
+    backslash: true,
     include_head: true,
     static_post: false,
     private_post_fallback: false,
@@ -44,10 +44,6 @@ const INSENSITIVE: DeploymentSettings = DeploymentSettings {
 };
 const EXPRESS_SENSITIVE: DeploymentSettings = DeploymentSettings {
     private_post_fallback: true,
-    ..SENSITIVE
-};
-const BACKSLASH: DeploymentSettings = DeploymentSettings {
-    backslash: true,
     ..SENSITIVE
 };
 
@@ -82,7 +78,10 @@ const REMOVE_BACKSLASH: &[Ablation] = &[
         name: "without-backslash",
         expect_method_denial: false,
         witness: ("GET", "/admin\\probe.txt"),
-        guard: SENSITIVE,
+        guard: DeploymentSettings {
+            backslash: false,
+            ..SENSITIVE
+        },
     },
     Ablation {
         name: "without-head",
@@ -90,7 +89,7 @@ const REMOVE_BACKSLASH: &[Ablation] = &[
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
-            ..BACKSLASH
+            ..SENSITIVE
         },
     },
 ];
@@ -227,7 +226,7 @@ const PROFILES: &[Profile] = &[
     Profile {
         backend: "sveltekit",
         name: "Sensitive",
-        guard: BACKSLASH,
+        guard: SENSITIVE,
         ablations: REMOVE_BACKSLASH,
     },
 ];

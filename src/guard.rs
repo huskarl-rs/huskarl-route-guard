@@ -962,7 +962,7 @@ mod tests {
     }
 
     impl Cfg {
-        /// The default-config baseline: positional reject, standard alphabet, sensitive.
+        /// The opt-out baseline: positional reject, no backslash handling, sensitive.
         fn structural() -> Self {
             Self {
                 mode: GuardMode::RejectAmbiguous,
@@ -976,8 +976,8 @@ mod tests {
 
         fn classes(&self) -> StructuralClasses {
             let mut c = StructuralClasses::new();
-            if self.backslash {
-                c = c.with_backslash();
+            if !self.backslash {
+                c = c.without_backslash();
             }
             if self.unicode {
                 c = c.with_fullwidth_structure();

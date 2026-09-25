@@ -23,7 +23,7 @@ environment; version numbers alone do not describe the entire deployment.
 Every row uses [`DecodeDepth::UpToOne`](crate::DecodeDepth::UpToOne), the default
 [`GuardMode::RejectAmbiguous`](crate::GuardMode::RejectAmbiguous), and the built-in
 structural classes. Case sensitivity is an explicit declaration, not a library
-default. Only the final row adds an optional structural class.
+default. All profiles now use default backslash handling.
 
 | Software | Tested backend configuration | Guard case declaration | Additional structural classes |
 |---|---|---|---|
@@ -34,7 +34,7 @@ default. Only the final row adds an optional structural class.
 | Express 5.2.1 | `express.Router({ caseSensitive: false, strict: true })` | `Insensitive` | None |
 | Express 5.2.1 | `express.Router({ caseSensitive: true, strict: true })` | `Sensitive` | None |
 | Axum 0.8.9 | Direct routes and fallback, without path-rewriting middleware | `Sensitive` | None |
-| `SvelteKit` 2.70.3 | Production `adapter-node` 5.5.7; rest-parameter endpoints | `Sensitive` | `with_backslash()` |
+| `SvelteKit` 2.70.3 | Production `adapter-node` 5.5.7; rest-parameter endpoints | `Sensitive` | None |
 
 Apache uses a case-sensitive container filesystem, `AllowOverride None`,
 `Options None`, and `AcceptPathInfo Off`. The fixture has no aliases, rewrite rules,
@@ -52,7 +52,7 @@ objects using decoded route captures. Full server setup lives alongside each fix
 Use the row matching the backend setup:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, StructuralClasses};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig};
 
 // Apache, Axum, or explicitly case-sensitive Express, as configured above.
 let sensitive = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
@@ -61,8 +61,7 @@ let sensitive = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOn
 let express = GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOne);
 
 // The tested SvelteKit adapter-node deployment.
-let sveltekit = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
-    .with_structural_classes(StructuralClasses::new().with_backslash());
+let sveltekit = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
 ```
 
 The tested guard tables have a public default and lowercase `/admin` and `/files`
@@ -121,7 +120,10 @@ handlers need their own policy mapping and tests.
 
 ## Evidence for additional settings
 
-All nine recommended profiles passed with zero observed confusion. The shared
+The previously tested nine profiles passed with zero observed confusion. Those
+runs enabled backslash handling only for SvelteKit; the current profiles enable
+it for every backend by default. This stricter setting can only deny more
+requests; it does not establish additional availability evidence. The shared
 396-path corpus combines mixed case, content escapes, double escapes,
 and separator transformations across four policy layouts. Each candidate uses the
 same input corpus; the summary counts and per-request reports record its results.
@@ -143,11 +145,13 @@ method entries are needed for availability, not to prevent default-rule fallthro
 | Express child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
 
 The confusion witnesses justify the parsing settings; the method-denial witnesses
-pin safe failure when an availability requirement is omitted. No additional
-backslash, fullwidth, overlong, or second-decode setting is recommended for the
-other direct profiles. `UpToOne` is the minimum available decode setting; built-in
-structural classes cannot be removed individually. These tests make no claim about
-the individual necessity of those mandatory behaviors.
+pin safe failure when an availability requirement is omitted. Backslash handling
+is now a conservative default for all profiles; the SvelteKit witness demonstrates
+why opting out can be unsafe. No additional fullwidth, overlong, or second-decode
+setting is recommended for the other direct profiles. `UpToOne` is the minimum
+available decode setting. Encoded-slash, dot-segment, matrix-param, and
+NUL-truncation handling cannot be disabled. These tests make no claim about the
+individual necessity of those mandatory behaviors.
 
 If a recommended configuration permits confusion, correct the deployment advice
 or model and preserve the counterexample. If removing an additional setting finds

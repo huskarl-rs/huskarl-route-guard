@@ -255,8 +255,7 @@ pub enum StructuralClass {
     /// A raw or `%00` NUL — truncates a C-string backend. Denied everywhere,
     /// unconditionally.
     NulTruncation,
-    /// A `\`/`%5C` treated as a separator (declared via
-    /// [`StructuralClasses::with_backslash`]). Scoped like
+    /// A `\`/`%5C` treated as a separator (enabled by default). Scoped like
     /// [`Separator`](Self::Separator).
     Backslash,
     /// ASCII uppercase under a declared case-folding backend
@@ -482,34 +481,31 @@ pub trait StructuralProbe: Send + Sync {
     fn matches(&self, path: &str) -> bool;
 }
 
-/// The structural alphabet the guard recognises **beyond the always-on default
-/// quartet** (encoded-slash, dot-segment, matrix-param, NUL-truncation).
+/// The structural alphabet the guard recognises.
 ///
-/// [`new`](Self::new) (the default) enables just that quartet — the separator-like
-/// and climb/truncate forms whose legitimate-traffic cost is near nil. Turn on the
-/// opt-in classes and encodings to match a backend that considers *more* paths
-/// equivalent:
+/// The default includes encoded-slash, dot-segment, matrix-param, NUL-truncation,
+/// and backslash separators. Backslash handling is enabled conservatively because
+/// downstream URL parsers can treat it as a separator even on Unix.
+///
+/// Disable backslash handling only when every downstream component preserves it
+/// as content. Opt into additional encodings to match your deployment:
 ///
 /// ```
 /// # use huskarl_route_guard::config::{StructuralClasses, StructuralChar};
-/// // A Windows/IIS-style backend that also decodes overlong UTF-8.
-/// let classes = StructuralClasses::new()
-///     .with_backslash()
-///     .with_overlong([StructuralChar::Slash, StructuralChar::Dot]);
+/// let classes =
+///     StructuralClasses::new().with_overlong([StructuralChar::Slash, StructuralChar::Dot]);
 /// ```
 ///
 /// Each toggle is a per-deployment **security** decision: enabling a class makes the
-/// guard treat that form as route structure (so it checks wherever a wildcard or
-/// catch-all matched it); leaving it off assumes the backend does not. Two declarations are **not**
-/// here, deliberately: case ([`CaseSensitivity`]) and decode depth ([`DecodeDepth`])
-/// are required, separate declarations on the builder rather than opt-ins, because
-/// every deployment must answer them.
+/// guard treat that form as route structure; leaving it off assumes the backend
+/// does not. Case ([`CaseSensitivity`]) and decode depth ([`DecodeDepth`]) are
+/// required, separate declarations on the builder.
 // Each field is an independent, orthogonal class/encoding toggle — a flat set of
 // booleans is the clearest representation, not a code smell here.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StructuralClasses {
-    /// `\`/`%5C` as a path separator (Windows/IIS).
+    /// `\`/`%5C` as a path separator (enabled by default).
     pub(crate) backslash: bool,
     /// Recognise overlong UTF-8 `/` (`%C0%AF`, …).
     pub(crate) overlong_slash: bool,
@@ -521,20 +517,43 @@ pub struct StructuralClasses {
     pub(crate) probes: Vec<Arc<dyn StructuralProbe>>,
 }
 
+impl Default for StructuralClasses {
+    fn default() -> Self {
+        Self {
+            backslash: true,
+            overlong_slash: false,
+            overlong_dot: false,
+            unicode: false,
+            probes: Vec::new(),
+        }
+    }
+}
+
 impl StructuralClasses {
-    /// The default set: just the always-on quartet (encoded-slash, dot-segment,
-    /// matrix-param, NUL-truncation), no opt-in classes, encodings, or probes.
+    /// The default set: encoded-slash, dot-segment, matrix-param, NUL-truncation,
+    /// and backslash separators, with no optional encodings or probes.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Treat `\`/`%5C` as a path separator — for Windows/IIS backends. Opt-in, not
-    /// default, because a raw `\` is legitimate *content* on a Unix backend — its
-    /// canonical spelling — so denying it by default would reject canonical paths.
+    /// Enable backslash separators (already enabled by default).
+    ///
+    /// Restores handling after [`without_backslash`](Self::without_backslash).
     #[must_use]
     pub fn with_backslash(mut self) -> Self {
         self.backslash = true;
+        self
+    }
+
+    /// Treat backslashes as path content rather than separators.
+    ///
+    /// Only disable this when every downstream component preserves backslashes
+    /// as content. Otherwise an accepted request may cross an authorization
+    /// boundary. URL parsers may normalize backslashes even on Unix.
+    #[must_use]
+    pub fn without_backslash(mut self) -> Self {
+        self.backslash = false;
         self
     }
 
@@ -555,8 +574,8 @@ impl StructuralClasses {
     }
 
     /// Recognise the **fullwidth-form** structural confusables — `／` (U+FF0F), `．`
-    /// (U+FF0E), `；` (U+FF1B), and (when [`with_backslash`](Self::with_backslash) is also
-    /// set) `＼` (U+FF3C) — that NFKC compatibility normalization folds to `/`, `.`, `;`,
+    /// (U+FF0E), `；` (U+FF1B), and (when backslash handling is enabled) `＼` (U+FF3C) —
+    /// that NFKC compatibility normalization folds to `/`, `.`, `;`,
     /// `\`, in both raw and percent-encoded (`%EF%BC%8F`) form. Enable this for a backend
     /// that Unicode-normalizes the path before routing: such a backend treats
     /// `/api／secret` as `/api/secret`, so the fullwidth solidus is a separator the guard
@@ -604,10 +623,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_quartet_only() {
-        // The always-on quartet lives in `enabled_classes`; the opt-in set is empty.
+    fn default_includes_backslash() {
+        // Both constructors enable backslash handling.
         let c = StructuralClasses::new();
-        assert!(!c.backslash);
+        assert!(c.backslash);
+        assert!(StructuralClasses::default().backslash);
         assert!(!c.overlong_slash);
         assert!(!c.overlong_dot);
         assert!(!c.unicode);
@@ -616,7 +636,13 @@ mod tests {
 
     #[test]
     fn builders_toggle_their_field() {
-        assert!(StructuralClasses::new().with_backslash().backslash);
+        assert!(!StructuralClasses::new().without_backslash().backslash);
+        assert!(
+            StructuralClasses::new()
+                .without_backslash()
+                .with_backslash()
+                .backslash
+        );
         assert!(StructuralClasses::new().with_fullwidth_structure().unicode);
 
         let both =
@@ -682,6 +708,6 @@ mod tests {
         assert!(c.probes[0].matches("/a~b"));
         assert!(!c.probes[0].matches("/ab"));
         // probe does not flip any class field
-        assert!(!c.backslash && !c.unicode);
+        assert!(c.backslash && !c.unicode);
     }
 }

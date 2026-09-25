@@ -15,7 +15,7 @@ modes use this model.
 | percent-decoding to a different literal (`/%61dmin`) | **default** | — |
 | double percent-decoding `%252F` (CDN/WAF → origin) | **required** declaration | [`DecodeDepth::UpToTwo`](crate::config::DecodeDepth::UpToTwo) |
 | case folding `/ADMIN` ≡ `/admin` | **required** declaration | [`CaseSensitivity::Insensitive`](crate::config::CaseSensitivity::Insensitive) |
-| `\` / `%5C` as a separator (Windows / IIS) | opt-in | [`with_backslash`](crate::config::StructuralClasses::with_backslash) |
+| `\` / `%5C` as a separator | default (opt-out) | [`without_backslash`](crate::config::StructuralClasses::without_backslash) |
 | overlong UTF-8 `%C0%AF` / `%C0%AE` (legacy decoders) | opt-in | [`with_overlong`](crate::config::StructuralClasses::with_overlong) |
 | fullwidth/NFKC structural confusables (`／`→`/`, …) | opt-in | [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure) |
 | a novel structural form (fresh CVE, vendor quirk) | custom detector | [`with_probe`](crate::config::StructuralClasses::with_probe) |

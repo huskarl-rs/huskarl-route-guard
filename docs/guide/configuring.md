@@ -43,9 +43,10 @@ because the library cannot determine them:
    [`UpToOne`](crate::config::DecodeDepth::UpToOne) only when no more than one
    decode pass can happen.
 3. **Enable the [`StructuralClasses`](crate::config::StructuralClasses)
-   that match your stack.** Reach for
-   [`with_backslash`](crate::config::StructuralClasses::with_backslash) on
-   Windows/IIS,
+   that match your stack.** Backslash separators are enabled by default, including
+   for Unix deployments whose URL parsers may normalize them. Use
+   [`without_backslash`](crate::config::StructuralClasses::without_backslash) only
+   when every downstream component preserves backslashes as content. Reach for
    [`with_overlong`](crate::config::StructuralClasses::with_overlong) for a
    decoder that accepts non-shortest-form UTF-8, and
    [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure)
@@ -78,11 +79,10 @@ start at their defaults. Customize it and clone it when several route tables sha
 the same downstream assumptions. Both construction paths take this same value:
 
 ```rust
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, RuleRouter, StructuralClasses};
+use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, RuleRouter};
 
 let config = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToTwo)
-    .with_mode(GuardMode::RejectAmbiguous)
-    .with_structural_classes(StructuralClasses::new().with_backslash());
+    .with_mode(GuardMode::RejectAmbiguous);
 let router = RuleRouter::builder("default", config)
     .register_subtree("/admin", |path| path.all("admin"))
     .build()

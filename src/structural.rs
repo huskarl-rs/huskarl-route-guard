@@ -22,11 +22,10 @@ use crate::percent::{Interpretation, fullwidth_at, interpretations, overlong_at}
 /// one bitwise AND: the classes **present** in a request path ([`classes_present`])
 /// and the classes a configuration **enables** ([`enabled_classes`]).
 ///
-/// The default classes — separator, dot-segment, param, truncation — are the byte
+/// The default classes — separator, dot-segment, param, truncation, backslash — are the byte
 /// forms covered by
 /// [`StructuralClasses::new`](crate::config::StructuralClasses::new).
-/// [`BACKSLASH`](ClassSet::BACKSLASH) is opt-in (it maps one-for-one to
-/// `with_backslash` and is turned on by [`enabled_classes`] when configured), and
+/// [`BACKSLASH`](ClassSet::BACKSLASH) can be disabled with `without_backslash`, and
 /// [`CASE`](ClassSet::CASE) comes from the required `CaseSensitivity` declaration.
 /// The *alternate encodings* a class can arrive in (overlong-UTF-8 and
 /// double-percent-encoded `/`·`.`, …) are recognised by [`classes_present`] when the
@@ -40,7 +39,7 @@ impl ClassSet {
     /// a literal empty segment (`//`) that slash-merging collapses — both shift
     /// segment boundaries the same way and are live in the same positions. A
     /// *single* literal `/` is not here: the router already saw it. Backslash
-    /// belongs to the opt-in [`Self::BACKSLASH`] class.
+    /// belongs to the separate [`Self::BACKSLASH`] class.
     pub(crate) const SEPARATOR: ClassSet = ClassSet(1 << 0);
     /// A `.`/`..` segment (literal) or an encoded dot (`%2E`) that could form one —
     /// feeds RFC 3986 §5.2.4 resolution, which removes or climbs segments.
@@ -55,8 +54,8 @@ impl ClassSet {
     /// ASCII uppercase — a case-folding backend. Opt-in.
     pub(crate) const CASE: ClassSet = ClassSet(1 << 4);
     /// A backslash or `%5C` separator. Kept separate from [`Self::SEPARATOR`] so
-    /// backslash handling requires an explicit deployment declaration through
-    /// [`StructuralClasses::with_backslash`](crate::config::StructuralClasses::with_backslash).
+    /// backslash handling can be explicitly disabled through
+    /// [`StructuralClasses::without_backslash`](crate::config::StructuralClasses::without_backslash).
     pub(crate) const BACKSLASH: ClassSet = ClassSet(1 << 5);
 
     /// The empty set.
@@ -322,9 +321,9 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
 /// The structural classes a [`StructuralClasses`](crate::config::StructuralClasses)
 /// set makes dangerous — the `structural_enabled` mask for the structural modes.
 ///
-/// The default quartet (separator, dot-segment, param, truncation) is **always on**;
-/// the opt-in backslash toggle adds its mirror class one-for-one:
-/// [`with_backslash`](crate::config::StructuralClasses::with_backslash) →
+/// The mandatory quartet (separator, dot-segment, param, truncation) is **always on**;
+/// backslash handling is enabled by default and can be disabled:
+/// [`without_backslash`](crate::config::StructuralClasses::without_backslash) removes
 /// [`BACKSLASH`](ClassSet::BACKSLASH). The [`CASE`](ClassSet::CASE) class is **not**
 /// derived here — the structural guard adds it from the required
 /// [`CaseSensitivity`](crate::config::CaseSensitivity) declaration, where it
@@ -339,7 +338,7 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
 /// break-glass scan in [`RuleRouter`](crate::path_router); it does not refine the
 /// class masks computed here.
 pub(crate) fn enabled_classes(classes: &crate::config::StructuralClasses) -> ClassSet {
-    // The always-on quartet, then the opt-in backslash class (case is added
+    // The always-on quartet, then the configurable backslash class (case is added
     // separately by the router from the CaseSensitivity declaration).
     let mut enabled =
         ClassSet::SEPARATOR | ClassSet::DOT_SEGMENT | ClassSet::PARAM | ClassSet::TRUNCATION;
@@ -942,10 +941,10 @@ mod tests {
         assert!(!has_dot_segment("/files/a／..／b", all, Encodings::none()));
     }
 
-    // ---- opt-in classes wired to config ----
+    // ---- classes wired to config ----
 
     #[test]
-    fn enabled_classes_default_is_the_quartet() {
+    fn enabled_classes_default_includes_backslash() {
         use crate::config::StructuralClasses;
         let e = enabled_classes(&StructuralClasses::new());
         assert!(e.contains_any(ClassSet::SEPARATOR));
@@ -955,18 +954,18 @@ mod tests {
         // it by default costs nothing while an undeclared C-string backend is a
         // silent truncation bypass.
         assert!(e.contains_any(ClassSet::TRUNCATION));
-        // opt-in / separately-declared classes stay off
+        // Case folding requires a separate declaration.
         assert!(!e.contains_any(ClassSet::CASE));
-        assert!(!e.contains_any(ClassSet::BACKSLASH));
+        assert!(e.contains_any(ClassSet::BACKSLASH));
     }
 
     #[test]
-    fn opt_in_classes_enable_their_class() {
+    fn backslash_can_be_disabled() {
         use crate::config::StructuralClasses;
         // CASE is not derived from StructuralClasses (it comes from CaseSensitivity);
-        // the backslash opt-in is.
+        // the backslash setting is.
         assert!(
-            enabled_classes(&StructuralClasses::new().with_backslash())
+            !enabled_classes(&StructuralClasses::new().without_backslash())
                 .contains_any(ClassSet::BACKSLASH)
         );
     }
@@ -985,10 +984,13 @@ mod tests {
             }
         }
 
-        // The default set is exactly the quartet.
-        let quartet =
-            ClassSet::SEPARATOR | ClassSet::DOT_SEGMENT | ClassSet::PARAM | ClassSet::TRUNCATION;
-        assert_eq!(enabled_classes(&StructuralClasses::new()), quartet);
+        // The default set includes backslash separators.
+        let defaults = ClassSet::SEPARATOR
+            | ClassSet::DOT_SEGMENT
+            | ClassSet::PARAM
+            | ClassSet::TRUNCATION
+            | ClassSet::BACKSLASH;
+        assert_eq!(enabled_classes(&StructuralClasses::new()), defaults);
         // A probe is opaque to the class machinery (it acts via the break-glass scan)
         // and an encoding toggle changes recognised forms, not classes.
         assert_eq!(
@@ -997,7 +999,7 @@ mod tests {
                     .with_probe(Noop)
                     .with_overlong([crate::config::StructuralChar::Slash])
             ),
-            quartet
+            defaults
         );
     }
 

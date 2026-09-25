@@ -230,6 +230,33 @@ fn diagnostics_validate_input_without_authorizing_ambiguous_paths() {
 }
 
 #[test]
+fn backslash_handling_is_default_with_explicit_opt_out() {
+    for classes in [StructuralClasses::new(), StructuralClasses::default()] {
+        let router = RuleRouter::builder("public", config().with_structural_classes(classes))
+            .register_subtree("/admin", |path| path.all("admin"))
+            .build()
+            .unwrap();
+        for path in ["/admin\\secret", "/admin%5csecret", "/admin%5Csecret"] {
+            assert!(router.resolve(path, &Method::GET).is_err(), "{path}");
+        }
+        assert!(router.resolve("/admin/a\\b", &Method::GET).is_ok());
+    }
+    let router = RuleRouter::builder(
+        "public",
+        config().with_structural_classes(StructuralClasses::new().without_backslash()),
+    )
+    .register_subtree("/admin", |path| path.all("admin"))
+    .build()
+    .unwrap();
+    for path in ["/admin\\secret", "/admin%5csecret", "/admin%5Csecret"] {
+        assert_eq!(
+            *router.resolve(path, &Method::GET).unwrap().rule(),
+            "public"
+        );
+    }
+}
+
+#[test]
 fn reused_configuration_carries_enforcement_and_structural_options() {
     let config = config().with_structural_classes(StructuralClasses::new().with_backslash());
     let default = RuleRouter::builder("public", config.clone())

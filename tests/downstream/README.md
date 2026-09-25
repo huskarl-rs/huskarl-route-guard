@@ -59,7 +59,7 @@ Docker daemons are unsupported: the published address must be local loopback.
 
 Direct guard profiles declare `UpToOne`; the chain declares `UpToTwo`. Express
 Default/Insensitive declares `Insensitive`; all other profiles declare `Sensitive`.
-SvelteKit adds backslash handling. All use default structural classes otherwise,
+All use default structural classes, including backslash handling,
 and default `RejectAmbiguous` mode. The normalized-URI proxy configuration is a
 specific behavior under test, not a proposed safe proxy default.
 

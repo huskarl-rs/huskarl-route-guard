@@ -25,7 +25,7 @@
 //! The one rule that keeps it honest: the reference backend's transforms are
 //! **gated by the same [`StructuralClasses`]/[`DecodeDepth`]/[`CaseSensitivity`]**
 //! the guard was built with. A relocation via a transform the config does not
-//! declare (e.g. `\`→`/` with `with_backslash()` off, or a second decode pass
+//! declare (e.g. `\`→`/` with `without_backslash()`, or a second decode pass
 //! under `DecodeDepth::UpToOne`) is operator under-declaration, not a guard bug,
 //! so those transforms stay off in the sampled backends too. NUL truncation is
 //! always-on in the guard, so the truncating backend is always in the family.
@@ -649,8 +649,8 @@ fn config_strategy() -> impl Strategy<Value = (StructuralClasses, DecodeDepth, C
     )
         .prop_map(|(back, over_s, over_d, up_to_two, uni, ci)| {
             let mut c = StructuralClasses::new();
-            if back {
-                c = c.with_backslash();
+            if !back {
+                c = c.without_backslash();
             }
             let mut overlong = Vec::new();
             if over_s {
@@ -789,8 +789,8 @@ fn method_from_index(index: u8) -> http::Method {
 /// Decode a config from one byte's bits (mirrors [`config_strategy`]).
 fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeDepth, CaseSensitivity) {
     let mut c = StructuralClasses::new();
-    if bits & 1 != 0 {
-        c = c.with_backslash();
+    if bits & 1 == 0 {
+        c = c.without_backslash();
     }
     let mut overlong = Vec::new();
     if bits & 2 != 0 {
@@ -1170,7 +1170,7 @@ mod reference_backend_tests {
 
     #[test]
     fn decode_pass_is_scoped_to_structural_bytes() {
-        let c = StructuralClasses::new();
+        let c = StructuralClasses::new().without_backslash();
         let all_decode = Backend {
             decode_sep: true,
             decode_dot: true,

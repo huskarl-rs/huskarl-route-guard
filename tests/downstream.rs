@@ -38,9 +38,9 @@ enum Layout {
 
 fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
     let classes = if settings.backslash {
-        StructuralClasses::new().with_backslash()
-    } else {
         StructuralClasses::new()
+    } else {
+        StructuralClasses::new().without_backslash()
     };
     let mut builder = RuleRouter::builder(
         Policy::Public,
