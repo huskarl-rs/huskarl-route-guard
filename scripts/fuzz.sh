@@ -5,14 +5,22 @@
 # cache-evicted, so we always copy the committed seeds in first to start warm. Used by
 # both `mise run fuzz` and the CI discovery job so local and CI prime identically.
 #
-#   scripts/fuzz.sh <full::target::name> [extra cargo-bolero args, e.g. -T 600s]
+# With no arguments, run all three targets with the CI discovery time budgets.
+#   scripts/fuzz.sh [<full::target::name> [extra cargo-bolero args, e.g. -T 600s]]
 set -euo pipefail
-
-target="${1:?usage: scripts/fuzz.sh <full::target::name> [extra cargo-bolero args]}"
-shift
 
 # Run from the repo root regardless of caller cwd.
 cd "$(dirname "$0")/.."
+
+if [ "$#" -eq 0 ]; then
+  bash scripts/fuzz.sh structural::tests::scanner -T 300s
+  bash scripts/fuzz.sh route_tree::tests::matcher_differential -T 300s
+  bash scripts/fuzz.sh path_confusion_proptest::guard_relocation -T 600s
+  exit 0
+fi
+
+target="$1"
+shift
 
 # bolero names its corpus dir after the target with `::` -> `__`.
 dir=$(printf '%s' "$target" | sed 's/::/__/g')

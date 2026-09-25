@@ -47,7 +47,9 @@ description = "Two-decode NGINX normalized-URI proxy to Apache baseline"
 # corpus from the committed seeds in `fuzz-corpus/` so a run starts warm, then fuzzes.
 # Targets are addressed by their fully-qualified name (see `cargo bolero list`); extra args
 # pass through (e.g. `-T 60s` to bound a run, `-r <n>` for a run count).
+# With no arguments, run all three targets for 300s, 300s, and 600s respectively.
 #
+#   mise run fuzz                                                # all targets (~20 min + builds)
 #   mise run fuzz path_confusion_proptest::guard_relocation -T 600s   # router + verdict
 #   mise run fuzz route_tree::tests::matcher_differential -T 300s     # matcher vs matchit
 #   mise run fuzz structural::tests::scanner -T 300s                  # scanner invariants
@@ -55,7 +57,7 @@ description = "Two-decode NGINX normalized-URI proxy to Apache baseline"
 # Edit/regenerate the seeds with:
 #   cargo test regenerate_fuzz_corpus -- --ignored
 [tasks.fuzz]
-description = "Prime seeds and fuzz a bolero target by full name (nightly)"
+description = "Fuzz all targets (~20 min + builds), or pass a full target name (nightly)"
 run = "bash scripts/fuzz.sh"
 
 [tasks.mutation]
