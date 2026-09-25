@@ -121,7 +121,7 @@ handlers need their own policy mapping and tests.
 ## Evidence for additional settings
 
 The previously tested nine profiles passed with zero observed confusion. Those
-runs enabled backslash handling only for SvelteKit; the current profiles enable
+runs enabled backslash handling only for `SvelteKit`; the current profiles enable
 it for every backend by default. This stricter setting can only deny more
 requests; it does not establish additional availability evidence. The shared
 396-path corpus combines mixed case, content escapes, double escapes,
@@ -146,7 +146,7 @@ method entries are needed for availability, not to prevent default-rule fallthro
 
 The confusion witnesses justify the parsing settings; the method-denial witnesses
 pin safe failure when an availability requirement is omitted. Backslash handling
-is now a conservative default for all profiles; the SvelteKit witness demonstrates
+is now a conservative default for all profiles; the `SvelteKit` witness demonstrates
 why opting out can be unsafe. No additional fullwidth, overlong, or second-decode
 setting is recommended for the other direct profiles. `UpToOne` is the minimum
 available decode setting. Encoded-slash, dot-segment, matrix-param, and
