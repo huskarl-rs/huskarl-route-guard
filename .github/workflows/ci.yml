@@ -108,6 +108,9 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: mise run test
 
+      - name: Test mutation outcome gate
+        run: python3 -B scripts/test-mutation-outcomes.py
+
       - name: Build documentation without warnings
         env:
           RUSTDOCFLAGS: -D warnings

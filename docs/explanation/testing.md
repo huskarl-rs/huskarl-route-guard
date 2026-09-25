@@ -85,11 +85,31 @@ failures, unrelated panics, and timeouts cannot satisfy that gate.
 
 The full audit runs alongside scheduled/manual fuzz discovery, with
 `github.run_id` as its proptest seed. Each nightly run explores a different seed;
-reruns retain it. It is a reporting job: known survivors and detected hangs make
-cargo-mutants exit nonzero, so CI validates that the entire campaign completed and
-publishes the outcome lists in the job summary. It does not impose a zero-survivor
-threshold or hide explained mutations. Both jobs upload logs, diffs, outcomes, and
+reruns retain it. Known survivors and detected hangs make cargo-mutants exit
+nonzero, so a separate CI gate validates that the entire campaign completed and
+compares outcomes with `scripts/mutation-baseline.json`. Unreviewed survivors,
+unexpected timeouts, and a reviewed survivor becoming a timeout (or vice versa)
+fail the gate. The known scanner hang requires a successful build followed by a
+test-phase timeout; a build timeout cannot satisfy that exception.
+Both jobs upload logs, diffs, outcomes, and
 seed metadata even on failure, retaining artifacts for 30 days.
+
+The baseline records each reviewed mutation, its expected outcome, and its rationale.
+Matching uses the source file, mutation description, and changed source lines,
+ignoring line numbers and surrounding indentation. This distinguishes different
+mutation sites within the same function; ambiguous matches fail the gate.
+Every mutant still runs, including the equivalent shift and diagnostic formatting
+cases. Previously reviewed mutants becoming caught, unviable, or absent are
+reported for baseline maintenance without failing the gate. Totals are informational,
+not an acceptance criterion.
+
+To review a new survivor or timeout, inspect its diff and logs, add a meaningful
+test if behavior should be detected, and otherwise document the justification
+before adding an exact entry to the baseline. Do not regenerate the baseline by
+accepting all observed outcomes. Revisit guard exceptions when their supporting
+invariants change, even if the mutation still matches. Validate a local campaign
+with `python3 scripts/check-mutation-outcomes.py full target/mutation-audit/full`;
+the mutation command itself retains cargo-mutants' nonzero exit for survivors.
 
 The tasks remain available locally. Survivors require triage: a mutation can be
 equivalent, affect only diagnostics, or make the guard more conservative.

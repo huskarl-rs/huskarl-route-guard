@@ -130,11 +130,10 @@ jobs:
         run: mise install cargo:cargo-mutants
       - name: Audit guard and scanner mutations
         # Known survivors and detected hangs make cargo-mutants exit nonzero.
-        # Validate completion below; retain all outcomes for review, without an
-        # exclusion list that could hide changes to a previously explained mutant.
+        # Validate completion and reviewed outcomes below. Keep every mutant running.
         continue-on-error: true
         run: mise run mutation
-      - name: Validate and summarize the completed audit
+      - name: Reject unexplained mutation outcomes and summarize the audit
         run: python3 scripts/check-mutation-outcomes.py full "$MUTATION_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
       - name: Save mutation evidence
         if: always()

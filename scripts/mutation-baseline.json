@@ -1,0 +1,85 @@
+[
+  {
+    "file": "src/guard.rs",
+    "mutation": "replace || with && in PathConfusionGuard::interpretations_deny",
+    "changes": [
+      "-|| (path.len() > self.max_analysis_path_len",
+      "+&& /* ~ changed by cargo-mutants ~ */ (path.len() > self.max_analysis_path_len"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Structural scanning and final positional denial remain active; skipped precise checks do not change the verdict under the documented ordering invariants."
+  },
+  {
+    "file": "src/guard.rs",
+    "mutation": "replace > with == in PathConfusionGuard::interpretations_deny",
+    "changes": [
+      "-|| (path.len() > self.max_analysis_path_len",
+      "+|| (path.len() == /* ~ changed by cargo-mutants ~ */ self.max_analysis_path_len"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Verdict-redundant under the documented budget checks and final structural denial ordering."
+  },
+  {
+    "file": "src/guard.rs",
+    "mutation": "replace > with < in PathConfusionGuard::interpretations_deny",
+    "changes": [
+      "-|| (path.len() > self.max_analysis_path_len",
+      "+|| (path.len() < /* ~ changed by cargo-mutants ~ */ self.max_analysis_path_len"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Uniform anchor coverage subsumes skipped precise comparisons for short structural paths; see the content-prefix argument and two 100,000-case trials in docs/explanation/testing.md."
+  },
+  {
+    "file": "src/guard.rs",
+    "mutation": "replace > with >= in PathConfusionGuard::interpretations_deny",
+    "changes": [
+      "-|| (path.len() > self.max_analysis_path_len",
+      "+|| (path.len() >= /* ~ changed by cargo-mutants ~ */ self.max_analysis_path_len"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Verdict-redundant under the documented budget checks and final structural denial ordering."
+  },
+  {
+    "file": "src/structural.rs",
+    "mutation": "replace << with >>",
+    "changes": [
+      "-pub(crate) const SEPARATOR: ClassSet = ClassSet(1 << 0);",
+      "+pub(crate) const SEPARATOR: ClassSet = ClassSet(1 >> /* ~ changed by cargo-mutants ~ */ 0);"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Equivalent for ClassSet::SEPARATOR: 1 << 0 and 1 >> 0 both equal one."
+  },
+  {
+    "file": "src/structural.rs",
+    "mutation": "replace <impl std::fmt::Debug for ClassSet>::fmt -> std::fmt::Result with Ok(Default::default())",
+    "changes": [
+      "-let mut names = Vec::new();",
+      "-for (bit, name) in [",
+      "-(Self::SEPARATOR, \"Separator\"),",
+      "-(Self::DOT_SEGMENT, \"DotSegment\"),",
+      "-(Self::PARAM, \"Param\"),",
+      "-(Self::TRUNCATION, \"Truncation\"),",
+      "-(Self::CASE, \"Case\"),",
+      "-(Self::BACKSLASH, \"Backslash\"),",
+      "-] {",
+      "-if self.contains_any(bit) {",
+      "-names.push(name);",
+      "-}",
+      "-}",
+      "-write!(f, \"ClassSet({})\", names.join(\"|\"))",
+      "+Ok(Default::default()) /* ~ changed by cargo-mutants ~ */"
+    ],
+    "outcome": "MissedMutant",
+    "rationale": "Internal diagnostic formatting is intentionally not asserted; this does not change enforcement."
+  },
+  {
+    "file": "src/structural.rs",
+    "mutation": "replace += with *= in scan_interpretation",
+    "changes": [
+      "-i += width;",
+      "+i *= /* ~ changed by cargo-mutants ~ */ width;"
+    ],
+    "outcome": "Timeout",
+    "rationale": "The scanner cursor starts at zero; multiplication keeps it stationary. A test-phase timeout detects this injected hang."
+  }
+]
