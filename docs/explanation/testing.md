@@ -174,7 +174,8 @@ versioned configuration recommendations supported by these tests.
 
 These tests challenge deployment assumptions behind configuration recommendations.
 `mise run test-downstream` runs the ignored `tests/downstream.rs` integration test
-against pinned Linux Apache, Express, Axum, and `SvelteKit` adapter-node fixtures,
+against pinned Linux Apache, Express, Axum, `SvelteKit` adapter-node, and
+Tomcat–Spring MVC fixtures,
 plus NGINX normalized-URI proxy chains to Apache and Express.
 The same command works on macOS and Linux with a local Docker daemon; an Ubuntu
 GitHub Actions matrix runs it in CI. Ordinary tests use `mise run test` without Docker.
@@ -187,6 +188,10 @@ for Apache), which the harness independently maps to authorization policies.
 A forwarded request reaching a different policy invalidates the recommendation.
 Denied requests are recorded as not forwarded and provide no downstream evidence.
 Stateless responses are cached by method/target across configurations and layouts.
+Fixed profile-specific parsing probes can also call a fixture directly, even if
+the guard would deny them. Reports label these `characterization`; they are not
+forwarded-request or agreement evidence. Tomcat–Spring probes pin raw/encoded
+semicolon, dot-semicolon, and encoded-slash behavior.
 
 Additional runs remove individual parsing settings and must produce actual
 accepted-request confusion. Case folding for default/insensitive Express and

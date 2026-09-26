@@ -1,6 +1,6 @@
 # Real downstream deployment baselines
 
-These tests validate the assumptions behind deployment recommendations. Only
+These tests validate the assumptions behind deployment recommendations. For corpus comparisons, only
 requests accepted by each candidate guard configuration are sent downstream.
 A reached route's independently assigned policy must agree with the authorized
 policy. Removal runs weaken one setting or registration assumption and must expose
@@ -14,10 +14,11 @@ The user-facing reference is `docs/reference/deployments.md`.
 
 ```sh
 mise run test                         # ordinary tests; no Docker
-mise run test-downstream              # all ten deployment profiles
+mise run test-downstream              # all eleven deployment profiles
 mise run test-downstream apache axum  # selected backends
 mise run test-nginx-apache            # real two-decode chain
 mise run test-nginx-express           # real decode-and-reparse chain
+mise run test-tomcat-spring           # native servlet + Spring MVC routing
 ```
 
 Aliases also include `test-apache`, `test-express`, `test-axum`, and `test-sveltekit`.
@@ -59,6 +60,7 @@ Docker daemons are unsupported: the published address must be local loopback.
 | Axum 0.8.9 | `Sensitive` | Native routes and fallback; no rewriting middleware |
 | SvelteKit 2.70.3 / adapter-node 5.5.7 | `Sensitive` | Production rest-parameter endpoints |
 | NGINX 1.28.0 → Apache 2.4.68 | `DecodedUri` | `proxy_pass http://origin$uri$is_args$args`; origin encoded slashes `On` |
+| Tomcat 11.0.26 / Spring MVC 7.0.8 | `PathPattern` | Case-sensitive `PathPatternParser`; encoded slash rejected; backslash disabled |
 | NGINX 1.28.0 → Express 5.2.1 | `DecodedUri` | Same proxy configuration; case-sensitive, strict Express router |
 
 Direct guard profiles and NGINX–Express declare `UpToOne`; NGINX–Apache declares
@@ -67,6 +69,9 @@ Default/Insensitive declares `Insensitive`; all other profiles declare `Sensitiv
 All use default structural classes, including backslash handling,
 and default `RejectAmbiguous` mode. The normalized-URI proxy configuration is a
 specific behavior under test, not a proposed safe proxy default.
+
+Tomcat–Spring uses explicit connector settings and native controller mappings;
+see `tomcat-spring/README.md` for version pins and parsing probes.
 
 Express registers child GET routes before parent GET routes and a parent POST
 handler. Axum and SvelteKit use their native specificity/method selection. SvelteKit
@@ -104,7 +109,7 @@ independent policy assignment and guard registrations:
 The method layout includes HEAD with GET. Apache includes POST for all static
 scopes. Frameworks have a POST handler at `/files`; Express's private child falls
 through to that handler and therefore needs an explicit child POST registration
-in the guard. Axum and SvelteKit return 405 for that child method gap. Canonical
+in the guard. Tomcat–Spring has the same parent POST fallback requirement. Axum and SvelteKit return 405 for that child method gap. Canonical
 probes pin those distinctions and verify header identity and empty HEAD bodies.
 The exception routes use native framework routing. Apache serves real files at
 `/exact.txt`, `/foo/secret/bar`, and `/foo/other/bar`; directory/file scopes label
@@ -135,7 +140,9 @@ built-in behaviors.
 
 `target/downstream/<backend>-<profile>.tsv` records candidate, layout, method, path,
 authorized policy, status, route ID, redirect location, and outcome: `agreement`,
-`route-confusion`, `no-resource`, or `not-forwarded`. Denied requests have no
+`route-confusion`, `no-resource`, or `not-forwarded`. The `characterization` candidate contains fixed direct parsing probes with outcome
+`observed`; these have no guard policy and never count as forwarding or agreement
+evidence. They are separate from candidate corpus runs. Denied corpus requests have no
 response fields and contribute no downstream evidence. String fields use Rust
 debug-string escaping. Summary counts are logical accepted/served/denied comparisons, including reused
 observations, rather than physical connection counts. Console output limits counterexample listings; reports
@@ -175,5 +182,5 @@ and this 7,024-path corpus; the current recommended profile found zero. Current
 removal runs found 102 query-truncation and 51 fragment-truncation mismatches.
 These are method/layout comparisons, not counts of unique exploit paths.
 
-Additional servlet, Envoy, Go, and FastCGI profiles, fuzz-corpus replay, and direct
+Additional servlet configurations, Envoy, Go, and FastCGI profiles, fuzz-corpus replay, and direct
 characterization of guard-rejected inputs remain follow-up work.

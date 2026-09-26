@@ -31,14 +31,15 @@ docker info >/dev/null
 mkdir -p target/downstream
 # COPY puts the fixtures on the container filesystem, including on macOS where
 # a bind-mounted document root could otherwise inherit host filesystem semantics.
-if [ "$#" -eq 0 ]; then set -- apache express axum sveltekit nginx-apache nginx-express; fi
+if [ "$#" -eq 0 ]; then set -- apache express axum sveltekit nginx-apache nginx-express tomcat-spring; fi
 for backend in "$@"; do
   case "$backend" in
     apache) profiles=(Off On NoDecode) ;;
+    tomcat-spring) profiles=(PathPattern) ;;
     express) profiles=(Default Sensitive Insensitive) ;;
     nginx-apache|nginx-express) profiles=(DecodedUri) ;;
     axum|sveltekit) profiles=(Sensitive) ;;
-    *) echo "Unknown backend: $backend (choose apache, express, axum, sveltekit, nginx-apache, nginx-express)" >&2; exit 2 ;;
+    *) echo "Unknown backend: $backend (choose apache, express, axum, sveltekit, nginx-apache, nginx-express, tomcat-spring)" >&2; exit 2 ;;
   esac
   fixture="$backend"
   if [ "$backend" = nginx-express ]; then fixture=nginx-apache; fi

@@ -22,8 +22,16 @@ pub struct Ablation {
     pub witness: (&'static str, &'static str),
 }
 
+pub struct ParsingProbe {
+    pub path: &'static str,
+    pub status: u16,
+    pub route_id: Option<&'static str>,
+}
+
 pub struct Profile {
     pub backend: &'static str,
+    /// Direct fixture observations, independent of guard acceptance.
+    pub parsing_probes: &'static [ParsingProbe],
     pub name: &'static str,
     pub guard: DeploymentSettings,
     // Parsing recommendations require accepted-request counterexamples when removed.
@@ -46,7 +54,7 @@ const INSENSITIVE: DeploymentSettings = DeploymentSettings {
     private_post_fallback: true,
     ..SENSITIVE
 };
-const EXPRESS_SENSITIVE: DeploymentSettings = DeploymentSettings {
+const PARENT_POST_FALLBACK: DeploymentSettings = DeploymentSettings {
     private_post_fallback: true,
     ..SENSITIVE
 };
@@ -56,7 +64,7 @@ const REMOVE_CASE_FOLDING: &[Ablation] = &[
         name: "without-case-folding",
         expect_method_denial: false,
         witness: ("GET", "/ADMIN/PROBE.TXT"),
-        guard: EXPRESS_SENSITIVE,
+        guard: PARENT_POST_FALLBACK,
     },
     Ablation {
         name: "without-head",
@@ -107,14 +115,14 @@ const HEAD: &[Ablation] = &[Ablation {
         ..SENSITIVE
     },
 }];
-const EXPRESS_METHODS: &[Ablation] = &[
+const PARENT_POST_METHODS: &[Ablation] = &[
     Ablation {
         name: "without-head",
         expect_method_denial: true,
         witness: ("HEAD", "/admin/probe.txt"),
         guard: DeploymentSettings {
             include_head: false,
-            ..EXPRESS_SENSITIVE
+            ..PARENT_POST_FALLBACK
         },
     },
     Ablation {
@@ -180,16 +188,45 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
 // candidate. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
     Profile {
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/admin;x=1/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/public/..;x=1/admin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/admin%3Bx=1/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/admin%2fprobe.txt",
+                status: 400,
+                route_id: None,
+            },
+        ],
+        backend: "tomcat-spring",
+        name: "PathPattern",
+        guard: PARENT_POST_FALLBACK,
+        ablations: PARENT_POST_METHODS,
+    },
+    Profile {
+        parsing_probes: &[],
         backend: "nginx-express",
         name: "DecodedUri",
-        guard: EXPRESS_SENSITIVE,
+        guard: PARENT_POST_FALLBACK,
         ablations: &[
             Ablation {
                 name: "without-query-truncation",
                 expect_method_denial: false,
                 guard: DeploymentSettings {
                     query_truncation: false,
-                    ..EXPRESS_SENSITIVE
+                    ..PARENT_POST_FALLBACK
                 },
                 witness: ("GET", "/foo/secret%3F/bar"),
             },
@@ -198,61 +235,70 @@ const PROFILES: &[Profile] = &[
                 expect_method_denial: false,
                 guard: DeploymentSettings {
                     fragment_truncation: false,
-                    ..EXPRESS_SENSITIVE
+                    ..PARENT_POST_FALLBACK
                 },
                 witness: ("GET", "/foo/secret%23/bar"),
             },
         ],
     },
     Profile {
+        parsing_probes: &[],
         backend: "nginx-apache",
         name: "DecodedUri",
         guard: TWO_DECODES,
         ablations: REMOVE_SECOND_DECODE,
     },
     Profile {
+        parsing_probes: &[],
         backend: "apache",
         name: "Off",
         guard: STATIC,
         ablations: STATIC_METHODS,
     },
     Profile {
+        parsing_probes: &[],
         backend: "apache",
         name: "On",
         guard: STATIC,
         ablations: STATIC_METHODS,
     },
     Profile {
+        parsing_probes: &[],
         backend: "apache",
         name: "NoDecode",
         guard: STATIC,
         ablations: STATIC_METHODS,
     },
     Profile {
+        parsing_probes: &[],
         backend: "express",
         name: "Default",
         guard: INSENSITIVE,
         ablations: REMOVE_CASE_FOLDING,
     },
     Profile {
+        parsing_probes: &[],
         backend: "express",
         name: "Insensitive",
         guard: INSENSITIVE,
         ablations: REMOVE_CASE_FOLDING,
     },
     Profile {
+        parsing_probes: &[],
         backend: "express",
         name: "Sensitive",
-        guard: EXPRESS_SENSITIVE,
-        ablations: EXPRESS_METHODS,
+        guard: PARENT_POST_FALLBACK,
+        ablations: PARENT_POST_METHODS,
     },
     Profile {
+        parsing_probes: &[],
         backend: "axum",
         name: "Sensitive",
         guard: SENSITIVE,
         ablations: HEAD,
     },
     Profile {
+        parsing_probes: &[],
         backend: "sveltekit",
         name: "Sensitive",
         guard: SENSITIVE,

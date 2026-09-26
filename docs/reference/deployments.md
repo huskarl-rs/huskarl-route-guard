@@ -33,6 +33,7 @@ default. All profiles now use default backslash handling.
 | Express 5.2.1 | `express.Router()` with default options | `Insensitive` | None |
 | Express 5.2.1 | `express.Router({ caseSensitive: false, strict: true })` | `Insensitive` | None |
 | Express 5.2.1 | `express.Router({ caseSensitive: true, strict: true })` | `Sensitive` | None |
+| Tomcat 11.0.26 / Spring MVC 7.0.8 | Embedded Tomcat; explicit connector options; case-sensitive `PathPatternParser` | `Sensitive` | None |
 | Axum 0.8.9 | Direct routes and fallback, without path-rewriting middleware | `Sensitive` | None |
 | `SvelteKit` 2.70.3 | Production `adapter-node` 5.5.7; rest-parameter endpoints | `Sensitive` | None |
 
@@ -46,6 +47,24 @@ each subtree root, trailing-slash root, and descendant path. Axum registers thos
 three forms with its native router. The `SvelteKit` fixture uses `[...rest]` endpoints
 under the corresponding prefixes, with a public fallback. None authorizes individual
 objects using decoded route captures. Full server setup lives alongside each fixture.
+
+The Tomcat–Spring fixture embeds Tomcat 11.0.26 with Spring MVC 7.0.8 on Java 21.
+It explicitly sets UTF-8 URI decoding, `encodedSolidusHandling=reject`,
+`encodedReverseSolidusHandling=decode`, `allowBackslash=false`, and
+`rejectSuspiciousURIs=false`. The root `DispatcherServlet` uses a case-sensitive
+`PathPatternParser`. Controllers return route IDs through native mappings, with
+a general fallback; there is no custom path normalization. See the
+[Tomcat connector reference](https://tomcat.apache.org/tomcat-11.0-doc/config/http.html)
+and [Spring request mapping reference](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-requestmapping.html).
+The fixture does not include Spring Boot, Spring Security filters, or the older
+`AntPathMatcher`; those require separate profiles.
+
+Fixed direct probes pin distinctions that guard filtering could hide:
+`/admin;x=1/probe.txt` reaches admin, while `/admin%3Bx=1/probe.txt` and
+`/public/..;x=1/admin/probe.txt` reach the public fallback. `/admin%2fprobe.txt`
+returns 400. These are observations of the complete servlet/MVC combination,
+not a claim that every servlet application treats these paths identically.
+They are reported as characterization, separately from authorization evidence.
 
 ## Guard configuration
 
@@ -93,7 +112,7 @@ without a response body. Canonical probes assert successful handlers and expecte
   for POST as well, or enforce a separately tested method restriction. This applies
   to the Apache origin in the NGINX chain too.
 - The framework fixtures register POST for `/files`, but only GET for its private
-  child. Express falls through to the parent's POST handler. Mirror that with an
+  child. Express and the Tomcat–Spring fixture fall through to the parent's POST handler. Mirror that with an
   explicit POST registration at `/files/private` using the files policy, or enable
   inheritance there to retain the parent POST rule and identity. Without either,
   the guard denies the method gap. Axum and `SvelteKit`
@@ -123,13 +142,13 @@ handlers need their own policy mapping and tests.
 
 ## Evidence for additional settings
 
-All ten recommended profiles passed with zero observed policy mismatches.
+All eleven recommended profiles passed with zero observed policy mismatches.
 The shared 7,024-path corpus combines grammar-generated delimiter injections,
 mixed case, content escapes, double escapes, and separator transformations across
 six policy layouts. The grammar table is independent of the guard's structural
 classes. Each candidate uses the same input corpus; summary counts and per-target
-reports record its results. Only requests accepted by a candidate are sent
-downstream. Stateless responses are reused across candidates/layouts for the same
+reports record its results. During corpus comparisons, only requests accepted by
+a candidate are sent downstream. Stateless responses are reused across candidates/layouts for the same
 method and target. A denied request supplies no downstream safety evidence;
 redirects and backend rejections supply no evidence of policy agreement either.
 
@@ -146,7 +165,7 @@ method entries are needed for availability, not to prevent default-rule fallthro
 | Fragment truncation for NGINX–Express | `/foo/secret%23/bar` | Public exception matches at guard; origin reaches protected fallback |
 | HEAD declarations | `HEAD /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
 | Apache POST declarations | `POST /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
-| Express child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
+| Express or Tomcat–Spring child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
 
 The confusion witnesses justify the parsing settings; the method-denial witnesses
 pin safe failure when an availability requirement is omitted. Backslash handling

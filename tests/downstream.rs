@@ -367,6 +367,28 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         )
         .unwrap();
     }
+    // Direct fixture characterization is separate from authorization evidence.
+    // These fixed probes may be rejected by the guard; never count them as
+    // accepted requests or policy agreement.
+    for probe in deployment.parsing_probes {
+        let response = request(address, probe.path, &Method::GET).expect("parsing probe response");
+        if let Some(report) = &mut report {
+            writeln!(
+                report,
+                "characterization\t-\tGET\t{:?}\t-\t{}\t{:?}\t{:?}\tobserved",
+                probe.path, response.status, response.route_id, response.location
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            (response.status, response.route_id.as_deref()),
+            (probe.status, probe.route_id),
+            "{}/{} parsing probe {:?}",
+            deployment.backend,
+            deployment.name,
+            probe.path
+        );
+    }
     let candidates = std::iter::once(("recommended", deployment.guard, None, false)).chain(
         deployment
             .ablations
