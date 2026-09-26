@@ -27,6 +27,14 @@ async fn main() {
             app = app.route(&path, route);
         }
     }
+    for (path, id) in [
+        ("/exact.txt", "exact"),
+        ("/foo/{segment}/bar", "parameterized"),
+    ] {
+        app = app
+            .route(path, get(move || marker(id)))
+            .route(&format!("{path}/"), get(move || marker(id)));
+    }
     let app = app.fallback(|| marker("public"));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await

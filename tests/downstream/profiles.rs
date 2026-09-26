@@ -7,6 +7,8 @@ pub struct DeploymentSettings {
     pub case: CaseSensitivity,
     pub decode: DecodeDepth,
     pub backslash: bool,
+    pub query_truncation: bool,
+    pub fragment_truncation: bool,
     pub include_head: bool,
     pub static_post: bool,
     pub private_post_fallback: bool,
@@ -33,6 +35,8 @@ const SENSITIVE: DeploymentSettings = DeploymentSettings {
     case: CaseSensitivity::Sensitive,
     decode: DecodeDepth::UpToOne,
     backslash: true,
+    query_truncation: true,
+    fragment_truncation: true,
     include_head: true,
     static_post: false,
     private_post_fallback: false,
@@ -172,9 +176,34 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
     },
 ];
 
-// Fixed before observations. The harness tests only outgoing requests for each
+// Explicit profiles with independently specified witnesses. Test only accepted requests for each
 // candidate. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
+    Profile {
+        backend: "nginx-express",
+        name: "DecodedUri",
+        guard: EXPRESS_SENSITIVE,
+        ablations: &[
+            Ablation {
+                name: "without-query-truncation",
+                expect_method_denial: false,
+                guard: DeploymentSettings {
+                    query_truncation: false,
+                    ..EXPRESS_SENSITIVE
+                },
+                witness: ("GET", "/foo/secret%3F/bar"),
+            },
+            Ablation {
+                name: "without-fragment-truncation",
+                expect_method_denial: false,
+                guard: DeploymentSettings {
+                    fragment_truncation: false,
+                    ..EXPRESS_SENSITIVE
+                },
+                witness: ("GET", "/foo/secret%23/bar"),
+            },
+        ],
+    },
     Profile {
         backend: "nginx-apache",
         name: "DecodedUri",

@@ -31,17 +31,19 @@ docker info >/dev/null
 mkdir -p target/downstream
 # COPY puts the fixtures on the container filesystem, including on macOS where
 # a bind-mounted document root could otherwise inherit host filesystem semantics.
-if [ "$#" -eq 0 ]; then set -- apache express axum sveltekit nginx-apache; fi
+if [ "$#" -eq 0 ]; then set -- apache express axum sveltekit nginx-apache nginx-express; fi
 for backend in "$@"; do
   case "$backend" in
     apache) profiles=(Off On NoDecode) ;;
     express) profiles=(Default Sensitive Insensitive) ;;
-    nginx-apache) profiles=(DecodedUri) ;;
+    nginx-apache|nginx-express) profiles=(DecodedUri) ;;
     axum|sveltekit) profiles=(Sensitive) ;;
-    *) echo "Unknown backend: $backend (choose apache, express, axum, sveltekit, nginx-apache)" >&2; exit 2 ;;
+    *) echo "Unknown backend: $backend (choose apache, express, axum, sveltekit, nginx-apache, nginx-express)" >&2; exit 2 ;;
   esac
+  fixture="$backend"
+  if [ "$backend" = nginx-express ]; then fixture=nginx-apache; fi
   if ! docker build --progress=plain --iidfile "$work/$backend-image" \
-    "tests/downstream/$backend" >"target/downstream/$backend-build.log" 2>&1; then
+    "tests/downstream/$fixture" >"target/downstream/$backend-build.log" 2>&1; then
     cat "target/downstream/$backend-build.log" >&2
     exit 1
   fi
@@ -52,14 +54,15 @@ for backend in "$@"; do
     report_prefix="target/downstream/$backend-$profile"
     : >"$report_prefix.tsv"
     network_args=(--env "ROUTING_PROFILE=$profile")
-    if [ "$backend" = nginx-apache ]; then
-      docker build --progress=plain --iidfile "$work/origin-image" tests/downstream/apache \
-        >"target/downstream/nginx-apache-origin-build.log" 2>&1 || {
-          cat target/downstream/nginx-apache-origin-build.log >&2; exit 1;
+    if [[ "$backend" = nginx-* ]]; then
+      origin_backend="${backend#nginx-}"
+      docker build --progress=plain --iidfile "$work/origin-image" "tests/downstream/$origin_backend" \
+        >"target/downstream/$backend-origin-build.log" 2>&1 || {
+          cat "target/downstream/$backend-origin-build.log" >&2; exit 1;
         }
       network=$(docker network create "route-guard-$(basename "$work")")
       origin=$(docker run --detach --network "$network" --network-alias origin \
-        --env APACHE_ENCODED_SLASHES=On "$(cat "$work/origin-image")")
+        --env APACHE_ENCODED_SLASHES=On --env ROUTING_PROFILE=Sensitive "$(cat "$work/origin-image")")
       network_args+=(--network "$network")
     fi
     container=$(docker run "${network_args[@]}" --detach --publish 127.0.0.1::8080 \

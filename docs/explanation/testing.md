@@ -175,16 +175,18 @@ versioned configuration recommendations supported by these tests.
 These tests challenge deployment assumptions behind configuration recommendations.
 `mise run test-downstream` runs the ignored `tests/downstream.rs` integration test
 against pinned Linux Apache, Express, Axum, and `SvelteKit` adapter-node fixtures,
-plus a NGINX normalized-URI proxy to Apache chain.
+plus NGINX normalized-URI proxy chains to Apache and Express.
 The same command works on macOS and Linux with a local Docker daemon; an Ubuntu
 GitHub Actions matrix runs it in CI. Ordinary tests use `mise run test` without Docker.
 
 The same input corpus is evaluated against each recommended guard configuration
-and four policy layouts. Only accepted requests are sent downstream, preserving
+and six policy layouts, including public exact/parameterized exceptions under a
+protected default. Only accepted requests are sent downstream, preserving
 request-target bytes over TCP. Responses identify selected routes (static resources
 for Apache), which the harness independently maps to authorization policies.
 A forwarded request reaching a different policy invalidates the recommendation.
 Denied requests are recorded as not forwarded and provide no downstream evidence.
+Stateless responses are cached by method/target across configurations and layouts.
 
 Additional runs remove individual parsing settings and must produce actual
 accepted-request confusion. Case folding for default/insensitive Express and
@@ -192,7 +194,15 @@ backslash handling for `SvelteKit` have such counterexamples. Method-registratio
 removals instead must produce `MethodNotConfigured` for a named request and no
 accepted-request confusion: missing methods now fail closed. The NGINX–Apache profile
 requires `UpToTwo`; removing its second decode declaration also reproduces confusion.
-The corpus combines content escapes, separator transformations, and case variants. GET and HEAD run across all
+The NGINX–Express profile exposes decoded query and fragment truncation without
+fixture-specific normalization code. Removing either class must reproduce its
+named public-exception-to-protected-fallback witness. The grammar generator
+produces those inputs from ordinary route seeds; its delimiter alphabet does not
+come from the guard's structural classes.
+
+The 7,024-path corpus combines raw, encoded, and double-encoded grammar delimiters
+at segment boundaries, midpoints, and suffixes with targeted content escapes,
+separator transformations, and case variants. GET and HEAD run across all
 layouts; POST exercises a layout with method-specific registrations and gaps.
 Route-ID headers identify HEAD handlers without relying on response bodies. If
 removal reveals no confusion, the test fails for review and removal of that unsupported recommendation from the tested profile. The minimum

@@ -2,7 +2,7 @@
 
 These recommendations apply to the particular versions, configurations, and routing
 scope below. The direct profiles have **no intermediate proxy between the guard
-and the backend**; the separate NGINX–Apache profile specifies its entire chain.
+and the backend**; the separate NGINX profiles specify their entire chains.
 The supported claim is that these configurations passed the downstream route-confusion
 tests. This is bounded evidence, not an exhaustive safety guarantee or a claim about
 every application using the same framework.
@@ -64,12 +64,15 @@ let express = GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToOn
 let sveltekit = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
 ```
 
-The tested guard tables have a public default and lowercase `/admin` and `/files`
+The subtree guard tables have a public default and lowercase `/admin` and `/files`
 subtree registrations. Layouts cover a uniform files subtree, a distinct private
 child, a private child under an otherwise public namespace, and method-specific
 registrations. The latter can use multiple registrations for one policy. This tests
 authorization-scope agreement, not equality of resource names within one scope. Use subtree registrations where slash/no-slash
-roots share a policy; exact-route trailing-slash equivalence is outside this baseline.
+roots share a policy. Two additional layouts use a protected default with a public
+exact `/exact.txt` or parameterized `/foo/{segment}/bar` exception. Each explicitly
+registers both trailing-slash spellings; backend rejection remains a no-resource
+outcome. Frameworks serve native handlers and Apache serves fixed matching files.
 
 Apply the guard to the unmodified path and forward accepted requests without
 rewriting it. Preserve the tested relationship between guard registrations and
@@ -120,16 +123,15 @@ handlers need their own policy mapping and tests.
 
 ## Evidence for additional settings
 
-The previously tested nine profiles passed with zero observed confusion. Those
-runs enabled backslash handling only for `SvelteKit`; the current profiles enable
-it for every backend by default. This stricter setting can only deny more
-requests; it does not establish additional availability evidence. The shared
-396-path corpus combines mixed case, content escapes, double escapes,
-and separator transformations across four policy layouts. Each candidate uses the
-same input corpus; the summary counts and per-request reports record its results.
-Only requests accepted by the candidate guard are sent downstream. A denied request
-supplies no downstream safety evidence; redirects and backend rejections supply no evidence
-of policy agreement either.
+All ten recommended profiles passed with zero observed policy mismatches.
+The shared 7,024-path corpus combines grammar-generated delimiter injections,
+mixed case, content escapes, double escapes, and separator transformations across
+six policy layouts. The grammar table is independent of the guard's structural
+classes. Each candidate uses the same input corpus; summary counts and per-target
+reports record its results. Only requests accepted by a candidate are sent
+downstream. Stateless responses are reused across candidates/layouts for the same
+method and target. A denied request supplies no downstream safety evidence;
+redirects and backend rejections supply no evidence of policy agreement either.
 
 Separate runs remove parsing settings and require accepted-request confusion.
 Removing a method declaration instead must deny its named request safely: these
@@ -140,6 +142,8 @@ method entries are needed for availability, not to prevent default-rule fallthro
 | Case folding for default or explicitly insensitive Express | `/ADMIN/PROBE.TXT` | Guard authorizes public; backend reaches admin |
 | Backslash handling for `SvelteKit` adapter-node | `/admin\probe.txt` | Guard authorizes public; backend reaches admin |
 | Second decode for the specified NGINX–Apache chain | `/%2561dmin/probe.txt` | Guard authorizes public; origin serves admin |
+| Query truncation for NGINX–Express | `/foo/secret%3F/bar` | Public exception matches at guard; origin reaches protected fallback |
+| Fragment truncation for NGINX–Express | `/foo/secret%23/bar` | Public exception matches at guard; origin reaches protected fallback |
 | HEAD declarations | `HEAD /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
 | Apache POST declarations | `POST /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
 | Express child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
@@ -207,6 +211,23 @@ For this exact chain, use `Sensitive`, `UpToTwo`, default structural classes, an
 above. The suite separately removes the second decode declaration, HEAD declaration,
 and static-file POST declarations. The decode removal requires an outgoing-request
 counterexample; the method removals require explicit method denial.
+
+## Tested decode-and-reparse chain: NGINX to Express
+
+The `nginx-express/DecodedUri` profile uses the same pinned NGINX configuration
+above, with the case-sensitive, strict Express fixture as its isolated origin.
+Use `Sensitive`, `UpToOne`, default structural classes, and `RejectAmbiguous`,
+with the Express method registrations above. This profile does not establish a
+second-decode requirement: decoding captures does not by itself reparse a URL.
+
+In this chain, `/foo/secret%23/bar` and `/foo/secret%3F/bar` lose the `/bar`
+suffix during downstream parsing. Both inputs match the guard's parameterized
+public exception when the corresponding truncation class is disabled. Express
+instead returns its fallback route ID, assigned the protected policy by this
+layout. Separate removal runs require each witness to produce confusion; the
+recommended configuration must produce none. No fixture implements a custom
+truncation transform. These observations concern this specific URI-forwarding
+configuration, not every NGINX or Express deployment.
 
 ## Running the tests
 

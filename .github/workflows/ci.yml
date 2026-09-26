@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [apache, express, axum, sveltekit, nginx-apache]
+        backend: [apache, express, axum, sveltekit, nginx-apache, nginx-express]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

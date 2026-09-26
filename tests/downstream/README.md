@@ -14,9 +14,10 @@ The user-facing reference is `docs/reference/deployments.md`.
 
 ```sh
 mise run test                         # ordinary tests; no Docker
-mise run test-downstream              # all nine deployment profiles
+mise run test-downstream              # all ten deployment profiles
 mise run test-downstream apache axum  # selected backends
 mise run test-nginx-apache            # real two-decode chain
+mise run test-nginx-express           # real decode-and-reparse chain
 ```
 
 Aliases also include `test-apache`, `test-express`, `test-axum`, and `test-sveltekit`.
@@ -38,7 +39,7 @@ Docker daemons are unsupported: the published address must be local loopback.
 
 - `scripts/test-downstream.sh` builds fixtures, publishes random loopback ports,
   runs the harness, saves logs, and removes containers and chain networks on exit.
-  Images remain cached. The chain's Apache origin has no published port.
+  Images remain cached. Neither chain publishes its origin port.
 - Fixtures use native handlers or static-file mapping to return stable route IDs.
   No fixture imports this library. `X-Route-ID` identifies HEAD routes despite
   body suppression; Apache assigns the header using filesystem directory scope.
@@ -46,6 +47,8 @@ Docker daemons are unsupported: the published address must be local loopback.
   variants removing individual recommendations. Each removal pins a named
   method/path confusion or method-denial witness and runs the entire shared corpus.
 - `tests/downstream.rs` contains the backend-independent transport and assertions.
+  Stateless fixture responses are cached by method/target across layouts and
+  candidates; a target is fetched only after a candidate accepts it.
   Each candidate receives the same input corpus before guard filtering. It has
   no branches identifying particular servers.
 
@@ -56,8 +59,10 @@ Docker daemons are unsupported: the published address must be local loopback.
 | Axum 0.8.9 | `Sensitive` | Native routes and fallback; no rewriting middleware |
 | SvelteKit 2.70.3 / adapter-node 5.5.7 | `Sensitive` | Production rest-parameter endpoints |
 | NGINX 1.28.0 → Apache 2.4.68 | `DecodedUri` | `proxy_pass http://origin$uri$is_args$args`; origin encoded slashes `On` |
+| NGINX 1.28.0 → Express 5.2.1 | `DecodedUri` | Same proxy configuration; case-sensitive, strict Express router |
 
-Direct guard profiles declare `UpToOne`; the chain declares `UpToTwo`. Express
+Direct guard profiles and NGINX–Express declare `UpToOne`; NGINX–Apache declares
+`UpToTwo`. Express
 Default/Insensitive declares `Insensitive`; all other profiles declare `Sensitive`.
 All use default structural classes, including backslash handling,
 and default `RejectAmbiguous` mode. The normalized-URI proxy configuration is a
@@ -71,13 +76,20 @@ and `AcceptPathInfo Off`; its static handler also accepts POST in this setup.
 
 ## Corpus, policy layouts, and methods
 
-The deterministic 396-path corpus includes per-byte content escapes and double
+The deterministic 7,024-path corpus includes per-byte content escapes and double
 escapes, mixed ASCII case, encoded/alternate separators, dot segments, matrix
 parameters, malformed escapes, invalid bytes, and combinations of content encoding
 with separator transformations. The same corpus is used for every candidate.
 
-Common route IDs are `public`, `admin`, `files`, and `private`; a legacy Apache
-literal-percent filename also belongs to the files policy. Four layouts vary the
+`corpus.rs` derives injections independently from RFC 3986's gen-delims and
+sub-delims, plus `%`, backslash, dot, and NUL. It inserts each byte raw, encoded,
+and double encoded (both hex cases) at segment boundaries, midpoints, and path
+suffixes. Seeds include ordinary resources, exact/parameterized exceptions, and
+dot-segment combinations. A sorted set deduplicates overlaps and gives stable
+report ordering. Targeted cases in the harness supplement this grammar table.
+
+Common route IDs are `public`, `admin`, `files`, `private`, `exact`, and `parameterized`; a legacy Apache
+literal-percent filename also belongs to the files policy. Six layouts vary the
 independent policy assignment and guard registrations:
 
 | Layout | Policy registration | Methods sent |
@@ -86,13 +98,19 @@ independent policy assignment and guard registrations:
 | Uniform | Admin and files; private resource shares files policy | GET, HEAD |
 | PrivateOnly | Only the private child is protected; everything else public | GET, HEAD |
 | Methods | Nested scopes with explicit methods and fallback registrations | GET, HEAD, POST |
+| ExactException | Protected default, public `/exact.txt` and `/exact.txt/` | GET, HEAD |
+| ParameterizedException | Protected default, public `/foo/{segment}/bar` and trailing-slash form | GET, HEAD |
 
 The method layout includes HEAD with GET. Apache includes POST for all static
 scopes. Frameworks have a POST handler at `/files`; Express's private child falls
 through to that handler and therefore needs an explicit child POST registration
 in the guard. Axum and SvelteKit return 405 for that child method gap. Canonical
 probes pin those distinctions and verify header identity and empty HEAD bodies.
-These comparisons establish policy agreement, not resource identity within a policy.
+The exception routes use native framework routing. Apache serves real files at
+`/exact.txt`, `/foo/secret/bar`, and `/foo/other/bar`; directory/file scopes label
+those resources without interpreting the incoming target. Both trailing-slash
+spellings are authorized for exceptions; a backend may reject one. These
+comparisons establish policy agreement, not resource identity within a policy.
 
 The TCP client sends HTTP/1.0 with the original request target and zero-length body,
 without a client URL parser or redirect following. Readiness and socket operations
@@ -119,7 +137,8 @@ built-in behaviors.
 authorized policy, status, route ID, redirect location, and outcome: `agreement`,
 `route-confusion`, `no-resource`, or `not-forwarded`. Denied requests have no
 response fields and contribute no downstream evidence. String fields use Rust
-debug-string escaping. Console output limits counterexample listings; reports
+debug-string escaping. Summary counts are logical accepted/served/denied comparisons, including reused
+observations, rather than physical connection counts. Console output limits counterexample listings; reports
 retain every result. Adjacent logs include the chain's origin separately, and CI
 uploads all reports and logs.
 
@@ -129,5 +148,32 @@ These are bounded GET/HEAD/POST baselines for the declared layouts, versions, an
 configurations. Other methods, request bodies, application authorization based on
 captures, arbitrary rewrites, native OS differences, and other proxy chains remain
 outside the recommendations. Axum shares the matchit family with the in-process
-matcher oracle. Proxy orchestration currently supports the specified NGINX–Apache
-pair; it is not an arbitrary cross-product of proxies and origins.
+matcher oracle. Proxy orchestration supports the specified NGINX–Apache and NGINX–Express
+pairs; it is not an arbitrary cross-product of proxies and origins.
+
+## Historical discovery check: `tmwxmztl`
+
+The NGINX–Express profile provides real decode-and-reparse evidence for query and
+fragment truncation. Removing either class must expose its independently
+specified witness, `/foo/secret%3F/bar` or `/foo/secret%23/bar`. The generator
+produces both from `/foo/secret/bar`; they are not injected as handpicked paths.
+Express reaches its fallback after truncation, which is protected in the
+parameterized-exception layout while the original path matches the public rule.
+
+To check historical discovery, export parent commit
+`b4e38bceca7230547a9ad837655aed3b0501bc27` into a temporary directory and overlay
+this harness, corpus, profiles, fixtures, and runner. The only API adaptations are
+removing the two class-builder toggles (which did not yet exist) and running only
+the default candidate, without the new ablations. Run `nginx-express` there.
+The expected failure is accepted-request policy confusion, not a compile failure
+or a synthetic normalizer result. Keep its TSV and logs separately from current
+baseline results. The normal suite continuously pins the two removal witnesses;
+historical source export is a manual audit, not a CI dependency.
+
+The audit on 2026-09-26 found 153 policy mismatches on that parent with `UpToOne`
+and this 7,024-path corpus; the current recommended profile found zero. Current
+removal runs found 102 query-truncation and 51 fragment-truncation mismatches.
+These are method/layout comparisons, not counts of unique exploit paths.
+
+Additional servlet, Envoy, Go, and FastCGI profiles, fuzz-corpus replay, and direct
+characterization of guard-rejected inputs remain follow-up work.

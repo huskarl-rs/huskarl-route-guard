@@ -2,7 +2,7 @@
 //! Fixtures identify resources/handlers without using our matcher.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -21,10 +21,15 @@ enum Policy {
     Admin,
     Files,
     Private,
+    Exact,
+    Parameterized,
 }
 
 #[path = "downstream/profiles.rs"]
 mod profiles;
+
+#[path = "downstream/corpus.rs"]
+mod generated;
 
 use profiles::{DeploymentSettings, Profile};
 
@@ -34,6 +39,8 @@ enum Layout {
     Uniform,
     PrivateOnly,
     Methods,
+    ExactException,
+    ParameterizedException,
 }
 
 fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
@@ -42,10 +49,33 @@ fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
     } else {
         StructuralClasses::new().without_backslash()
     };
-    let mut builder = RuleRouter::builder(
-        Policy::Public,
-        GuardConfig::new(settings.case, settings.decode).with_structural_classes(classes),
-    );
+    let classes = if settings.query_truncation {
+        classes
+    } else {
+        classes.without_query_truncation()
+    };
+    let classes = if settings.fragment_truncation {
+        classes
+    } else {
+        classes.without_fragment_truncation()
+    };
+    let config = GuardConfig::new(settings.case, settings.decode).with_structural_classes(classes);
+    if matches!(
+        layout,
+        Layout::ExactException | Layout::ParameterizedException
+    ) {
+        let path = if layout == Layout::ExactException {
+            "/exact.txt"
+        } else {
+            "/foo/{segment}/bar"
+        };
+        return RuleRouter::builder(Policy::Admin, config)
+            .register_path(path, |p| p.all(Policy::Public))
+            .register_path(format!("{path}/"), |p| p.all(Policy::Public))
+            .build()
+            .unwrap();
+    }
+    let mut builder = RuleRouter::builder(Policy::Public, config);
     let mut methods = if settings.include_head {
         vec![Method::GET, Method::HEAD]
     } else {
@@ -226,6 +256,7 @@ fn corpus() -> BTreeSet<String> {
             }
         }
     }
+    paths.extend(generated::grammar_paths());
     paths
 }
 
@@ -249,6 +280,8 @@ fn downstream_baseline() {
         ("/files/probe.txt", "files", Policy::Files),
         ("/files/private/probe.txt", "private", Policy::Private),
         ("/files/a/b.txt", "files", Policy::Files),
+        ("/exact.txt", "exact", Policy::Public),
+        ("/foo/secret/bar", "parameterized", Policy::Public),
     ] {
         assert_eq!(*nested.resolve(path, &Method::GET).unwrap().rule(), policy);
         let response = request(address, path, &Method::GET).unwrap();
@@ -313,6 +346,8 @@ fn response_policy(response: &Response) -> Option<Policy> {
                 "admin" => Policy::Admin,
                 "files" | "literal-slash" => Policy::Files,
                 "private" => Policy::Private,
+                "exact" => Policy::Exact,
+                "parameterized" => Policy::Parameterized,
                 other => panic!("unknown resource marker {other:?}"),
             },
         ),
@@ -338,6 +373,9 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             .iter()
             .map(|a| (a.name, a.guard, Some(a.witness), a.expect_method_denial)),
     );
+    let paths = corpus();
+    println!("shared corpus: {} paths", paths.len());
+    let mut responses = HashMap::new();
     let mut failures = Vec::new();
     for (candidate, settings, required_witness, expect_method_denial) in candidates {
         let require_confusion = required_witness.is_some() && !expect_method_denial;
@@ -351,6 +389,8 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             Layout::Uniform,
             Layout::PrivateOnly,
             Layout::Methods,
+            Layout::ExactException,
+            Layout::ParameterizedException,
         ] {
             let guard = router(layout, settings);
             let methods = if layout == Layout::Methods {
@@ -360,8 +400,8 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             };
             for method in methods {
                 let mut method_served = 0;
-                for path in corpus() {
-                    let resolution = guard.resolve(&path, &method);
+                for path in &paths {
+                    let resolution = guard.resolve(path, &method);
                     let Ok(matched) = resolution else {
                         if expect_method_denial
                             && layout == Layout::Methods
@@ -382,19 +422,18 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                     };
                     // Only accepted requests leave this simulated gateway. Each
                     // candidate gets the same input corpus, before guard filtering.
-                    let response = request(address, &path, &method).unwrap_or_else(|error| {
-                        panic!("{candidate}/{layout:?}/{method}/{path:?}: {error}")
-                    });
+                    // Fixtures are stateless. Reuse observations across policy
+                    // layouts/settings, but never fetch a guard-rejected target.
+                    let response = responses
+                        .entry((method.clone(), path.clone()))
+                        .or_insert_with(|| {
+                            request(address, path, &method).unwrap_or_else(|error| {
+                                panic!("{candidate}/{layout:?}/{method}/{path:?}: {error}")
+                            })
+                        });
                     forwarded += 1;
-                    let expected = response_policy(&response).map(|policy| {
-                        if layout == Layout::Uniform && policy == Policy::Private {
-                            Policy::Files
-                        } else if layout == Layout::PrivateOnly && policy != Policy::Private {
-                            Policy::Public
-                        } else {
-                            policy
-                        }
-                    });
+                    let expected =
+                        response_policy(response).map(|policy| layout_policy(layout, policy));
                     let outcome = match expected {
                         Some(policy) if policy != *matched.rule() => {
                             confusion += 1;
@@ -453,5 +492,34 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             deployment.backend, deployment.name
         );
     }
+    println!(
+        "unique downstream method/target observations: {}",
+        responses.len()
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// Assign policies to independently reported resource identities, never to the
+// request path (which would repeat the guard's interpretation in the oracle).
+fn layout_policy(layout: Layout, policy: Policy) -> Policy {
+    match layout {
+        Layout::ExactException => {
+            if policy == Policy::Exact {
+                Policy::Public
+            } else {
+                Policy::Admin
+            }
+        }
+        Layout::ParameterizedException => {
+            if policy == Policy::Parameterized {
+                Policy::Public
+            } else {
+                Policy::Admin
+            }
+        }
+        Layout::Uniform if policy == Policy::Private => Policy::Files,
+        Layout::PrivateOnly if policy != Policy::Private => Policy::Public,
+        _ if matches!(policy, Policy::Exact | Policy::Parameterized) => Policy::Public,
+        _ => policy,
+    }
 }

@@ -11,6 +11,14 @@ const router = profile === 'Default' ? express.Router() : express.Router({
   strict: true,
 });
 
+// Explicitly accept both trailing-slash spellings for these exception routes.
+router.get(['/exact.txt', '/exact.txt/'], (_request, response) => {
+  response.set('X-Route-ID', 'exact').type('text/plain').send('exact');
+});
+router.get(['/foo/:segment/bar', '/foo/:segment/bar/'], (_request, response) => {
+  response.set('X-Route-ID', 'parameterized').type('text/plain').send('parameterized');
+});
+
 // These are route IDs. The harness independently assigns policies to each ID.
 // Express uses registration order, so register the specific child first.
 for (const [prefix, routeId] of [
