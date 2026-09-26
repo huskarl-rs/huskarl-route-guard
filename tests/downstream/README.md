@@ -21,6 +21,10 @@ mise run test-downstream apache axum  # selected backends
 mise run test-nginx-apache            # real two-decode chain
 mise run test-nginx-express           # real decode-and-reparse chain
 mise run test-tomcat-spring           # native servlet + Spring MVC routing
+mise run test-downstream-search       # adds a seeded composed-mutation search
+
+# Reproduce a search run (seed and budget are printed and saved in search.txt):
+ROUTE_GUARD_DOWNSTREAM_SEED=123 ROUTE_GUARD_DOWNSTREAM_BUDGET=10000 mise run test-downstream nginx-express
 ```
 
 Aliases also include `test-apache`, `test-express`, `test-axum`, and `test-sveltekit`.
@@ -131,6 +135,47 @@ prevent a vacuous pass. Successful responses must contain known route IDs.
 Redirects and 400/403/404/405 responses are `no-resource`, not agreement evidence.
 A redirected request needs fresh authorization. Other statuses or network errors fail.
 
+## Regressions, seeded search, and shrinking
+
+Every run replays `regressions.tsv`: one target per line as a Rust debug string
+(the spelling used by all reports), a tab, and provenance. These targets join the
+shared corpus for every profile, candidate, layout, and method, so a committed
+mismatch stays covered even if the generators change.
+
+The default suite stays deterministic. Setting `ROUTE_GUARD_DOWNSTREAM_SEED`
+adds a seeded search (`corpus.rs`, `seeded_paths`): `ROUTE_GUARD_DOWNSTREAM_BUDGET`
+attempts (default 2,000), each applying two or three composed mutations to a
+grammar seed. Mutations are delimiter insertion (the grammar table's bytes and
+spellings), separator substitution, single-byte escaping, case flips, dot-segment
+insertion (including `..;` and encoded forms), matrix parameters, and trailing
+slash toggling. The generator uses SplitMix64, so a seed reproduces the same
+paths on any platform. `mise run test-downstream-search` draws a random seed
+unless one is set; the nightly `downstream-search` workflow uses the run ID and
+a budget of 10,000, and records the reproduction command in the job summary.
+Runtime grows with paths multiplied by three characterization methods per profile,
+while candidate comparisons reuse those observations.
+
+Each target records its families: `targeted`, `grammar`, `regression`, `seeded`,
+and one `seeded/<mutation>` entry per mutation that produced it. The console and
+`<backend>-<profile>-families.tsv` report, per candidate and family, the guard
+evaluations, accepted inputs, accepted inputs that reached a resource, and policy
+mismatches. The `characterization` rows count direct method/target observations
+and resources reached. A family whose inputs the guard denies exercises the
+guard but provides no downstream evidence; compare `accepted` and `served`
+before reading a family's zero mismatches as coverage.
+
+An unexpected mismatch (any mismatch for the recommended configuration, or for a
+method-registration removal) is shrunk against the live backend: at most five
+cases per candidate, each within 400 predicate checks. Shrinking deletes
+character ranges while the guard still accepts the target and the backend still
+reaches a different policy; the minimized mismatch need not keep the original
+policy pair. Removal witnesses are expected mismatches and are not shrunk.
+Results go to the console and `<backend>-<profile>-shrunk.tsv`, in
+`regressions.tsv` format with candidate, layout, method, policies, original
+target, families, seed, budget, check count, and whether the budget ran out. The
+file header records the reproduction command. After diagnosing and fixing a
+mismatch, append its line to `regressions.tsv`.
+
 ## Outcomes and recommendation changes
 
 Recommended configurations must have zero policy mismatches. Each removal must
@@ -197,6 +242,6 @@ removal runs found 102 query-truncation and 51 fragment-truncation mismatches
 across the original six layouts. These are method/layout comparisons, not counts
 of unique exploit paths; adding the distinct layout changes the totals.
 
-Additional servlet configurations, Envoy, Go, and FastCGI profiles, fuzz-corpus
-replay, and comparison of characterization results against backend-specific
-reference predictions remain follow-up work.
+Additional servlet configurations, Envoy, Go, and FastCGI profiles, replay of
+decoded bolero fuzz inputs, and comparison of characterization results against
+backend-specific reference predictions remain follow-up work.

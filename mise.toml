@@ -27,6 +27,10 @@ description = "Differential baseline against Linux Apache in Docker (macOS/Linux
 run = "bash scripts/test-downstream.sh"
 description = "Differential baselines in Docker; optionally pass apache, express, axum, sveltekit, nginx-apache, nginx-express, or tomcat-spring"
 
+[tasks.test-downstream-search]
+run = "ROUTE_GUARD_DOWNSTREAM_SEED=${ROUTE_GUARD_DOWNSTREAM_SEED:-random} bash scripts/test-downstream.sh"
+description = "Downstream baselines plus seeded composed-mutation search; set ROUTE_GUARD_DOWNSTREAM_SEED and ROUTE_GUARD_DOWNSTREAM_BUDGET to reproduce"
+
 [tasks.test-express]
 run = "bash scripts/test-downstream.sh express"
 description = "Differential baseline against Express in Docker"

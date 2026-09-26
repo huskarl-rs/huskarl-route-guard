@@ -1,0 +1,78 @@
+name: downstream-search
+
+# Nightly seeded composed-mutation search against the real downstream fixtures.
+# The per-push `ci` downstream job runs the deterministic corpus and committed
+# regressions; this job adds a larger seeded search. The seed changes each
+# scheduled run and is kept on reruns, so a failure reproduces locally with the
+# seed and budget printed in the job summary and saved in search.txt.
+
+on:
+  schedule:
+    # 03:43 UTC daily, off the top of the hour and before the fuzz discovery run.
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Search seed (defaults to the run id)"
+        required: false
+        default: ""
+      budget:
+        description: "Seeded mutation attempts per profile"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_AUTO_INSTALL: "false"
+
+concurrency:
+  group: downstream-search-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  search:
+    name: Search (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [apache, express, axum, sveltekit, nginx-apache, nginx-express, tomcat-spring]
+    env:
+      ROUTE_GUARD_DOWNSTREAM_SEED: ${{ github.event.inputs.seed || github.run_id }}
+      ROUTE_GUARD_DOWNSTREAM_BUDGET: ${{ github.event.inputs.budget || '10000' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: false
+      - name: Record reproduction details
+        env:
+          DOWNSTREAM_BACKEND: ${{ matrix.backend }}
+        run: |
+          {
+            echo "### Downstream search ($DOWNSTREAM_BACKEND)"
+            echo
+            echo '```sh'
+            echo "ROUTE_GUARD_DOWNSTREAM_SEED=$ROUTE_GUARD_DOWNSTREAM_SEED ROUTE_GUARD_DOWNSTREAM_BUDGET=$ROUTE_GUARD_DOWNSTREAM_BUDGET mise run test-downstream $DOWNSTREAM_BACKEND"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Run seeded search
+        env:
+          DOWNSTREAM_BACKEND: ${{ matrix.backend }}
+        run: mise run test-downstream "$DOWNSTREAM_BACKEND"
+      - name: Save reports, shrunk mismatches, and server logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: downstream-search-${{ matrix.backend }}
+          path: target/downstream/
+          if-no-files-found: ignore
+          retention-days: 30

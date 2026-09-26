@@ -29,6 +29,16 @@ trap 'exit 143' TERM
 
 docker info >/dev/null
 mkdir -p target/downstream
+# Optional seeded composed-mutation search on top of the deterministic corpus.
+# Pass a seed to reproduce a run, or "random" to draw a fresh one.
+if [ "${ROUTE_GUARD_DOWNSTREAM_SEED:-}" = random ]; then
+  ROUTE_GUARD_DOWNSTREAM_SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+fi
+if [ -n "${ROUTE_GUARD_DOWNSTREAM_SEED:-}" ]; then
+  export ROUTE_GUARD_DOWNSTREAM_SEED
+  echo "seeded search: ROUTE_GUARD_DOWNSTREAM_SEED=$ROUTE_GUARD_DOWNSTREAM_SEED ROUTE_GUARD_DOWNSTREAM_BUDGET=${ROUTE_GUARD_DOWNSTREAM_BUDGET:-default}" \
+    | tee target/downstream/search.txt
+fi
 # COPY puts the fixtures on the container filesystem, including on macOS where
 # a bind-mounted document root could otherwise inherit host filesystem semantics.
 if [ "$#" -eq 0 ]; then set -- apache express axum sveltekit nginx-apache nginx-express tomcat-spring; fi
@@ -54,6 +64,8 @@ for backend in "$@"; do
   for profile in "${profiles[@]}"; do
     report_prefix="target/downstream/$backend-$profile"
     : >"$report_prefix.tsv"
+    # Written only when a mismatch is shrunk; never leave a stale one behind.
+    rm -f "$report_prefix-shrunk.tsv"
     network_args=(--env "ROUTING_PROFILE=$profile")
     if [[ "$backend" = nginx-* ]]; then
       origin_backend="${backend#nginx-}"
@@ -72,6 +84,8 @@ for backend in "$@"; do
     echo "$backend/$profile ($address)"
     ROUTE_GUARD_DOWNSTREAM_ADDR="$address" ROUTE_GUARD_DOWNSTREAM_BACKEND="$backend" \
       ROUTE_GUARD_DOWNSTREAM_PROFILE="$profile" ROUTE_GUARD_DOWNSTREAM_REPORT="$report_prefix.tsv" \
+      ROUTE_GUARD_DOWNSTREAM_FAMILY_REPORT="$report_prefix-families.tsv" \
+      ROUTE_GUARD_DOWNSTREAM_SHRINK_REPORT="$report_prefix-shrunk.tsv" \
       cargo test --locked --test downstream downstream_baseline -- --ignored --nocapture
     docker logs "$container" >"$report_prefix.log" 2>&1
     docker rm -f "$container" >/dev/null

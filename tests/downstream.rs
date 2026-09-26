@@ -2,7 +2,7 @@
 //! Fixtures identify resources/handlers without using our matcher.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     fs::File,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -30,6 +30,15 @@ mod profiles;
 
 #[path = "downstream/corpus.rs"]
 mod generated;
+
+#[path = "downstream/regressions.rs"]
+mod regressions;
+
+#[path = "downstream/shrink.rs"]
+mod shrink;
+
+#[path = "downstream/shrink_pipeline.rs"]
+mod shrink_pipeline;
 
 use profiles::{DeploymentSettings, Profile};
 
@@ -191,7 +200,65 @@ fn wait_until_ready(address: SocketAddr) {
     }
 }
 
-fn corpus() -> BTreeSet<String> {
+/// Each target with the input families that produced it.
+type Corpus = BTreeMap<String, BTreeSet<&'static str>>;
+
+/// Seeded composed-mutation search, enabled by `ROUTE_GUARD_DOWNSTREAM_SEED`.
+#[derive(Clone, Copy)]
+struct Search {
+    seed: u64,
+    budget: usize,
+}
+
+const DEFAULT_SEARCH_BUDGET: usize = 2_000;
+// Shrinking costs real requests. Bound both the cases and the work per case.
+const SHRINK_CASES_PER_CANDIDATE: usize = 5;
+const SHRINK_CHECKS_PER_CASE: usize = 400;
+
+fn search_from_env() -> Option<Search> {
+    let seed = std::env::var("ROUTE_GUARD_DOWNSTREAM_SEED")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let seed = seed
+        .parse()
+        .expect("ROUTE_GUARD_DOWNSTREAM_SEED must be an unsigned 64-bit integer");
+    let budget = std::env::var("ROUTE_GUARD_DOWNSTREAM_BUDGET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map_or(DEFAULT_SEARCH_BUDGET, |b| {
+            b.parse()
+                .expect("ROUTE_GUARD_DOWNSTREAM_BUDGET must be a count")
+        });
+    Some(Search { seed, budget })
+}
+
+/// The deterministic corpus, committed regressions, and optional seeded search.
+fn corpus(search: Option<Search>) -> Corpus {
+    let mut corpus = Corpus::new();
+    let mut tag = |path: String, family: &'static str| {
+        corpus.entry(path).or_default().insert(family);
+    };
+    for path in targeted_paths() {
+        tag(path, "targeted");
+    }
+    for path in generated::grammar_paths() {
+        tag(path, "grammar");
+    }
+    for regression in regressions::load() {
+        tag(regression.path, "regression");
+    }
+    if let Some(search) = search {
+        for (path, mutations) in generated::seeded_paths(search.seed, search.budget) {
+            tag(path.clone(), "seeded");
+            for mutation in mutations {
+                tag(path.clone(), mutation);
+            }
+        }
+    }
+    corpus
+}
+
+fn targeted_paths() -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for seed in [
         "/public/probe.txt",
@@ -273,7 +340,6 @@ fn corpus() -> BTreeSet<String> {
             }
         }
     }
-    paths.extend(generated::grammar_paths());
     paths
 }
 
@@ -352,26 +418,43 @@ fn downstream_baseline() {
 }
 
 fn response_policy(response: &Response) -> Option<Policy> {
+    classify(response).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn classify(response: &Response) -> Result<Option<Policy>, String> {
     match response.status {
-        200 => Some(
-            match response
-                .route_id
-                .as_deref()
-                .expect("successful response must identify its route")
-            {
-                "public" => Policy::Public,
-                "admin" => Policy::Admin,
-                "files" => Policy::Files,
-                "private" => Policy::Private,
-                "exact" => Policy::Exact,
-                "parameterized" => Policy::Parameterized,
-                other => panic!("unknown resource marker {other:?}"),
-            },
-        ),
+        200 => match response.route_id.as_deref() {
+            Some("public") => Ok(Some(Policy::Public)),
+            Some("admin") => Ok(Some(Policy::Admin)),
+            Some("files") => Ok(Some(Policy::Files)),
+            Some("private") => Ok(Some(Policy::Private)),
+            Some("exact") => Ok(Some(Policy::Exact)),
+            Some("parameterized") => Ok(Some(Policy::Parameterized)),
+            Some(other) => Err(format!("unknown resource marker {other:?}")),
+            None => Err("successful response must identify its route".to_owned()),
+        },
         // A redirect requires fresh authorization. No resource policy to compare.
-        301 | 302 | 307 | 308 | 400 | 403 | 404 | 405 => None,
-        status => panic!("unexpected downstream status {status}"),
+        301 | 302 | 307 | 308 | 400 | 403 | 404 | 405 => Ok(None),
+        status => Err(format!("unexpected downstream status {status}")),
     }
+}
+
+/// Evidence per input family. Generated inputs the guard denies exercise the
+/// guard but say nothing about the backend; only accepted inputs that reach a
+/// resource are downstream evidence.
+#[derive(Default)]
+struct FamilyStats {
+    /// Guard evaluations, or method/target observations for characterization.
+    inputs: usize,
+    accepted: usize,
+    served: usize,
+    confusions: usize,
+}
+
+struct Confusion {
+    layout: Layout,
+    method: Method,
+    path: String,
 }
 
 fn compare_corpus(address: SocketAddr, deployment: &Profile) {
@@ -384,12 +467,31 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         )
         .unwrap();
     }
-    let paths = corpus();
-    println!("shared corpus: {} paths", paths.len());
+    let search = search_from_env();
+    let corpus = corpus(search);
+    let paths: BTreeSet<String> = corpus.keys().cloned().collect();
+    match search {
+        Some(Search { seed, budget }) => println!(
+            "shared corpus: {} paths (seeded search: seed={seed}, budget={budget})",
+            paths.len()
+        ),
+        None => println!("shared corpus: {} paths", paths.len()),
+    }
     let mut responses = characterize_corpus(&paths, &mut report, |path, method| {
         request(address, path, method)
             .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
     });
+    let mut families: BTreeMap<(&str, &str), FamilyStats> = BTreeMap::new();
+    for (path, tags) in &corpus {
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            let reached = response_policy(&responses[&(method, path.clone())]).is_some();
+            for &family in tags {
+                let stats = families.entry(("characterization", family)).or_default();
+                stats.inputs += 1;
+                stats.served += usize::from(reached);
+            }
+        }
+    }
     // Reuse corpus observations for fixed probes where possible. Profile probes
     // can also cover targets outside the shared corpus.
     for probe in deployment.parsing_probes {
@@ -418,6 +520,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             probe.path
         );
     }
+    let mut shrink_report = ShrinkReport::new(deployment, search);
     let candidates = std::iter::once(("recommended", deployment.guard, None, false)).chain(
         deployment
             .ablations
@@ -432,6 +535,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         let mut served = 0;
         let mut skipped = 0;
         let mut confusion = 0;
+        let mut unexpected = Vec::new();
         for layout in [
             Layout::Nested,
             Layout::Uniform,
@@ -449,7 +553,10 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             };
             for method in methods {
                 let mut method_served = 0;
-                for path in &paths {
+                for (path, tags) in &corpus {
+                    for &family in tags {
+                        families.entry((candidate, family)).or_default().inputs += 1;
+                    }
                     let resolution = guard.resolve(path, &method);
                     let Ok(matched) = resolution else {
                         if expect_method_denial
@@ -482,6 +589,13 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                             confusion += 1;
                             witness_observed |=
                                 required_witness == Some((method.as_str(), path.as_str()));
+                            if !require_confusion && unexpected.len() < SHRINK_CASES_PER_CANDIDATE {
+                                unexpected.push(Confusion {
+                                    layout,
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                });
+                            }
                             "route-confusion"
                         }
                         Some(_) => "agreement",
@@ -490,6 +604,12 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                     if expected.is_some() {
                         served += 1;
                         method_served += 1;
+                    }
+                    for &family in tags {
+                        let stats = families.entry((candidate, family)).or_default();
+                        stats.accepted += 1;
+                        stats.served += usize::from(expected.is_some());
+                        stats.confusions += usize::from(outcome == "route-confusion");
                     }
                     if let Some(report) = &mut report {
                         writeln!(
@@ -522,24 +642,187 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             served >= 10,
             "{candidate}: too few forwarded resource requests"
         );
+        // Unexpected mismatches only: removal witnesses are expected confusion.
+        for case in &unexpected {
+            let shrunk = shrink_confusion(address, &mut responses, settings, case);
+            shrink_report.record(candidate, case, &shrunk, &corpus[&case.path]);
+        }
         if required_witness.is_some() && !witness_observed {
             failures.push(format!("{candidate}: required witness {required_witness:?} did not produce its expected outcome (method denial: {expect_method_denial})"));
         }
         if require_confusion && confusion == 0 {
             failures.push(format!("{candidate}: removal found no confusion; review and remove the unsupported recommendation for this profile"));
         } else if !require_confusion && confusion != 0 {
-            failures.push(format!("configuration permits {confusion} route confusions; fix the profile or model and document required settings"));
+            failures.push(format!(
+                "{candidate}: configuration permits {confusion} route confusions; fix the profile or model and document required settings{}",
+                shrink_report.hint()
+            ));
         }
         println!(
             "{}/{}/{candidate}: forwarded={forwarded}, served={served}, not-forwarded={skipped}, route-confusions={confusion}",
             deployment.backend, deployment.name
         );
     }
+    write_family_report(&families);
     println!(
         "unique downstream method/target observations: {}",
         responses.len()
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn write_family_report(families: &BTreeMap<(&str, &str), FamilyStats>) {
+    let mut report = std::env::var_os("ROUTE_GUARD_DOWNSTREAM_FAMILY_REPORT")
+        .map(|path| File::create(path).expect("create family report"));
+    if let Some(report) = &mut report {
+        writeln!(
+            report,
+            "candidate\tfamily\tinputs\taccepted\tserved\tconfusions"
+        )
+        .unwrap();
+    }
+    for ((candidate, family), stats) in families {
+        println!(
+            "family {candidate}/{family}: inputs={}, accepted={}, served={}, confusions={}",
+            stats.inputs, stats.accepted, stats.served, stats.confusions
+        );
+        if let Some(report) = &mut report {
+            writeln!(
+                report,
+                "{candidate}\t{family}\t{}\t{}\t{}\t{}",
+                stats.inputs, stats.accepted, stats.served, stats.confusions
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Minimizes an unexpected mismatch against the live backend. Any accepted
+/// policy mismatch counts as still failing; it need not keep the same policies.
+fn shrink_confusion(
+    address: SocketAddr,
+    responses: &mut HashMap<(Method, String), Response>,
+    settings: DeploymentSettings,
+    case: &Confusion,
+) -> (shrink::Shrunk, Policy, Policy) {
+    shrink_confusion_with(responses, settings, case, |path, method| {
+        request(address, path, method)
+    })
+}
+
+fn shrink_confusion_with(
+    responses: &mut HashMap<(Method, String), Response>,
+    settings: DeploymentSettings,
+    case: &Confusion,
+    mut fetch: impl FnMut(&str, &Method) -> std::io::Result<Response>,
+) -> (shrink::Shrunk, Policy, Policy) {
+    let guard = router(case.layout, settings);
+    let mut mismatch = |path: &str| -> Option<(Policy, Policy)> {
+        let authorized = *guard.resolve(path, &case.method).ok()?.rule();
+        let response = match responses.entry((case.method.clone(), path.to_owned())) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(fetch(path, &case.method).ok()?),
+        };
+        let reached = layout_policy(case.layout, classify(response).ok()??);
+        (reached != authorized).then_some((authorized, reached))
+    };
+    let shrunk = shrink::shrink(&case.path, SHRINK_CHECKS_PER_CASE, |path| {
+        mismatch(path).is_some()
+    });
+    let (authorized, reached) = mismatch(&shrunk.path).expect("shrinking preserves a mismatch");
+    (shrunk, authorized, reached)
+}
+
+/// Shrunk mismatches in `regressions.tsv` format, with reproduction details.
+struct ShrinkReport {
+    backend: &'static str,
+    profile: &'static str,
+    search: Option<Search>,
+    path: Option<std::ffi::OsString>,
+    file: Option<File>,
+    /// Distinct originals often minimize to the same mismatch; report it once.
+    seen: BTreeSet<(String, String, String, String)>,
+}
+
+impl ShrinkReport {
+    fn new(deployment: &Profile, search: Option<Search>) -> Self {
+        Self {
+            backend: deployment.backend,
+            profile: deployment.name,
+            search,
+            path: std::env::var_os("ROUTE_GUARD_DOWNSTREAM_SHRINK_REPORT"),
+            file: None,
+            seen: BTreeSet::new(),
+        }
+    }
+
+    fn reproduce(&self) -> String {
+        let prefix = self
+            .search
+            .map_or_else(String::new, |Search { seed, budget }| {
+                format!(
+                    "ROUTE_GUARD_DOWNSTREAM_SEED={seed} ROUTE_GUARD_DOWNSTREAM_BUDGET={budget} "
+                )
+            });
+        format!("{prefix}mise run test-downstream {}", self.backend)
+    }
+
+    fn hint(&self) -> String {
+        match &self.path {
+            Some(path) => format!(" (shrunk cases: {})", path.to_string_lossy()),
+            None => String::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        candidate: &str,
+        case: &Confusion,
+        (shrunk, authorized, reached): &(shrink::Shrunk, Policy, Policy),
+        families: &BTreeSet<&str>,
+    ) {
+        let key = (
+            candidate.to_owned(),
+            format!("{:?}", case.layout),
+            case.method.to_string(),
+            shrunk.path.clone(),
+        );
+        if !self.seen.insert(key) {
+            println!("shrunk: {:?} (duplicate from {:?})", shrunk.path, case.path);
+            return;
+        }
+        let search = self.search.map_or_else(
+            || "deterministic".to_owned(),
+            |Search { seed, budget }| format!("seed={seed} budget={budget}"),
+        );
+        let families = families.iter().copied().collect::<Vec<_>>().join(",");
+        let line = format!(
+            "{:?}\t{}/{} candidate={candidate} layout={:?} method={} authorized={authorized:?} reached={reached:?} original={:?} families={families} {search} checks={} exhausted={}",
+            shrunk.path,
+            self.backend,
+            self.profile,
+            case.layout,
+            case.method,
+            case.path,
+            shrunk.checks,
+            shrunk.exhausted
+        );
+        println!("shrunk: {line}");
+        let Some(path) = &self.path else { return };
+        if self.file.is_none() {
+            let mut file = File::create(path).expect("create shrink report");
+            writeln!(
+                file,
+                "# Shrunk downstream mismatches ({}/{}), in regressions.tsv format.\n# Reproduce: {}",
+                self.backend,
+                self.profile,
+                self.reproduce()
+            )
+            .unwrap();
+            self.file = Some(file);
+        }
+        writeln!(self.file.as_mut().unwrap(), "{line}").unwrap();
+    }
 }
 
 // This deliberately bypasses the guard. Observations are not authorization or
