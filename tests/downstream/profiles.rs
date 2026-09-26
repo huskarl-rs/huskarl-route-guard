@@ -184,8 +184,8 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
     },
 ];
 
-// Explicit profiles with independently specified witnesses. Test only accepted requests for each
-// candidate. Parsing removals expose confusion; method removals pin safe denial.
+// Explicit profiles with independently specified witnesses. Only accepted requests contribute
+// candidate safety evidence. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
     Profile {
         parsing_probes: &[

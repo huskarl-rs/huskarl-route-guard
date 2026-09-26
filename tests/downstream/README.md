@@ -1,7 +1,9 @@
 # Real downstream deployment baselines
 
-These tests validate the assumptions behind deployment recommendations. For corpus comparisons, only
-requests accepted by each candidate guard configuration are sent downstream.
+These tests validate the assumptions behind deployment recommendations. A separate
+characterization pass sends every corpus path directly to the backend with GET,
+HEAD, and POST, independently of guard acceptance. Safety comparisons use only
+requests accepted by each candidate guard configuration.
 A reached route's independently assigned policy must agree with the authorized
 policy. Removal runs weaken one setting or registration assumption and must expose
 actual outgoing-request confusion for parsing settings. Removing a method
@@ -48,8 +50,9 @@ Docker daemons are unsupported: the published address must be local loopback.
   variants removing individual recommendations. Each removal pins a named
   method/path confusion or method-denial witness and runs the entire shared corpus.
 - `tests/downstream.rs` contains the backend-independent transport and assertions.
-  Stateless fixture responses are cached by method/target across layouts and
-  candidates; a target is fetched only after a candidate accepts it.
+  The full-corpus characterization pass caches stateless fixture responses by
+  method/target for reuse across layouts and candidates. Only accepted requests
+  contribute to candidate safety comparisons.
   Each candidate receives the same input corpus before guard filtering. It has
   no branches identifying particular servers.
 
@@ -94,11 +97,12 @@ dot-segment combinations. A sorted set deduplicates overlaps and gives stable
 report ordering. Targeted cases in the harness supplement this grammar table.
 
 Common route IDs are `public`, `admin`, `files`, `private`, `exact`, and `parameterized`; a legacy Apache
-literal-percent filename also belongs to the files policy. Six layouts vary the
+literal-percent filename also belongs to the files policy. Seven layouts vary the
 independent policy assignment and guard registrations:
 
 | Layout | Policy registration | Methods sent |
 |---|---|---|
+| Distinct | Each of the six fixture route IDs has its own policy, including exact and parameterized routes | GET, HEAD |
 | Nested | Admin, files, distinct private child; public default | GET, HEAD |
 | Uniform | Admin and files; private resource shares files policy | GET, HEAD |
 | PrivateOnly | Only the private child is protected; everything else public | GET, HEAD |
@@ -114,8 +118,11 @@ probes pin those distinctions and verify header identity and empty HEAD bodies.
 The exception routes use native framework routing. Apache serves real files at
 `/exact.txt`, `/foo/secret/bar`, and `/foo/other/bar`; directory/file scopes label
 those resources without interpreting the incoming target. Both trailing-slash
-spellings are authorized for exceptions; a backend may reject one. These
-comparisons establish policy agreement, not resource identity within a policy.
+spellings are authorized for exceptions; a backend may reject one. The distinct
+layout retains each fixture route ID as a separate policy; the other layouts still exercise shared policies and different acceptance boundaries. These
+comparisons establish policy agreement, not resource identity or capture values
+within a handler. Adding registrations can cause more guard denials, so the
+distinct layout supplements rather than replaces the existing layouts.
 
 The TCP client sends HTTP/1.0 with the original request target and zero-length body,
 without a client URL parser or redirect following. Readiness and socket operations
@@ -140,10 +147,17 @@ built-in behaviors.
 
 `target/downstream/<backend>-<profile>.tsv` records candidate, layout, method, path,
 authorized policy, status, route ID, redirect location, and outcome: `agreement`,
-`route-confusion`, `no-resource`, or `not-forwarded`. The `characterization` candidate contains fixed direct parsing probes with outcome
-`observed`; these have no guard policy and never count as forwarding or agreement
-evidence. They are separate from candidate corpus runs. Denied corpus requests have no
-response fields and contribute no downstream evidence. String fields use Rust
+`route-confusion`, `no-resource`, or `not-forwarded`. The `characterization`
+candidate contains every corpus path for GET, HEAD, and POST with outcome
+`observed` (21,072 corpus rows per profile, plus any fixed GET probes outside the
+corpus). These rows have no guard policy and never count as forwarding or agreement
+evidence. Fixed parsing probes reuse corpus observations where available and pin
+known behavior. Denied candidate rows
+retain empty response fields and contribute no downstream safety evidence; join
+them to characterization rows by method/path to inspect backend behavior.
+Characterization validates response statuses and successful route IDs, but does
+not assert agreement with an exact backend model or prove that a denial is
+unnecessary. Redirects are recorded without following them. String fields use Rust
 debug-string escaping. Summary counts are logical accepted/served/denied comparisons, including reused
 observations, rather than physical connection counts. Console output limits counterexample listings; reports
 retain every result. Adjacent logs include the chain's origin separately, and CI
@@ -178,9 +192,11 @@ baseline results. The normal suite continuously pins the two removal witnesses;
 historical source export is a manual audit, not a CI dependency.
 
 The audit on 2026-09-26 found 153 policy mismatches on that parent with `UpToOne`
-and this 7,024-path corpus; the current recommended profile found zero. Current
-removal runs found 102 query-truncation and 51 fragment-truncation mismatches.
-These are method/layout comparisons, not counts of unique exploit paths.
+and this 7,024-path corpus; the recommended profile found zero. At that audit,
+removal runs found 102 query-truncation and 51 fragment-truncation mismatches
+across the original six layouts. These are method/layout comparisons, not counts
+of unique exploit paths; adding the distinct layout changes the totals.
 
-Additional servlet configurations, Envoy, Go, and FastCGI profiles, fuzz-corpus replay, and direct
-characterization of guard-rejected inputs remain follow-up work.
+Additional servlet configurations, Envoy, Go, and FastCGI profiles, fuzz-corpus
+replay, and comparison of characterization results against backend-specific
+reference predictions remain follow-up work.

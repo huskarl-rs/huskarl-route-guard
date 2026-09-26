@@ -41,6 +41,7 @@ enum Layout {
     Methods,
     ExactException,
     ParameterizedException,
+    Distinct,
 }
 
 fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
@@ -110,6 +111,16 @@ fn router(layout: Layout, settings: DeploymentSettings) -> RuleRouter<Policy> {
             );
         }
     }
+    if layout == Layout::Distinct {
+        for (path, policy) in [
+            ("/exact.txt", Policy::Exact),
+            ("/foo/{segment}/bar", Policy::Parameterized),
+        ] {
+            builder = builder
+                .register_path(path, |p| p.all(policy))
+                .register_path(format!("{path}/"), |p| p.all(policy));
+        }
+    }
     builder.build().unwrap()
 }
 
@@ -133,6 +144,12 @@ fn request(address: SocketAddr, path: &str, method: &Method) -> std::io::Result<
     )?;
     let mut bytes = Vec::new();
     stream.take(64 * 1024).read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed without an HTTP response",
+        ));
+    }
     assert!(bytes.len() < 64 * 1024, "oversized response for {path:?}");
     let text = String::from_utf8(bytes).expect("fixture response is UTF-8");
     let (headers, body) = text.split_once("\r\n\r\n").expect("HTTP response");
@@ -344,7 +361,7 @@ fn response_policy(response: &Response) -> Option<Policy> {
             {
                 "public" => Policy::Public,
                 "admin" => Policy::Admin,
-                "files" | "literal-slash" => Policy::Files,
+                "files" => Policy::Files,
                 "private" => Policy::Private,
                 "exact" => Policy::Exact,
                 "parameterized" => Policy::Parameterized,
@@ -367,19 +384,31 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         )
         .unwrap();
     }
-    // Direct fixture characterization is separate from authorization evidence.
-    // These fixed probes may be rejected by the guard; never count them as
-    // accepted requests or policy agreement.
+    let paths = corpus();
+    println!("shared corpus: {} paths", paths.len());
+    let mut responses = characterize_corpus(&paths, &mut report, |path, method| {
+        request(address, path, method)
+            .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
+    });
+    // Reuse corpus observations for fixed probes where possible. Profile probes
+    // can also cover targets outside the shared corpus.
     for probe in deployment.parsing_probes {
-        let response = request(address, probe.path, &Method::GET).expect("parsing probe response");
-        if let Some(report) = &mut report {
-            writeln!(
-                report,
-                "characterization\t-\tGET\t{:?}\t-\t{}\t{:?}\t{:?}\tobserved",
-                probe.path, response.status, response.route_id, response.location
-            )
-            .unwrap();
-        }
+        let response = responses
+            .entry((Method::GET, probe.path.to_owned()))
+            .or_insert_with(|| {
+                let response =
+                    request(address, probe.path, &Method::GET).expect("parsing probe response");
+                response_policy(&response);
+                if let Some(report) = &mut report {
+                    writeln!(
+                        report,
+                        "characterization\t-\tGET\t{:?}\t-\t{}\t{:?}\t{:?}\tobserved",
+                        probe.path, response.status, response.route_id, response.location
+                    )
+                    .unwrap();
+                }
+                response
+            });
         assert_eq!(
             (response.status, response.route_id.as_deref()),
             (probe.status, probe.route_id),
@@ -395,9 +424,6 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             .iter()
             .map(|a| (a.name, a.guard, Some(a.witness), a.expect_method_denial)),
     );
-    let paths = corpus();
-    println!("shared corpus: {} paths", paths.len());
-    let mut responses = HashMap::new();
     let mut failures = Vec::new();
     for (candidate, settings, required_witness, expect_method_denial) in candidates {
         let require_confusion = required_witness.is_some() && !expect_method_denial;
@@ -413,6 +439,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             Layout::Methods,
             Layout::ExactException,
             Layout::ParameterizedException,
+            Layout::Distinct,
         ] {
             let guard = router(layout, settings);
             let methods = if layout == Layout::Methods {
@@ -442,17 +469,11 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                         }
                         continue;
                     };
-                    // Only accepted requests leave this simulated gateway. Each
-                    // candidate gets the same input corpus, before guard filtering.
-                    // Fixtures are stateless. Reuse observations across policy
-                    // layouts/settings, but never fetch a guard-rejected target.
+                    // Only accepted requests contribute safety evidence. Reuse
+                    // the independent characterization of our stateless fixtures.
                     let response = responses
-                        .entry((method.clone(), path.clone()))
-                        .or_insert_with(|| {
-                            request(address, path, &method).unwrap_or_else(|error| {
-                                panic!("{candidate}/{layout:?}/{method}/{path:?}: {error}")
-                            })
-                        });
+                        .get(&(method.clone(), path.clone()))
+                        .expect("every method/target has been characterized");
                     forwarded += 1;
                     let expected =
                         response_policy(response).map(|policy| layout_policy(layout, policy));
@@ -521,10 +542,49 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// This deliberately bypasses the guard. Observations are not authorization or
+// model-agreement evidence, including when a backend serves a denied target.
+fn characterize_corpus(
+    paths: &BTreeSet<String>,
+    report: &mut Option<impl Write>,
+    mut fetch: impl FnMut(&str, &Method) -> Response,
+) -> HashMap<(Method, String), Response> {
+    let mut responses = HashMap::new();
+    for method in [Method::GET, Method::HEAD, Method::POST] {
+        let mut served = 0;
+        for path in paths {
+            let response = fetch(path, &method);
+            // Validate status and route identity even for guard-rejected inputs.
+            served += usize::from(response_policy(&response).is_some());
+            // Malformed request lines may be rejected before the server knows
+            // this is HEAD, so only successful responses must suppress bodies.
+            if method == Method::HEAD && response.status == 200 {
+                assert!(response.body.is_empty(), "HEAD body for {path:?}");
+            }
+            if let Some(report) = report {
+                writeln!(
+                    report,
+                    "characterization\t-\t{method}\t{path:?}\t-\t{}\t{:?}\t{:?}\tobserved",
+                    response.status, response.route_id, response.location
+                )
+                .unwrap();
+            }
+            responses.insert((method.clone(), path.clone()), response);
+        }
+        println!(
+            "characterization/{method}: observed={}, served={served}, no-resource={}",
+            paths.len(),
+            paths.len() - served
+        );
+    }
+    responses
+}
+
 // Assign policies to independently reported resource identities, never to the
 // request path (which would repeat the guard's interpretation in the oracle).
 fn layout_policy(layout: Layout, policy: Policy) -> Policy {
     match layout {
+        Layout::Distinct => policy,
         Layout::ExactException => {
             if policy == Policy::Exact {
                 Policy::Public
@@ -543,5 +603,66 @@ fn layout_policy(layout: Layout, policy: Policy) -> Policy {
         Layout::PrivateOnly if policy != Policy::Private => Policy::Public,
         _ if matches!(policy, Policy::Exact | Policy::Parameterized) => Policy::Public,
         _ => policy,
+    }
+}
+
+#[test]
+fn distinct_layout_preserves_each_fixture_identity() {
+    let guard = router(Layout::Distinct, profiles::find("axum", "Sensitive").guard);
+    for method in [Method::GET, Method::HEAD] {
+        for (path, policy) in [
+            ("/public/probe.txt", Policy::Public),
+            ("/admin/probe.txt", Policy::Admin),
+            ("/files/probe.txt", Policy::Files),
+            ("/files/private/probe.txt", Policy::Private),
+            ("/exact.txt", Policy::Exact),
+            ("/exact.txt/", Policy::Exact),
+            ("/foo/secret/bar", Policy::Parameterized),
+            ("/foo/other/bar/", Policy::Parameterized),
+        ] {
+            assert_eq!(*guard.resolve(path, &method).unwrap().rule(), policy);
+            assert_eq!(layout_policy(Layout::Distinct, policy), policy);
+        }
+    }
+    // The older nested layout merges these routes into its public default.
+    assert_ne!(
+        layout_policy(Layout::Distinct, Policy::Exact),
+        layout_policy(Layout::Distinct, Policy::Parameterized)
+    );
+    assert_eq!(layout_policy(Layout::Nested, Policy::Exact), Policy::Public);
+}
+
+#[test]
+fn characterization_observes_denied_paths_without_claiming_agreement() {
+    let denied = "/admin\0/probe.txt";
+    let guard = router(Layout::Distinct, profiles::find("axum", "Sensitive").guard);
+    assert!(guard.resolve(denied, &Method::GET).is_err());
+    let paths = BTreeSet::from([denied.to_owned(), "/public/probe.txt".to_owned()]);
+    let mut report = Some(Vec::new());
+    let mut requests = Vec::new();
+    let responses = characterize_corpus(&paths, &mut report, |path, method| {
+        requests.push((method.clone(), path.to_owned()));
+        Response {
+            status: if path == denied { 400 } else { 200 },
+            // Early request-line errors can have bodies even for HEAD.
+            body: if path == denied { "bad request" } else { "" }.to_owned(),
+            location: None,
+            route_id: (path != denied).then(|| "public".to_owned()),
+        }
+    });
+    assert_eq!(requests.len(), 6);
+    assert_eq!(responses.len(), 6);
+    for method in [Method::GET, Method::HEAD, Method::POST] {
+        assert_eq!(responses[&(method, denied.to_owned())].status, 400);
+    }
+    let report = String::from_utf8(report.unwrap()).unwrap();
+    assert_eq!(report.lines().count(), 6);
+    for line in report.lines() {
+        let columns: Vec<_> = line.split('\t').collect();
+        assert_eq!(columns.len(), 9);
+        assert_eq!(columns[0], "characterization");
+        assert_eq!(columns[1], "-");
+        assert_eq!(columns[4], "-");
+        assert_eq!(columns[8], "observed");
     }
 }

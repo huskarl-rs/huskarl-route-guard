@@ -1,7 +1,7 @@
 # Tomcat and Spring MVC fixture
 
 Run `mise run test-tomcat-spring` from the repository root. Java and Maven run
-inside Docker; no host JDK is needed. The same 7,024 paths, six policy layouts,
+inside Docker; no host JDK is needed. The same 7,024 paths, seven policy layouts,
 and independent route-ID assertions used by the other fixtures apply here.
 
 ## Pinned environment
@@ -58,8 +58,8 @@ The harness pins these direct GET probes independently of guard acceptance:
 
 In particular, servlet normalization alone does not predict the final Spring
 handler for `..;`. The observations concern the complete pinned stack. These
-probes appear under `characterization` in the TSV and do not count as guard
-forwarding or policy agreement. The normal corpus run found zero policy
+probes are included in the full-corpus `characterization` rows in the TSV and do
+not count as guard forwarding or policy agreement. The normal corpus run found zero policy
 mismatches with `Sensitive`, `UpToOne`, and the default structural classes.
 
 References: [Tomcat HTTP connector](https://tomcat.apache.org/tomcat-11.0-doc/config/http.html),

@@ -145,11 +145,15 @@ handlers need their own policy mapping and tests.
 All eleven recommended profiles passed with zero observed policy mismatches.
 The shared 7,024-path corpus combines grammar-generated delimiter injections,
 mixed case, content escapes, double escapes, and separator transformations across
-six policy layouts. The grammar table is independent of the guard's structural
-classes. Each candidate uses the same input corpus; summary counts and per-target
-reports record its results. During corpus comparisons, only requests accepted by
-a candidate are sent downstream. Stateless responses are reused across candidates/layouts for the same
-method and target. A denied request supplies no downstream safety evidence;
+seven policy layouts, including one with a distinct policy for each fixture route
+ID. The grammar table is independent of the guard's structural classes. Each
+candidate uses the same input corpus; summary counts and per-target reports record
+its results. A separate characterization pass sends every corpus path with GET,
+HEAD, and POST to the backend regardless of guard acceptance. Its observations are
+reused across candidates/layouts for the same method and target, but only accepted requests
+contribute to safety comparisons. Characterization records actual behavior; it
+does not assert an exact backend-model prediction or establish that denials are
+unnecessary. A denied request supplies no downstream safety evidence;
 redirects and backend rejections supply no evidence of policy agreement either.
 
 Separate runs remove parsing settings and require accepted-request confusion.
