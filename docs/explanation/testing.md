@@ -14,9 +14,9 @@ inside the model; they cannot prove that the model describes a real deployment.
 
 ## Transform selection and order
 
-The reference model enumerates every subset of the nine supported transforms. It does
-not enumerate every possible order for every subset: eight transforms have up to
-`8!` orders. Property tests exercise the canonical order and a fresh sampled order for
+The reference model enumerates every subset of the eleven supported transforms. It does
+not enumerate every possible order for every subset: ten transforms have up to
+`10!` orders. Property tests exercise the canonical order and a fresh sampled order for
 each subset and generated case.
 
 Order genuinely matters. For `/admin;x//../b`, merging `//` before resolving `..`
@@ -61,8 +61,12 @@ cases in ordinary test runs.
 public API. An independent decoder and normalizer establish the downstream path;
 each denial fixture also verifies that this path reaches a different rule identity.
 The cases cover mixed encoded dots, encoded hex digits across two decode passes,
-parameter stripping followed by traversal, and slash merging. Separate assertions
-exercise decode-depth limits and exclusive subtrees. A whitespace-trimming example
+parameter stripping followed by traversal, slash merging, and escaped slash/backslash
+separators. A query-suffix witness checks rejection of full request-target input and
+protected routing through `uri.path()`, including with the guard disabled. Separate
+assertions exercise decode-depth limits and exclusive subtrees. Fragment truncation
+checks both default protection and the gap after opting out. Query truncation is
+also included in the independent transform model. A whitespace-trimming example
 documents a behavior outside the model rather than claiming the guard rejects it.
 
 These layers support one bounded conclusion: the implementation has strong evidence

@@ -29,7 +29,7 @@ Some parsing behaviors change the content of a segment predictably. For example,
 the selected rule with the raw path's rule.
 
 Structural behavior is harder to simulate. Slash merging, path-parameter removal,
-and dot-segment resolution can interact in different orders. Instead of choosing
+query/fragment truncation, and dot-segment resolution can interact in different orders. Instead of choosing
 one order, the guard calculates a region that contains the possible results.
 If every path in that region selects the same rule for the request method, the structural
 form cannot cross a rule boundary.
@@ -76,6 +76,11 @@ An escape in an earlier segment does **not** always force the anchor to the root
 For `/files/%61/a%2fb`, the earlier escape shortens it to `/files/`.
 For `/%66iles/a%2fb`, it becomes `/`. The implementation keeps whatever earlier
 prefix it can establish as stable.
+
+Query and fragment truncation use the same region calculation. The scanner also
+counts dot-segments exposed by truncation: `/files/..%23suffix` can become
+`/files/..`, then `/`. Simply comparing the raw and truncated route matches would
+miss that composition. These checks do not rewrite the forwarded path.
 
 Registered literal segments cannot contain enabled structural forms while the
 guard is active. This build-time check prevents a literal route from depending

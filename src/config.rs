@@ -255,6 +255,13 @@ pub enum StructuralClass {
     /// A raw or `%00` NUL — truncates a C-string backend. Denied everywhere,
     /// unconditionally.
     NulTruncation,
+    /// A decoded `#` treated as a fragment delimiter. Enabled by default; see
+    /// [`StructuralClasses::without_fragment_truncation`]. Scoped like
+    /// [`Separator`](Self::Separator), including traversal exposed by truncation.
+    FragmentTruncation,
+    /// A decoded `?` treated as a query delimiter. Enabled by default; scoped
+    /// like [`Separator`](Self::Separator).
+    QueryTruncation,
     /// A `\`/`%5C` treated as a separator (enabled by default). Scoped like
     /// [`Separator`](Self::Separator).
     Backslash,
@@ -273,6 +280,8 @@ impl std::fmt::Display for StructuralClass {
             Self::Separator => "encoded or alternate path separator",
             Self::MatrixParam => "matrix path-parameter (`;`)",
             Self::NulTruncation => "NUL byte (truncation)",
+            Self::FragmentTruncation => "fragment delimiter (`#` truncation)",
+            Self::QueryTruncation => "query delimiter (`?` truncation)",
             Self::Backslash => "backslash separator",
             Self::Uppercase => "uppercase under a case-folding backend",
         })
@@ -484,8 +493,9 @@ pub trait StructuralProbe: Send + Sync {
 /// The structural alphabet the guard recognises.
 ///
 /// The default includes encoded-slash, dot-segment, matrix-param, NUL-truncation,
-/// and backslash separators. Backslash handling is enabled conservatively because
-/// downstream URL parsers can treat it as a separator even on Unix.
+/// backslash separators, and decoded query/fragment truncation. These delimiter
+/// interpretations are enabled conservatively to cover downstream URL reparsing;
+/// backslashes can act as separators even on Unix.
 ///
 /// Disable backslash handling only when every downstream component preserves it
 /// as content. Opt into additional encodings to match your deployment:
@@ -505,6 +515,10 @@ pub trait StructuralProbe: Send + Sync {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct StructuralClasses {
+    /// Treat decoded `?` as a query delimiter (enabled by default).
+    pub(crate) query_truncation: bool,
+    /// Treat decoded `#` as a fragment delimiter (enabled by default).
+    pub(crate) fragment_truncation: bool,
     /// `\`/`%5C` as a path separator (enabled by default).
     pub(crate) backslash: bool,
     /// Recognise overlong UTF-8 `/` (`%C0%AF`, …).
@@ -520,6 +534,8 @@ pub struct StructuralClasses {
 impl Default for StructuralClasses {
     fn default() -> Self {
         Self {
+            fragment_truncation: true,
+            query_truncation: true,
             backslash: true,
             overlong_slash: false,
             overlong_dot: false,
@@ -530,8 +546,61 @@ impl Default for StructuralClasses {
 }
 
 impl StructuralClasses {
+    /// Model downstream truncation at a decoded `#` fragment delimiter.
+    ///
+    /// Enabled by default to cover downstream components that decode and then
+    /// reparse the path as a URL. Restores handling after
+    /// [`without_fragment_truncation`](Self::without_fragment_truncation).
+    /// The configured [`DecodeDepth`] controls which spellings are recognized:
+    /// `%23` after one pass, `%2523` after two. Literal `#` remains invalid API input.
+    ///
+    /// In [`GuardMode::RejectAmbiguous`], the guard requires uniform rule coverage
+    /// beneath the structural anchor, accounting for other enabled transforms
+    /// and dot-segments exposed by truncation. This is conservative: same-rule
+    /// paths can still be denied unless uniformity is provable. The forwarded
+    /// path is never rewritten. [`GuardMode::Disabled`] skips this check.
+    #[must_use]
+    pub fn with_fragment_truncation(mut self) -> Self {
+        self.fragment_truncation = true;
+        self
+    }
+
+    /// Preserve decoded `#` as path content in the interpretation model.
+    ///
+    /// Only disable this when every downstream component preserves it as data;
+    /// otherwise a fragment suffix may cross an authorization boundary.
+    #[must_use]
+    pub fn without_fragment_truncation(mut self) -> Self {
+        self.fragment_truncation = false;
+        self
+    }
+
+    /// Model downstream truncation at a decoded `?` query delimiter.
+    ///
+    /// Enabled by default. Like [`with_fragment_truncation`](Self::with_fragment_truncation),
+    /// this uses conservative structural coverage without rewriting the path.
+    /// `%3F` is recognized after one decode; `%253F` requires [`DecodeDepth::UpToTwo`].
+    /// Literal `?` remains invalid API input. Restores handling after
+    /// [`without_query_truncation`](Self::without_query_truncation).
+    #[must_use]
+    pub fn with_query_truncation(mut self) -> Self {
+        self.query_truncation = true;
+        self
+    }
+
+    /// Preserve decoded `?` as path content in the interpretation model.
+    ///
+    /// Only disable this when every downstream component preserves it as data;
+    /// otherwise a query suffix may cross an authorization boundary.
+    #[must_use]
+    pub fn without_query_truncation(mut self) -> Self {
+        self.query_truncation = false;
+        self
+    }
+
     /// The default set: encoded-slash, dot-segment, matrix-param, NUL-truncation,
-    /// and backslash separators, with no optional encodings or probes.
+    /// backslash separators, and decoded query/fragment truncation, with no optional
+    /// encodings or probes.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -609,6 +678,8 @@ impl std::fmt::Debug for StructuralClasses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let probes: Vec<&str> = self.probes.iter().map(|p| p.name()).collect();
         f.debug_struct("StructuralClasses")
+            .field("fragment_truncation", &self.fragment_truncation)
+            .field("query_truncation", &self.query_truncation)
             .field("backslash", &self.backslash)
             .field("overlong_slash", &self.overlong_slash)
             .field("overlong_dot", &self.overlong_dot)
@@ -627,6 +698,8 @@ mod tests {
         // Both constructors enable backslash handling.
         let c = StructuralClasses::new();
         assert!(c.backslash);
+        assert!(c.fragment_truncation);
+        assert!(c.query_truncation);
         assert!(StructuralClasses::default().backslash);
         assert!(!c.overlong_slash);
         assert!(!c.overlong_dot);
@@ -636,6 +709,28 @@ mod tests {
 
     #[test]
     fn builders_toggle_their_field() {
+        assert!(
+            !StructuralClasses::new()
+                .without_fragment_truncation()
+                .fragment_truncation
+        );
+        assert!(
+            !StructuralClasses::new()
+                .without_query_truncation()
+                .query_truncation
+        );
+        assert!(
+            StructuralClasses::new()
+                .without_fragment_truncation()
+                .with_fragment_truncation()
+                .fragment_truncation
+        );
+        assert!(
+            StructuralClasses::new()
+                .without_query_truncation()
+                .with_query_truncation()
+                .query_truncation
+        );
         assert!(!StructuralClasses::new().without_backslash().backslash);
         assert!(
             StructuralClasses::new()

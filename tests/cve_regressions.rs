@@ -1,7 +1,10 @@
 //! Reduced path-confusion witnesses, not reproductions of the vulnerable products.
 //! Keep the interpretation oracle independent of production scanner helpers.
-use http::Method;
-use huskarl_route_guard::{CaseSensitivity, DecodeDepth, GuardConfig, RuleRouter};
+use http::{Method, Uri};
+use huskarl_route_guard::{
+    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, RuleRouter,
+    StructuralClasses,
+};
 
 fn config(depth: DecodeDepth) -> GuardConfig {
     GuardConfig::new(CaseSensitivity::Sensitive, depth)
@@ -143,6 +146,111 @@ fn cve_2021_31920_separator_witnesses_reach_the_protected_route() {
         let downstream = normalize(&decode(raw));
         assert_eq!(downstream, "/admin");
         assert_denied_relocation(&router, raw, &downstream);
+    }
+}
+
+#[test]
+fn cve_2021_29492_escaped_separators_cross_rule_boundaries() {
+    // https://github.com/envoyproxy/envoy/security/advisories/GHSA-4987-27fx-x6cf
+    // Model a backend that decodes and treats backslashes as separators.
+    let router = RuleRouter::builder("public", config(DecodeDepth::UpToOne))
+        .register_subtree("/admin", |path| path.all("protected"))
+        .build()
+        .unwrap();
+    for raw in [
+        "/admin%2Fsecret",
+        "/admin%2fsecret",
+        "/admin%5Csecret",
+        "/admin%5csecret",
+    ] {
+        let downstream = decode(raw).replace('\\', "/");
+        assert_eq!(downstream, "/admin/secret");
+        assert_denied_relocation(&router, raw, &downstream);
+    }
+}
+
+#[test]
+fn cve_2025_54576_query_suffix_cannot_select_a_public_route() {
+    // https://github.com/oauth2-proxy/oauth2-proxy/security/advisories/GHSA-7rh7-c77v-6434
+    // A reduced equivalent of ^/foo/.*/bar$, using a single wildcard segment.
+    for mode in [GuardMode::RejectAmbiguous, GuardMode::Disabled] {
+        let router = RuleRouter::builder("protected", config(DecodeDepth::UpToOne).with_mode(mode))
+            .register_path("/foo/{segment}/bar", |path| path.all("public"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            *router
+                .resolve("/foo/something/bar", &Method::GET)
+                .unwrap()
+                .rule(),
+            "public"
+        );
+        let raw = "/foo/critical_endpoint?param=/bar";
+        assert_eq!(
+            router.resolve(raw, &Method::GET).unwrap_err(),
+            ResolveError::InvalidPathInput
+        );
+        let uri: Uri = raw.parse().unwrap();
+        assert_eq!(uri.path(), "/foo/critical_endpoint");
+        assert_eq!(
+            *router.resolve(uri.path(), &Method::GET).unwrap().rule(),
+            "protected"
+        );
+    }
+}
+
+#[test]
+fn cve_2026_41059_decoded_fragment_truncation_denied_by_default() {
+    // https://github.com/oauth2-proxy/oauth2-proxy/security/advisories/GHSA-pxq7-h93f-9jrg
+    // A reduced equivalent of ^/foo/.*/bar$, not OAuth2 Proxy's regex matcher.
+    for depth in [DecodeDepth::UpToOne, DecodeDepth::UpToTwo] {
+        let router = RuleRouter::builder(
+            "protected",
+            config(depth)
+                .with_structural_classes(StructuralClasses::new().without_fragment_truncation()),
+        )
+        .register_path("/foo/{segment}/bar", |path| path.all("public"))
+        .build()
+        .unwrap();
+        assert_eq!(
+            router
+                .resolve("/foo/secret#/bar", &Method::GET)
+                .unwrap_err(),
+            ResolveError::InvalidPathInput
+        );
+        let guarded = RuleRouter::builder("protected", config(depth))
+            .register_path("/foo/{segment}/bar", |path| path.all("public"))
+            .build()
+            .unwrap();
+        for raw in ["/foo/secret%23/bar", "/foo/secret%2523/bar"] {
+            if raw.contains("%2523") && depth == DecodeDepth::UpToOne {
+                assert_eq!(
+                    *guarded.resolve(raw, &Method::GET).unwrap().rule(),
+                    "public"
+                );
+                continue;
+            }
+            let decoded = decode(raw);
+            let decoded = if depth == DecodeDepth::UpToTwo {
+                decode(&decoded)
+            } else {
+                decoded
+            };
+            assert_eq!(decoded, "/foo/secret#/bar");
+            let downstream = decoded.split_once('#').unwrap().0;
+            assert_eq!(downstream, "/foo/secret");
+            assert_denied_relocation(&guarded, raw, downstream);
+            assert_ne!(
+                router.inspect_raw(raw, &Method::GET).unwrap(),
+                router.inspect_raw(downstream, &Method::GET).unwrap()
+            );
+            // Decoding alone preserves the public match; downstream truncation does not.
+            assert_eq!(*router.resolve(raw, &Method::GET).unwrap().rule(), "public");
+            assert_eq!(
+                *router.resolve(downstream, &Method::GET).unwrap().rule(),
+                "protected"
+            );
+        }
     }
 }
 
