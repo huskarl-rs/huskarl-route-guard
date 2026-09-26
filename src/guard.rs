@@ -959,6 +959,8 @@ mod tests {
         up_to_two: bool,
         unicode: bool,
         overlong: bool,
+        fragment: bool,
+        query: bool,
     }
 
     impl Cfg {
@@ -971,6 +973,8 @@ mod tests {
                 up_to_two: false,
                 unicode: false,
                 overlong: false,
+                fragment: false,
+                query: false,
             }
         }
 
@@ -978,6 +982,12 @@ mod tests {
             let mut c = StructuralClasses::new();
             if !self.backslash {
                 c = c.without_backslash();
+            }
+            if !self.fragment {
+                c = c.without_fragment_truncation();
+            }
+            if !self.query {
+                c = c.without_query_truncation();
             }
             if self.unicode {
                 c = c.with_fullwidth_structure();
@@ -1013,6 +1023,8 @@ mod tests {
         UpToTwo,
         Unicode,
         Overlong,
+        Query,
+        Fragment,
         NonCanonical,
     }
 
@@ -1020,6 +1032,8 @@ mod tests {
         fn apply(self, base: &Cfg) -> Cfg {
             let mut c = base.clone();
             match self {
+                Tighten::Query => c.query = true,
+                Tighten::Fragment => c.fragment = true,
                 Tighten::Insensitive => c.insensitive = true,
                 Tighten::Backslash => c.backslash = true,
                 Tighten::UpToTwo => c.up_to_two = true,
@@ -1035,8 +1049,31 @@ mod tests {
     /// payloads across every class — including opt-in forms that stay inert unless the
     /// matching toggle is on, so config tightening visibly changes the verdict.
     const SEG_VOCAB: &[&str] = &[
-        "a", "b", "x", "admin", "users", "files", "edit", "super", "secret", "a%2fb", "..",
-        "%2e%2e", "a;b", "..;x", "a%5cb", "a%00b", "a%252fb", "a%c0%afb", "Abc",
+        "a%3Fb",
+        "..%3fsuffix",
+        "a%253Fb",
+        "a%23b",
+        "..%23suffix",
+        "a%2523b",
+        "a",
+        "b",
+        "x",
+        "admin",
+        "users",
+        "files",
+        "edit",
+        "super",
+        "secret",
+        "a%2fb",
+        "..",
+        "%2e%2e",
+        "a;b",
+        "..;x",
+        "a%5cb",
+        "a%00b",
+        "a%252fb",
+        "a%c0%afb",
+        "Abc",
     ];
 
     fn arb_cfg() -> impl Strategy<Value = Cfg> {
@@ -1050,15 +1087,21 @@ mod tests {
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
         )
             .prop_map(
-                |(mode, insensitive, backslash, up_to_two, unicode, overlong)| Cfg {
-                    mode,
-                    insensitive,
-                    backslash,
-                    up_to_two,
-                    unicode,
-                    overlong,
+                |(mode, insensitive, backslash, up_to_two, unicode, overlong, fragment, query)| {
+                    Cfg {
+                        mode,
+                        insensitive,
+                        backslash,
+                        up_to_two,
+                        unicode,
+                        overlong,
+                        fragment,
+                        query,
+                    }
                 },
             )
     }
@@ -1071,6 +1114,8 @@ mod tests {
             Just(Tighten::Unicode),
             Just(Tighten::Overlong),
             Just(Tighten::NonCanonical),
+            Just(Tighten::Fragment),
+            Just(Tighten::Query),
         ]
     }
 

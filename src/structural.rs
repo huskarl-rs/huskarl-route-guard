@@ -2,8 +2,8 @@
 //!
 //! This is the byte-level half of the guard: given a request path, which
 //! [`ClassSet`] of structural byte families does it carry — encoded/empty
-//! separators, dot-segments, matrix-params, NUL truncation, and the opt-in
-//! backslash class, plus their alternate encodings (overlong-UTF-8, double-percent,
+//! separators, dot-segments, matrix-params, NUL truncation, and configurable
+//! backslash, query-truncation, and fragment-truncation classes, plus their alternate encodings (overlong-UTF-8, double-percent,
 //! fullwidth confusables, gated by [`Encodings`]) — and the two positional facts the
 //! scoped verdict anchors on: the earliest enabled occurrence and the dot-segment
 //! pop count ([`ScanResult`])? It models no backend and consults no route table; it
@@ -22,7 +22,8 @@ use crate::percent::{Interpretation, fullwidth_at, interpretations, overlong_at}
 /// one bitwise AND: the classes **present** in a request path ([`classes_present`])
 /// and the classes a configuration **enables** ([`enabled_classes`]).
 ///
-/// The default classes — separator, dot-segment, param, truncation, backslash — are the byte
+/// The default classes — separator, dot-segment, param, NUL truncation, backslash,
+/// query truncation, and fragment truncation — are the byte
 /// forms covered by
 /// [`StructuralClasses::new`](crate::config::StructuralClasses::new).
 /// [`BACKSLASH`](ClassSet::BACKSLASH) can be disabled with `without_backslash`, and
@@ -57,6 +58,10 @@ impl ClassSet {
     /// backslash handling can be explicitly disabled through
     /// [`StructuralClasses::without_backslash`](crate::config::StructuralClasses::without_backslash).
     pub(crate) const BACKSLASH: ClassSet = ClassSet(1 << 5);
+    /// Configurable `#` truncation after decoding. Scoped, unlike unconditional NUL denial.
+    pub(crate) const FRAGMENT: ClassSet = ClassSet(1 << 6);
+    /// Configurable `?` truncation after decoding. Scoped like fragment truncation.
+    pub(crate) const QUERY: ClassSet = ClassSet(1 << 7);
 
     /// The empty set.
     pub(crate) const fn empty() -> Self {
@@ -108,6 +113,8 @@ impl std::fmt::Debug for ClassSet {
             (Self::TRUNCATION, "Truncation"),
             (Self::CASE, "Case"),
             (Self::BACKSLASH, "Backslash"),
+            (Self::FRAGMENT, "Fragment"),
+            (Self::QUERY, "Query"),
         ] {
             if self.contains_any(bit) {
                 names.push(name);
@@ -177,7 +184,7 @@ pub(crate) struct ScanResult {
     /// **second** slash (a merge always keeps the first, so the first is stable).
     pub(crate) earliest: Option<usize>,
     /// Conservative count of dot-segment-capable segments (`k`): each segment whose
-    /// bare content before parameters is exactly `.`/`..`, or that carries an encoded-dot
+    /// bare content before parameters or enabled truncation delimiters is exactly `.`/`..`, or that carries an encoded-dot
     /// form anywhere (`%2E`, `%252E`, overlong, fullwidth), counts as one `..` — one
     /// level of climb. Overcounting only widens the verdict's anchor (denies more);
     /// an undercount would be a traversal bypass. Invariant: `dot_pops >= 1` iff
@@ -227,7 +234,8 @@ pub(crate) fn classes_present(path: &str, enabled: ClassSet, enc: Encodings) -> 
     scan(path, enabled, enc).classes
 }
 
-/// Segment state shared by byte classification and climb counting. Encoded dots
+/// Segment state shared by byte classification and climb counting. Parameters and
+/// enabled truncation delimiters terminate bare segment content. Encoded dots
 /// count conservatively even inside content or parameters, as do alternate dots.
 #[derive(Default)]
 struct DotSegment {
@@ -281,6 +289,8 @@ pub(crate) fn scan_interpretation(
             b'/' if encoded || previous_slash => ClassSet::SEPARATOR,
             b'.' if encoded => ClassSet::DOT_SEGMENT,
             b';' => ClassSet::PARAM,
+            b'#' => ClassSet::FRAGMENT,
+            b'?' => ClassSet::QUERY,
             b'\\' => ClassSet::BACKSLASH,
             0 => ClassSet::TRUNCATION,
             b'A'..=b'Z' => ClassSet::CASE,
@@ -295,7 +305,13 @@ pub(crate) fn scan_interpretation(
                 start: view.source_offset(i + width),
                 ..DotSegment::default()
             };
-        } else if byte == b';' && enabled.contains_any(ClassSet::PARAM) {
+        } else if (byte == b';' && enabled.contains_any(ClassSet::PARAM))
+            || (byte == b'#' && enabled.contains_any(ClassSet::FRAGMENT))
+            || (byte == b'?' && enabled.contains_any(ClassSet::QUERY))
+        {
+            // Truncation can expose a literal dot-segment (`..#suffix`). Keep
+            // scanning the suffix too: interpretations without truncation still
+            // matter, and counting their possible climbs is conservative.
             segment.in_param = true;
         } else {
             if !segment.in_param {
@@ -322,7 +338,8 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
 /// set makes dangerous — the `structural_enabled` mask for the structural modes.
 ///
 /// The mandatory quartet (separator, dot-segment, param, truncation) is **always on**;
-/// backslash handling is enabled by default and can be disabled:
+/// backslash and query/fragment handling are enabled by default and can be disabled.
+/// For backslashes,
 /// [`without_backslash`](crate::config::StructuralClasses::without_backslash) removes
 /// [`BACKSLASH`](ClassSet::BACKSLASH). The [`CASE`](ClassSet::CASE) class is **not**
 /// derived here — the structural guard adds it from the required
@@ -338,12 +355,18 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
 /// break-glass scan in [`RuleRouter`](crate::path_router); it does not refine the
 /// class masks computed here.
 pub(crate) fn enabled_classes(classes: &crate::config::StructuralClasses) -> ClassSet {
-    // The always-on quartet, then the configurable backslash class (case is added
+    // The always-on quartet, then configurable delimiter classes (case is added
     // separately by the router from the CaseSensitivity declaration).
     let mut enabled =
         ClassSet::SEPARATOR | ClassSet::DOT_SEGMENT | ClassSet::PARAM | ClassSet::TRUNCATION;
     if classes.backslash {
         enabled.insert(ClassSet::BACKSLASH);
+    }
+    if classes.query_truncation {
+        enabled.insert(ClassSet::QUERY);
+    }
+    if classes.fragment_truncation {
+        enabled.insert(ClassSet::FRAGMENT);
     }
     enabled
 }
@@ -371,13 +394,17 @@ pub(crate) fn enabled_encodings(
 /// denying [`ClassSet`] — the attribution carried by
 /// [`ResolveError`](crate::config::ResolveError). More than one class can be
 /// present; the most consequential is reported, in the fixed order dot-segment >
-/// truncation > separator > param > backslash > case.
+/// truncation > query > fragment > separator > param > backslash > case.
 pub(crate) fn primary_class(present: ClassSet) -> crate::config::StructuralClass {
     use crate::config::StructuralClass;
     if present.contains_any(ClassSet::DOT_SEGMENT) {
         StructuralClass::DotSegment
     } else if present.contains_any(ClassSet::TRUNCATION) {
         StructuralClass::NulTruncation
+    } else if present.contains_any(ClassSet::QUERY) {
+        StructuralClass::QueryTruncation
+    } else if present.contains_any(ClassSet::FRAGMENT) {
+        StructuralClass::FragmentTruncation
     } else if present.contains_any(ClassSet::SEPARATOR) {
         StructuralClass::Separator
     } else if present.contains_any(ClassSet::PARAM) {
@@ -517,6 +544,8 @@ mod tests {
             | ClassSet::PARAM
             | ClassSet::TRUNCATION
             | ClassSet::CASE
+            | ClassSet::FRAGMENT
+            | ClassSet::QUERY
             | ClassSet::BACKSLASH
     }
 
@@ -989,7 +1018,9 @@ mod tests {
             | ClassSet::DOT_SEGMENT
             | ClassSet::PARAM
             | ClassSet::TRUNCATION
-            | ClassSet::BACKSLASH;
+            | ClassSet::BACKSLASH
+            | ClassSet::FRAGMENT
+            | ClassSet::QUERY;
         assert_eq!(enabled_classes(&StructuralClasses::new()), defaults);
         // A probe is opaque to the class machinery (it acts via the break-glass scan)
         // and an encoding toggle changes recognised forms, not classes.
@@ -1099,8 +1130,27 @@ mod tests {
     /// rather than inert noise.
     fn arb_path() -> impl Strategy<Value = String> {
         const VOCAB: &[&str] = &[
-            "a", "b", "admin", "..", ".", "a%2fb", "%2e%2e", "a;b", "..;x", "..%3bx", "a%5cb",
-            "a%00b", "a%252fb", "a%c0%afb", "Abc",
+            "a%3Fb",
+            "..%3fsuffix",
+            "a%253Fb",
+            "a%23b",
+            "..%23suffix",
+            "a%2523b",
+            "a",
+            "b",
+            "admin",
+            "..",
+            ".",
+            "a%2fb",
+            "%2e%2e",
+            "a;b",
+            "..;x",
+            "..%3bx",
+            "a%5cb",
+            "a%00b",
+            "a%252fb",
+            "a%c0%afb",
+            "Abc",
         ];
         proptest::collection::vec(0..VOCAB.len(), 1..4).prop_map(|idxs| {
             format!(

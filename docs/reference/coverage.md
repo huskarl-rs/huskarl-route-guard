@@ -18,6 +18,8 @@ modes use this model.
 | `\` / `%5C` as a separator | default (opt-out) | [`without_backslash`](crate::config::StructuralClasses::without_backslash) |
 | overlong UTF-8 `%C0%AF` / `%C0%AE` (legacy decoders) | opt-in | [`with_overlong`](crate::config::StructuralClasses::with_overlong) |
 | fullwidth/NFKC structural confusables (`／`→`/`, …) | opt-in | [`with_fullwidth_structure`](crate::config::StructuralClasses::with_fullwidth_structure) |
+| decoded `#` fragment truncation (`%23`) | default (opt-out) | [`without_fragment_truncation`](crate::config::StructuralClasses::without_fragment_truncation) |
+| decoded `?` query truncation (`%3F`) | default (opt-out) | [`without_query_truncation`](crate::config::StructuralClasses::without_query_truncation) |
 | a novel structural form (fresh CVE, vendor quirk) | custom detector | [`with_probe`](crate::config::StructuralClasses::with_probe) |
 
 “Default” interpretations are considered whenever the guard is active. “Required”
@@ -93,6 +95,16 @@ not seen at all:
   `tests/cve_regressions.rs` demonstrates this limitation with an exact `/admin`
   rule. Use registrations that cover the equivalent paths or a custom probe
   accounting for raw and encoded whitespace if your backend has this behavior.
+- **Disabled query/fragment truncation.** Downstream URL reparsing can treat decoded
+  `%23` or `%3F` as delimiters. Both interpretations are enabled by default, using
+  conservative structural coverage, including dot-segments exposed by truncation.
+  Uniform subtrees can still accept these paths. `%2523` and `%253F` require
+  `DecodeDepth::UpToTwo`. Only use
+  [`without_fragment_truncation`](crate::config::StructuralClasses::without_fragment_truncation)
+  or [`without_query_truncation`](crate::config::StructuralClasses::without_query_truncation)
+  when downstream preserves the respective decoded character as data. The
+  CVE-2026-41059 regression verifies fragment denial by default and the gap after
+  opting out. Literal `#`/`?` remain invalid input; forwarding preserves the path.
 - **Strip-style "sanitizers".** The built-in model includes decoding, slash merging,
   parameter stripping, and dot-segment resolution. Boundary changes act at or after
   their triggers; dot-segments can remove earlier segments, so the scoped check

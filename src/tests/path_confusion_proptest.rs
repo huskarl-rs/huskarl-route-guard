@@ -31,9 +31,9 @@
 //! always-on in the guard, so the truncating backend is always in the family.
 //!
 //! The family has two axes and they are swept differently. *Which* transforms a
-//! backend performs is **enumerated** (the power set, all 2⁹). The *order* it
+//! backend performs is **enumerated** (the power set, all 2¹¹). The *order* it
 //! composes them in is **sampled** — a fresh permutation per backend per case —
-//! because enumerating it too would cost `8!` per subset. Order matters: it is
+//! because enumerating it too would cost `10!` per subset. Order matters: it is
 //! not a no-op the fixpoint washes out (see [`normalize_ordered`] for a worked
 //! divergence). What makes sampling sufficient rather than merely cheap is that
 //! the guard's structure axis bounds a *region* instead of simulating transforms,
@@ -121,6 +121,12 @@ const VOCAB: &[&str] = &[
     "a\\b",
     "%5cadmin",
     "..%5cadmin",
+    "a%3Fb",
+    "..%3fsuffix",
+    "admin%253Fsuffix",
+    "a%23b",
+    "..%23suffix",
+    "admin%2523suffix",
     "a%00b",
     "admin%00",
     "%252e%252e",
@@ -207,6 +213,8 @@ struct Backend {
     merge_slashes: bool,     // `//` → `/`
     resolve_dots: bool,      // RFC 3986 §5.2.4 dot-segment removal
     case_fold: bool,         // ASCII lowercase
+    truncate_query: bool,    // cut at the first decoded ?
+    truncate_fragment: bool, // cut at the first decoded #
     truncate_nul: bool,      // cut at the first NUL (`%00`)
 }
 
@@ -223,6 +231,8 @@ impl Backend {
         merge_slashes: false,
         resolve_dots: false,
         case_fold: false,
+        truncate_query: false,
+        truncate_fragment: false,
         truncate_nul: false,
     };
 }
@@ -236,11 +246,17 @@ fn modeled_backends(classes: &StructuralClasses, case: CaseSensitivity) -> Vec<B
     let case_avail = case.is_insensitive();
     let uni_avail = classes.unicode;
     let mut backends = Vec::new();
-    for mask in 0u32..(1 << 9) {
+    for mask in 0u32..(1 << 11) {
         let case_fold = mask & (1 << 5) != 0;
         let truncate_nul = mask & (1 << 6) != 0;
         let fold_unicode = mask & (1 << 8) != 0;
-        if (case_fold && !case_avail) || (fold_unicode && !uni_avail) {
+        let truncate_fragment = mask & (1 << 9) != 0;
+        let truncate_query = mask & (1 << 10) != 0;
+        if (case_fold && !case_avail)
+            || (fold_unicode && !uni_avail)
+            || (truncate_fragment && !classes.fragment_truncation)
+            || (truncate_query && !classes.query_truncation)
+        {
             continue; // out of model for this config
         }
         backends.push(Backend {
@@ -251,6 +267,8 @@ fn modeled_backends(classes: &StructuralClasses, case: CaseSensitivity) -> Vec<B
             resolve_dots: mask & (1 << 4) != 0,
             case_fold,
             truncate_nul,
+            truncate_fragment,
+            truncate_query,
             // Content decoding is always available in the family, but each
             // backend mask selects whether to perform it.
             decode_unreserved: mask & (1 << 7) != 0,
@@ -265,6 +283,8 @@ fn modeled_backends(classes: &StructuralClasses, case: CaseSensitivity) -> Vec<B
 /// data so the properties can vary it (see [`normalize_ordered`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
+    Query,
+    Fragment,
     Trunc,
     DecodeStruct,
     DecodeUnres,
@@ -288,6 +308,8 @@ fn apply(
     match step {
         Step::StripTraversalControl => t.replace("../", ""),
         Step::Trunc => truncate_at_nul(t),
+        Step::Fragment => t.split('#').next().unwrap().to_owned(),
+        Step::Query => t.split('?').next().unwrap().to_owned(),
         Step::DecodeStruct => decode_pass(t, backend, classes, layers),
         Step::DecodeUnres => decode_unreserved(t),
         Step::FoldUni => fold_unicode(t),
@@ -309,7 +331,7 @@ fn apply(
 /// *canonical* member of the backend's ordering family, and [`normalize`] uses
 /// exactly this order; the properties permute it.
 fn canonical_order(backend: Backend) -> Vec<Step> {
-    let mut steps = Vec::with_capacity(8);
+    let mut steps = Vec::with_capacity(10);
     if backend.truncate_nul {
         steps.push(Step::Trunc);
     }
@@ -318,6 +340,12 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
     }
     if backend.decode_unreserved {
         steps.push(Step::DecodeUnres);
+    }
+    if backend.truncate_query {
+        steps.push(Step::Query);
+    }
+    if backend.truncate_fragment {
+        steps.push(Step::Fragment);
     }
     if backend.fold_unicode {
         steps.push(Step::FoldUni);
@@ -344,8 +372,8 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
 /// # Why order is a sampled axis, not a fixed one
 ///
 /// [`Backend`] enumerates *which* transforms a backend performs — the power set,
-/// all 2⁹ of it. It cannot also enumerate the order it performs them in: that
-/// would multiply the family by up to `8!` per subset. Order is therefore
+/// all 2¹¹ of it. It cannot also enumerate the order it performs them in: that
+/// would multiply the family by up to `10!` per subset. Order is therefore
 /// **sampled** rather than enumerated — [`guard_denies_every_modeled_relocation`]
 /// draws a fresh permutation per backend per case, and the fuzz body sticks to
 /// the canonical order.
@@ -646,37 +674,47 @@ fn config_strategy() -> impl Strategy<Value = (StructuralClasses, DecodeDepth, C
         any::<bool>(),
         any::<bool>(),
         any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
     )
-        .prop_map(|(back, over_s, over_d, up_to_two, uni, ci)| {
-            let mut c = StructuralClasses::new();
-            if !back {
-                c = c.without_backslash();
-            }
-            let mut overlong = Vec::new();
-            if over_s {
-                overlong.push(StructuralChar::Slash);
-            }
-            if over_d {
-                overlong.push(StructuralChar::Dot);
-            }
-            if !overlong.is_empty() {
-                c = c.with_overlong(overlong);
-            }
-            if uni {
-                c = c.with_fullwidth_structure();
-            }
-            let layers = if up_to_two {
-                DecodeDepth::UpToTwo
-            } else {
-                DecodeDepth::UpToOne
-            };
-            let case = if ci {
-                CaseSensitivity::Insensitive
-            } else {
-                CaseSensitivity::Sensitive
-            };
-            (c, layers, case)
-        })
+        .prop_map(
+            |(back, over_s, over_d, up_to_two, uni, ci, fragment, query)| {
+                let mut c = StructuralClasses::new();
+                if !back {
+                    c = c.without_backslash();
+                }
+                let mut overlong = Vec::new();
+                if over_s {
+                    overlong.push(StructuralChar::Slash);
+                }
+                if over_d {
+                    overlong.push(StructuralChar::Dot);
+                }
+                if !overlong.is_empty() {
+                    c = c.with_overlong(overlong);
+                }
+                if uni {
+                    c = c.with_fullwidth_structure();
+                }
+                if !fragment {
+                    c = c.without_fragment_truncation();
+                }
+                if !query {
+                    c = c.without_query_truncation();
+                }
+                let layers = if up_to_two {
+                    DecodeDepth::UpToTwo
+                } else {
+                    DecodeDepth::UpToOne
+                };
+                let case = if ci {
+                    CaseSensitivity::Insensitive
+                } else {
+                    CaseSensitivity::Sensitive
+                };
+                (c, layers, case)
+            },
+        )
 }
 
 fn specs_strategy() -> impl Strategy<Value = Vec<(char, &'static str)>> {
@@ -810,6 +848,12 @@ fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeDepth, CaseSensitivit
     if bits & 16 != 0 {
         c = c.with_fullwidth_structure();
     }
+    if bits & 64 == 0 {
+        c = c.without_fragment_truncation();
+    }
+    if bits & 128 == 0 {
+        c = c.without_query_truncation();
+    }
     let case = if bits & 32 != 0 {
         CaseSensitivity::Insensitive
     } else {
@@ -889,7 +933,7 @@ proptest! {
     ///
     /// The family is swept on both axes: every transform *subset* (enumerated —
     /// the power set), each in both its canonical order and a **sampled**
-    /// permutation, since order cannot be enumerated too (`8!` per subset — see
+    /// permutation, since order cannot be enumerated too (`10!` per subset — see
     /// [`normalize_ordered`]). `order_seed` derives one permutation per backend
     /// per case, so a run covers ~2⁹ distinct orders rather than one, and 2048
     /// cases keep redrawing them.
@@ -1327,6 +1371,12 @@ mod transform_order_tests {
         // one, and at the root.
         const PREFIXES: &[&str] = &["", "/blob", "/deep/nested", "/admin", "/a", "/users/4"];
         const TAILS: &[&str] = &[
+            "k1%3Fsuffix",
+            "..%3fsuffix",
+            "k1/..%253Fsuffix",
+            "k1%23suffix",
+            "..%23suffix",
+            "k1/..%2523suffix",
             "k1//../k2",
             "k1/..//k2",
             "k1;v//../k2",
@@ -1346,7 +1396,9 @@ mod transform_order_tests {
             "k1/....//../k2",
         ];
 
-        let classes = StructuralClasses::new().with_backslash();
+        let classes = StructuralClasses::new()
+            .with_backslash()
+            .with_fragment_truncation();
         let layers = DecodeDepth::UpToTwo;
         let case = CaseSensitivity::Insensitive;
         let router = build_router(CATALOG, classes.clone(), layers, case).expect("catalog builds");
@@ -1587,14 +1639,14 @@ fn regenerate_fuzz_corpus() {
 
     // Each closure prepends the fixed control-byte prefix its `fuzz_*` body decodes.
     let scanner = |path: &str| {
-        // [enabled = 0x3f (all classes), e2_extra = 0, enc1 = 0x0f (all encodings), enc2_extra = 0]
-        [&[0x3f, 0x00, 0x0f, 0x00], path.as_bytes()].concat()
+        // [enabled = 0xff (all classes), e2_extra = 0, enc1 = 0x0f (all encodings), enc2_extra = 0]
+        [&[0xff, 0x00, 0x0f, 0x00], path.as_bytes()].concat()
     };
     let matcher = |probe: &str| [&[0xFFu8], probe.as_bytes()].concat(); // [include = all routes]
     let guard = |path: &str| {
-        // [specs_mask = 0xFF (all routes), config_bits = 0x3F (every opt-in class,
+        // [specs_mask = 0xFF (all routes), config_bits = 0xFF (every class,
         //  up-to-two decode, case-insensitive)]
-        [&[0xFFu8, 0x3F], path.as_bytes()].concat()
+        [&[0xFFu8, 0xFF], path.as_bytes()].concat()
     };
 
     // scanner — one of each structural form, incl. the `..%3b` and raw-NUL regressions.
@@ -1605,6 +1657,8 @@ fn regenerate_fuzz_corpus() {
         ("matrix_param_leading_segment", "/;x=y/auth/"),
         ("raw_nul", "/a\u{0}b"),
         ("encoded_nul", "/a%00b"),
+        ("fragment_dot", "/files/..%23suffix"),
+        ("query_dot_double", "/files/..%253Fsuffix"),
         ("overlong", "/a%c0%afb"),
         ("double_encoded", "/a%252fb"),
         ("fullwidth", "/a／b"),
@@ -1638,6 +1692,8 @@ fn regenerate_fuzz_corpus() {
         ("encoded_traversal", "/api/%2e%2e/admin"),
         ("raw_nul_trunc", "/a\u{0}b"),
         ("encoded_nul_trunc", "/a%00b"),
+        ("fragment_dot", "/files/..%23suffix"),
+        ("query_dot_double", "/files/..%253Fsuffix"),
         ("encoded_sep_dot", "/public/..%2fadmin"),
         ("empty_segment", "//admin"),
         ("trailing_encoded_sep", "/admin%2f"),
