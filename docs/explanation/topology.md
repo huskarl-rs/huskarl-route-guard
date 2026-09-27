@@ -22,13 +22,15 @@ client -> guard / authorization -> Apache, Express, Axum, or SvelteKit
 ```
 
 There is no intermediate proxy after the guard in these profiles. The harness
-evaluates the original path and method, then sends only accepted requests unchanged
-to the server. The backend independently identifies the selected handler or file.
+evaluates the original path and method and compares only accepted requests with
+independent server observations. A separate characterization pass sends all corpus
+paths unchanged, including guard-denied inputs. The backend independently identifies
+the selected handler or file.
 These fixtures validate the guard/backend pairing; they do not exercise a complete
 production gateway or prove that its request extraction and forwarding preserve
 the tested bytes.
 
-The chain profile adds a specific normalization step after authorization:
+A chain profile adds a specific normalization step after authorization:
 
 ```text
 client -> guard / authorization -> NGINX normalized $uri -> Apache static files
@@ -40,6 +42,15 @@ authorized as public to reach admin. Declaring `UpToTwo` removes the observed
 confusion. The requirement comes from that measured path transformation, not simply
 from counting proxy processes. Other NGINX forwarding configurations need their
 own validation.
+
+The test runner also supports multiple proxy types and multiple hops, described
+as an ordered proxy list plus an origin in `tests/downstream/topologies.tsv`.
+Fixtures include raw and decoded NGINX forwarding and Apache reverse proxying.
+For example, two decoded NGINX hops before Express require `UpToTwo`, whereas
+the tested Apache reverse proxy followed by one decoded NGINX hop before Express
+uses `UpToOne`. Each complete chain has explicit probes and guard settings;
+proxy count alone cannot determine those settings. Three whole-path decode passes
+remain outside the library's model.
 
 Topology also includes method dispatch. In the tested fixtures, HEAD reaches GET
 handlers, Apache serves static files for POST, and Express can fall through a

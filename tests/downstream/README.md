@@ -16,7 +16,7 @@ The user-facing reference is `docs/reference/deployments.md`.
 
 ```sh
 mise run test                         # ordinary tests; no Docker
-mise run test-downstream              # all eleven deployment profiles
+mise run test-downstream              # all seventeen deployment profiles
 mise run test-downstream apache axum  # selected backends
 mise run test-nginx-apache            # real two-decode chain
 mise run test-nginx-express           # real decode-and-reparse chain
@@ -45,8 +45,8 @@ Docker daemons are unsupported: the published address must be local loopback.
 ## Setup, recommendations, and harness
 
 - `scripts/test-downstream.sh` builds fixtures, publishes random loopback ports,
-  runs the harness, saves logs, and removes containers and chain networks on exit.
-  Images remain cached. Neither chain publishes its origin port.
+  runs the harness, saves logs, and removes every hop and chain network on exit.
+  Images remain cached. Only each chain's entry port is published.
 - Fixtures use native handlers or static-file mapping to return stable route IDs.
   No fixture imports this library. `X-Route-ID` identifies HEAD routes despite
   body suppression; Apache assigns the header using filesystem directory scope.
@@ -85,6 +85,58 @@ handler. Axum and SvelteKit use their native specificity/method selection. Svelt
 retains minimal page/layout/error components so malformed requests have a working
 error renderer. Apache serves real files with `AllowOverride None`, `Options None`,
 and `AcceptPathInfo Off`; its static handler also accepts POST in this setup.
+
+## Composing proxies and origins
+
+`topologies.tsv` is the runner's registry. Each row has five whitespace-separated
+fields: deployment name, guard profile name, origin fixture, origin profile, and
+an entry-first comma-separated proxy list (`-` for a direct deployment). For example:
+
+```text
+nginx-nginx-express DecodedUri express Sensitive nginx-decoded,nginx-decoded
+apache-proxy-nginx-express Mixed express Sensitive apache-proxy,nginx-decoded
+```
+
+The runner builds each fixture once per invocation, starts the origin and then
+works outward, connects each proxy to its next hop through `UPSTREAM`, and publishes
+only the entry on a random loopback port. Logs are saved for every hop and the
+origin, including on test failure. `*-topology.txt` records the exact registry row.
+The proxy fixtures are independent of the selected origin:
+
+- `nginx-decoded`: the existing normalized `$uri$is_args$args` forwarding behavior.
+- `nginx-raw`: the same pinned NGINX, forwarding `$request_uri`.
+- `apache-proxy`: pinned Apache 2.4.68, native `mod_proxy_http`, `ProxyPass ... nocanon`,
+  `AllowEncodedSlashes NoDecode`, and `MergeSlashes On`.
+
+Add a row and a corresponding recommendation/probes/removal witnesses in
+`profiles.rs` to test another coupling or hop sequence. No orchestration branches
+are needed for new pairings of existing proxies and origins. New proxy
+implementations need a fixture and a proxy-type entry in the runner. Arbitrary
+sequences are representable; their guard settings are deliberately not inferred
+from the number or names of their components. Add new deployments to both CI
+matrices for continuous deterministic and seeded coverage.
+
+```sh
+mise run test-downstream nginx-axum nginx-raw-express apache-proxy-express
+mise run test-downstream nginx-nginx-express nginx-raw-nginx-apache
+mise run test-downstream apache-proxy-nginx-express
+python3 -B scripts/test-downstream-runner.py  # wiring/cleanup checks without Docker
+```
+
+Additional baselines cover NGINX decoded → Axum, NGINX raw → Express, Apache proxy
+→ Express, two decoded NGINX hops → Express, raw NGINX → decoded NGINX → Apache,
+and Apache proxy → decoded NGINX → Express. Two decoded NGINX hops → Express and
+the raw/decoded NGINX chain → Apache declare `UpToTwo`; the others declare
+`UpToOne`. All declare `Sensitive` and retain the origin's method requirements.
+Two-hop profiles pin decoding or truncation witnesses against the complete chain.
+The raw NGINX and Apache-proxy profiles pin escaped-content and encoded-query
+observations that distinguish them from normalized-URI forwarding.
+
+The library supports at most two whole-path decode passes. A third decoding stage
+is outside that model; it must not be declared safe by selecting `UpToTwo`.
+Multiple hops can still fit: raw forwarding does not necessarily add a decode pass.
+The two-NGINX/Express profile also probes a triple-escaped content byte to pin the
+observed two-pass boundary.
 
 ## Corpus, policy layouts, and methods
 
@@ -214,8 +266,9 @@ These are bounded GET/HEAD/POST baselines for the declared layouts, versions, an
 configurations. Other methods, request bodies, application authorization based on
 captures, arbitrary rewrites, native OS differences, and other proxy chains remain
 outside the recommendations. Axum shares the matchit family with the in-process
-matcher oracle. Proxy orchestration supports the specified NGINX–Apache and NGINX–Express
-pairs; it is not an arbitrary cross-product of proxies and origins.
+matcher oracle. Proxy orchestration accepts an ordered list of proxy configurations for any fixture
+origin. Each registered chain still requires its own measured guard profile;
+passing individual components does not establish safety of their composition.
 
 ## Historical discovery check: `tmwxmztl`
 

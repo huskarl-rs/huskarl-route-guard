@@ -1,0 +1,18 @@
+# deployment profile origin origin-profile proxies (entry first; comma separated; - for direct)
+apache	Off	apache	Off	-
+apache	On	apache	On	-
+apache	NoDecode	apache	NoDecode	-
+express	Default	express	Default	-
+express	Sensitive	express	Sensitive	-
+express	Insensitive	express	Insensitive	-
+axum	Sensitive	axum	Sensitive	-
+sveltekit	Sensitive	sveltekit	Sensitive	-
+tomcat-spring	PathPattern	tomcat-spring	PathPattern	-
+nginx-apache	DecodedUri	apache	On	nginx-decoded
+nginx-express	DecodedUri	express	Sensitive	nginx-decoded
+nginx-axum	DecodedUri	axum	Sensitive	nginx-decoded
+nginx-raw-express	OriginalUri	express	Sensitive	nginx-raw
+apache-proxy-express	NoCanon	express	Sensitive	apache-proxy
+nginx-nginx-express	DecodedUri	express	Sensitive	nginx-decoded,nginx-decoded
+nginx-raw-nginx-apache	Mixed	apache	On	nginx-raw,nginx-decoded
+apache-proxy-nginx-express	Mixed	express	Sensitive	apache-proxy,nginx-decoded

@@ -55,7 +55,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [apache, express, axum, sveltekit, nginx-apache, nginx-express, tomcat-spring]
+        backend:
+          - apache
+          - express
+          - axum
+          - sveltekit
+          - nginx-apache
+          - nginx-express
+          - tomcat-spring
+          - nginx-axum
+          - nginx-raw-express
+          - apache-proxy-express
+          - nginx-nginx-express
+          - nginx-raw-nginx-apache
+          - apache-proxy-nginx-express
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -107,6 +120,9 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: stable
         run: mise run test
+
+      - name: Test downstream topology wiring and cleanup
+        run: python3 -B scripts/test-downstream-runner.py
 
       - name: Test mutation outcome gate
         run: python3 -B scripts/test-mutation-outcomes.py

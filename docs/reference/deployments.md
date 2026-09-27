@@ -142,7 +142,7 @@ handlers need their own policy mapping and tests.
 
 ## Evidence for additional settings
 
-All eleven recommended profiles passed with zero observed policy mismatches.
+All seventeen recommended profiles passed with zero observed policy mismatches.
 The shared 7,024-path corpus combines grammar-generated delimiter injections,
 mixed case, content escapes, double escapes, and separator transformations across
 seven policy layouts, including one with a distinct policy for each fixture route
@@ -251,6 +251,41 @@ layout. Separate removal runs require each witness to produce confusion; the
 recommended configuration must produce none. No fixture implements a custom
 truncation transform. These observations concern this specific URI-forwarding
 configuration, not every NGINX or Express deployment.
+
+## Additional proxy pairings and multiple hops
+
+The runner separates proxy configurations from origin fixtures. The registry at
+`tests/downstream/topologies.tsv` declares each full chain, in entry-to-origin
+order, and `profiles.rs` assigns explicit guard settings and behavioral witnesses.
+
+| Deployment | Chain after authorization | Decode declaration |
+|---|---|---|
+| `nginx-axum` | NGINX decoded URI → Axum | `UpToOne` |
+| `nginx-raw-express` | NGINX original request URI → Express | `UpToOne` |
+| `apache-proxy-express` | Apache reverse proxy → Express | `UpToOne` |
+| `nginx-nginx-express` | NGINX decoded URI → NGINX decoded URI → Express | `UpToTwo` |
+| `nginx-raw-nginx-apache` | NGINX original request URI → NGINX decoded URI → Apache | `UpToTwo` |
+| `apache-proxy-nginx-express` | Apache reverse proxy → NGINX decoded URI → Express | `UpToOne` |
+
+These profiles use the pinned versions above, `Sensitive`, default structural
+classes, `RejectAmbiguous`, and their origin's method registrations. The Apache
+reverse proxy uses native `mod_proxy_http`,
+[`ProxyPass ... nocanon`](https://httpd.apache.org/docs/2.4/mod/mod_proxy.html#proxypass),
+`AllowEncodedSlashes NoDecode`, and `MergeSlashes On`. NGINX original-URI forwarding
+uses `$request_uri` in the same variable-URI proxy configuration. These are
+specific fixture configurations, not claims about every deployment of either proxy.
+
+The two decoded NGINX hops make `/%2561dmin/probe.txt` reach Express's admin
+handler; removing the second-decode declaration must expose policy confusion.
+Separate removal witnesses use `/foo/secret%253F/bar` and
+`/foo/secret%2523/bar` for query and fragment truncation. The raw/decoded NGINX
+chain to Apache retains the original second-decode witness. The mixed Apache/NGINX
+chain to Express retains the single-encoded truncation witnesses.
+
+The number of processes is not the decode depth. A chain requiring three
+whole-path decode passes exceeds the library's supported model. The runner can
+represent arbitrary ordered sequences, but a new composition needs its own full
+chain validation and cannot inherit a safety claim from the component profiles.
 
 ## Running the tests
 

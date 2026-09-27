@@ -40,7 +40,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [apache, express, axum, sveltekit, nginx-apache, nginx-express, tomcat-spring]
+        backend:
+          - apache
+          - express
+          - axum
+          - sveltekit
+          - nginx-apache
+          - nginx-express
+          - tomcat-spring
+          - nginx-axum
+          - nginx-raw-express
+          - apache-proxy-express
+          - nginx-nginx-express
+          - nginx-raw-nginx-apache
+          - apache-proxy-nginx-express
     env:
       ROUTE_GUARD_DOWNSTREAM_SEED: ${{ github.event.inputs.seed || github.run_id }}
       ROUTE_GUARD_DOWNSTREAM_BUDGET: ${{ github.event.inputs.budget || '10000' }}

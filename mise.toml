@@ -25,7 +25,7 @@ description = "Differential baseline against Linux Apache in Docker (macOS/Linux
 
 [tasks.test-downstream]
 run = "bash scripts/test-downstream.sh"
-description = "Differential baselines in Docker; optionally pass apache, express, axum, sveltekit, nginx-apache, nginx-express, or tomcat-spring"
+description = "Differential baselines in Docker; optionally select deployments from tests/downstream/topologies.tsv"
 
 [tasks.test-downstream-search]
 run = "ROUTE_GUARD_DOWNSTREAM_SEED=${ROUTE_GUARD_DOWNSTREAM_SEED:-random} bash scripts/test-downstream.sh"

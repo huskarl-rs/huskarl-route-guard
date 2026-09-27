@@ -176,17 +176,20 @@ These tests challenge deployment assumptions behind configuration recommendation
 `mise run test-downstream` runs the ignored `tests/downstream.rs` integration test
 against pinned Linux Apache, Express, Axum, `SvelteKit` adapter-node, and
 Tomcat–Spring MVC fixtures,
-plus NGINX normalized-URI proxy chains to Apache and Express.
+plus configurable NGINX and Apache reverse proxy chains, including multiple hops.
+The topology registry separates origin fixtures from ordered proxy configurations;
+every complete chain retains explicit guard recommendations and witnesses.
 The same command works on macOS and Linux with a local Docker daemon; an Ubuntu
 GitHub Actions matrix runs it in CI. Ordinary tests use `mise run test` without Docker.
 
 The same input corpus is evaluated against each recommended guard configuration
-and six policy layouts, including public exact/parameterized exceptions under a
-protected default. Only accepted requests are sent downstream, preserving
-request-target bytes over TCP. Responses identify selected routes (static resources
-for Apache), which the harness independently maps to authorization policies.
+and seven policy layouts, including public exact/parameterized exceptions under a
+protected default. A separate characterization pass sends every corpus path with
+GET, HEAD, and POST, preserving request-target bytes over TCP. Only guard-accepted
+requests contribute to the safety comparison. Responses identify selected routes
+(static resources for Apache), which the harness independently maps to authorization policies.
 A forwarded request reaching a different policy invalidates the recommendation.
-Denied requests are recorded as not forwarded and provide no downstream evidence.
+Denied requests are recorded as not forwarded and provide no downstream safety evidence.
 Stateless responses are cached by method/target across configurations and layouts.
 Fixed profile-specific parsing probes can also call a fixture directly, even if
 the guard would deny them. Reports label these `characterization`; they are not
@@ -199,11 +202,15 @@ backslash handling for `SvelteKit` have such counterexamples. Method-registratio
 removals instead must produce `MethodNotConfigured` for a named request and no
 accepted-request confusion: missing methods now fail closed. The NGINX–Apache profile
 requires `UpToTwo`; removing its second decode declaration also reproduces confusion.
-The NGINX–Express profile exposes decoded query and fragment truncation without
-fixture-specific normalization code. Removing either class must reproduce its
+The NGINX–Express and mixed Apache-proxy/NGINX/Express profiles expose decoded
+query and fragment truncation without fixture-specific normalization code. Removing either class must reproduce its
 named public-exception-to-protected-fallback witness. The grammar generator
 produces those inputs from ordinary route seeds; its delimiter alphabet does not
-come from the guard's structural classes.
+come from the guard's structural classes. Two decoded NGINX hops before Express
+also require `UpToTwo` and expose double-encoded query/fragment witnesses. Raw
+NGINX forwarding and Apache's `nocanon` reverse proxying have separate probes to
+pin their behavior. Runner tests check hop ordering, entry-only port publishing,
+image reuse, and cleanup/log retention on failure without requiring Docker.
 
 The 7,024-path corpus combines raw, encoded, and double-encoded grammar delimiters
 at segment boundaries, midpoints, and suffixes with targeted content escapes,

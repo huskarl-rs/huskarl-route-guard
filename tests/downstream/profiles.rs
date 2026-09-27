@@ -184,9 +184,161 @@ const REMOVE_SECOND_DECODE: &[Ablation] = &[
     },
 ];
 
+const REMOVE_TRUNCATION: &[Ablation] = &[
+    Ablation {
+        name: "without-query-truncation",
+        expect_method_denial: false,
+        guard: DeploymentSettings {
+            query_truncation: false,
+            ..PARENT_POST_FALLBACK
+        },
+        witness: ("GET", "/foo/secret%3F/bar"),
+    },
+    Ablation {
+        name: "without-fragment-truncation",
+        expect_method_denial: false,
+        guard: DeploymentSettings {
+            fragment_truncation: false,
+            ..PARENT_POST_FALLBACK
+        },
+        witness: ("GET", "/foo/secret%23/bar"),
+    },
+];
+
+const TWO_PROXY_DECODES: DeploymentSettings = DeploymentSettings {
+    decode: DecodeDepth::UpToTwo,
+    ..PARENT_POST_FALLBACK
+};
+
 // Explicit profiles with independently specified witnesses. Only accepted requests contribute
 // candidate safety evidence. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
+    Profile {
+        backend: "nginx-axum",
+        name: "DecodedUri",
+        guard: SENSITIVE,
+        ablations: HEAD,
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%61dmin/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/%2561dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+        ],
+    },
+    Profile {
+        backend: "nginx-raw-express",
+        name: "OriginalUri",
+        guard: PARENT_POST_FALLBACK,
+        ablations: PARENT_POST_METHODS,
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%61dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/foo/secret%3F/bar",
+                status: 200,
+                route_id: Some("parameterized"),
+            },
+        ],
+    },
+    Profile {
+        backend: "apache-proxy-express",
+        name: "NoCanon",
+        guard: PARENT_POST_FALLBACK,
+        ablations: PARENT_POST_METHODS,
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%61dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/foo/secret%3F/bar",
+                status: 200,
+                route_id: Some("parameterized"),
+            },
+        ],
+    },
+    Profile {
+        backend: "nginx-nginx-express",
+        name: "DecodedUri",
+        guard: TWO_PROXY_DECODES,
+        ablations: &[
+            Ablation {
+                name: "without-second-decode",
+                expect_method_denial: false,
+                witness: ("GET", "/%2561dmin/probe.txt"),
+                guard: PARENT_POST_FALLBACK,
+            },
+            Ablation {
+                name: "without-query-truncation",
+                expect_method_denial: false,
+                witness: ("GET", "/foo/secret%253F/bar"),
+                guard: DeploymentSettings {
+                    query_truncation: false,
+                    ..TWO_PROXY_DECODES
+                },
+            },
+            Ablation {
+                name: "without-fragment-truncation",
+                expect_method_denial: false,
+                witness: ("GET", "/foo/secret%2523/bar"),
+                guard: DeploymentSettings {
+                    fragment_truncation: false,
+                    ..TWO_PROXY_DECODES
+                },
+            },
+        ],
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%2561dmin/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/%252561dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+        ],
+    },
+    Profile {
+        backend: "nginx-raw-nginx-apache",
+        name: "Mixed",
+        guard: TWO_DECODES,
+        ablations: REMOVE_SECOND_DECODE,
+        parsing_probes: &[ParsingProbe {
+            path: "/%2561dmin/probe.txt",
+            status: 200,
+            route_id: Some("admin"),
+        }],
+    },
+    Profile {
+        backend: "apache-proxy-nginx-express",
+        name: "Mixed",
+        guard: PARENT_POST_FALLBACK,
+        ablations: REMOVE_TRUNCATION,
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%61dmin/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/%2561dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+        ],
+    },
     Profile {
         parsing_probes: &[
             ParsingProbe {
@@ -220,26 +372,7 @@ const PROFILES: &[Profile] = &[
         backend: "nginx-express",
         name: "DecodedUri",
         guard: PARENT_POST_FALLBACK,
-        ablations: &[
-            Ablation {
-                name: "without-query-truncation",
-                expect_method_denial: false,
-                guard: DeploymentSettings {
-                    query_truncation: false,
-                    ..PARENT_POST_FALLBACK
-                },
-                witness: ("GET", "/foo/secret%3F/bar"),
-            },
-            Ablation {
-                name: "without-fragment-truncation",
-                expect_method_denial: false,
-                guard: DeploymentSettings {
-                    fragment_truncation: false,
-                    ..PARENT_POST_FALLBACK
-                },
-                witness: ("GET", "/foo/secret%23/bar"),
-            },
-        ],
+        ablations: REMOVE_TRUNCATION,
     },
     Profile {
         parsing_probes: &[],
@@ -311,4 +444,36 @@ pub fn find(backend: &str, name: &str) -> &'static Profile {
         .iter()
         .find(|profile| profile.backend == backend && profile.name == name)
         .unwrap_or_else(|| panic!("unknown deployment profile {backend}/{name}"))
+}
+
+#[test]
+fn topology_registry_matches_guard_profiles() {
+    use std::collections::BTreeSet;
+    let mut seen = BTreeSet::new();
+    for line in include_str!("topologies.tsv").lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(fields.len(), 5, "invalid topology: {line}");
+        let [backend, name, origin, origin_profile, proxies] = fields[..] else {
+            unreachable!()
+        };
+        assert!(seen.insert((backend, name)), "duplicate topology: {line}");
+        find(backend, name);
+        find(origin, origin_profile);
+        if proxies != "-" {
+            for proxy in proxies.split(',') {
+                assert!(
+                    matches!(proxy, "nginx-raw" | "nginx-decoded" | "apache-proxy"),
+                    "unknown proxy: {proxy}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        PROFILES.len(),
+        "every guard profile must have a runnable topology"
+    );
 }
