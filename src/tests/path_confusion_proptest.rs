@@ -1099,6 +1099,10 @@ proptest! {
         let Some(anchor) = router.structural_anchor(&path) else {
             return Ok(());
         };
+        // Even the root anchor is "/". An empty anchor makes every prefix check
+        // vacuous and needlessly runs the backend matrix for otherwise clean paths.
+        // Reject it before normalization so mutation audits fail without timing out.
+        prop_assert!(!anchor.is_empty(), "empty structural anchor for {:?}", path);
 
         for (i, backend) in modeled_backends(&classes, case).into_iter().enumerate() {
             let canonical = canonical_order(backend);

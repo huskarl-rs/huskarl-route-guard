@@ -61,6 +61,8 @@
       "-(Self::TRUNCATION, \"Truncation\"),",
       "-(Self::CASE, \"Case\"),",
       "-(Self::BACKSLASH, \"Backslash\"),",
+      "-(Self::FRAGMENT, \"Fragment\"),",
+      "-(Self::QUERY, \"Query\"),",
       "-] {",
       "-if self.contains_any(bit) {",
       "-names.push(name);",
