@@ -79,3 +79,11 @@ description = "NGINX decoded-URI proxy to Express delimiter-reparsing baseline"
 [tasks.test-tomcat-spring]
 run = "bash scripts/test-downstream.sh tomcat-spring"
 description = "Tomcat and Spring MVC native PathPattern routing baseline"
+
+[tasks.test-go]
+run = "bash scripts/test-downstream.sh go"
+description = "Go standard-library net/http.ServeMux downstream baseline"
+
+[tasks.test-nginx-go]
+run = "bash scripts/test-downstream.sh nginx-go"
+description = "NGINX decoded-URI proxy to Go ServeMux baseline"

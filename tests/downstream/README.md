@@ -16,7 +16,7 @@ The user-facing reference is `docs/reference/deployments.md`.
 
 ```sh
 mise run test                         # ordinary tests; no Docker
-mise run test-downstream              # all seventeen deployment profiles
+mise run test-downstream              # all nineteen deployment profiles
 mise run test-downstream apache axum  # selected backends
 mise run test-nginx-apache            # real two-decode chain
 mise run test-nginx-express           # real decode-and-reparse chain
@@ -27,7 +27,8 @@ mise run test-downstream-search       # adds a seeded composed-mutation search
 ROUTE_GUARD_DOWNSTREAM_SEED=123 ROUTE_GUARD_DOWNSTREAM_BUDGET=10000 mise run test-downstream nginx-express
 ```
 
-Aliases also include `test-apache`, `test-express`, `test-axum`, and `test-sveltekit`.
+Aliases also include `test-apache`, `test-express`, `test-axum`, `test-sveltekit`,
+`test-go`, and `test-nginx-go`.
 Requirements: Mise, Rust, Bash, and a running local Docker-compatible daemon.
 Node, pnpm, and fixture build dependencies run inside containers. Initial builds
 need network access; image digests and dependency locks are committed.
@@ -64,18 +65,24 @@ Docker daemons are unsupported: the published address must be local loopback.
 |---|---|---|
 | Apache 2.4.68 | `Off`, `On`, `NoDecode` | `AllowEncodedSlashes` as named; `MergeSlashes On` |
 | Express 5.2.1 | `Default`, `Sensitive`, `Insensitive` | Unmodified `express.Router()`, or explicit case declaration with `strict: true` |
+| Go 1.27.1 | `ServeMux` | Standard-library `net/http.ServeMux`; modern method/wildcard patterns |
+| NGINX 1.28.0 → Go 1.27.1 | `DecodedUri` | Normalized-URI forwarding to the same ServeMux fixture |
 | Axum 0.8.9 | `Sensitive` | Native routes and fallback; no rewriting middleware |
 | SvelteKit 2.70.3 / adapter-node 5.5.7 | `Sensitive` | Production rest-parameter endpoints |
 | NGINX 1.28.0 → Apache 2.4.68 | `DecodedUri` | `proxy_pass http://origin$uri$is_args$args`; origin encoded slashes `On` |
 | Tomcat 11.0.26 / Spring MVC 7.0.8 | `PathPattern` | Case-sensitive `PathPatternParser`; encoded slash rejected; backslash disabled |
 | NGINX 1.28.0 → Express 5.2.1 | `DecodedUri` | Same proxy configuration; case-sensitive, strict Express router |
 
-Direct guard profiles and NGINX–Express declare `UpToOne`; NGINX–Apache declares
-`UpToTwo`. Express
+Direct guard profiles and NGINX–Express declare `UpToOne`; NGINX–Apache and
+NGINX–Go declare `UpToTwo`. Express
 Default/Insensitive declares `Insensitive`; all other profiles declare `Sensitive`.
 All use default structural classes, including backslash handling,
 and default `RejectAmbiguous` mode. The normalized-URI proxy configuration is a
 specific behavior under test, not a proposed safe proxy default.
+
+Go uses native `ServeMux` patterns and pins segment unescaping, escaped slashes,
+path-cleaning redirects, and method fallback; see `go/README.md`. Its decoded-URI
+NGINX chain declares `UpToTwo` and pins a second-decode confusion witness.
 
 Tomcat–Spring uses explicit connector settings and native controller mappings;
 see `tomcat-spring/README.md` for version pins and parsing probes.
@@ -169,7 +176,7 @@ independent policy assignment and guard registrations:
 The method layout includes HEAD with GET. Apache includes POST for all static
 scopes. Frameworks have a POST handler at `/files`; Express's private child falls
 through to that handler and therefore needs an explicit child POST registration
-in the guard. Tomcat–Spring has the same parent POST fallback requirement. Axum and SvelteKit return 405 for that child method gap. Canonical
+in the guard. Tomcat–Spring and Go ServeMux have the same parent POST fallback requirement. Axum and SvelteKit return 405 for that child method gap. Canonical
 probes pin those distinctions and verify header identity and empty HEAD bodies.
 The exception routes use native framework routing. Apache serves real files at
 `/exact.txt`, `/foo/secret/bar`, and `/foo/other/bar`; directory/file scopes label
@@ -295,6 +302,6 @@ removal runs found 102 query-truncation and 51 fragment-truncation mismatches
 across the original six layouts. These are method/layout comparisons, not counts
 of unique exploit paths; adding the distinct layout changes the totals.
 
-Additional servlet configurations, Envoy, Go, and FastCGI profiles, replay of
+Additional servlet configurations, Envoy, and FastCGI profiles, replay of
 decoded bolero fuzz inputs, and comparison of characterization results against
 backend-specific reference predictions remain follow-up work.

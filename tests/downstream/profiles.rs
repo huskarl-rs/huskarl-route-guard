@@ -214,6 +214,96 @@ const TWO_PROXY_DECODES: DeploymentSettings = DeploymentSettings {
 // candidate safety evidence. Parsing removals expose confusion; method removals pin safe denial.
 const PROFILES: &[Profile] = &[
     Profile {
+        backend: "go",
+        name: "ServeMux",
+        guard: PARENT_POST_FALLBACK,
+        ablations: PARENT_POST_METHODS,
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%61dmin/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/%2561dmin/probe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/admin%2fprobe.txt",
+                status: 200,
+                route_id: Some("public"),
+            },
+            ParsingProbe {
+                path: "/foo/secret%2Fother/bar",
+                status: 200,
+                route_id: Some("parameterized"),
+            },
+            ParsingProbe {
+                path: "/admin/../public/probe.txt",
+                status: 307,
+                route_id: None,
+            },
+            ParsingProbe {
+                path: "/admin/%2e%2e/public/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/admin//probe.txt",
+                status: 307,
+                route_id: None,
+            },
+        ],
+    },
+    Profile {
+        backend: "nginx-go",
+        name: "DecodedUri",
+        guard: DeploymentSettings {
+            decode: DecodeDepth::UpToTwo,
+            ..PARENT_POST_FALLBACK
+        },
+        ablations: &[
+            Ablation {
+                name: "without-second-decode",
+                expect_method_denial: false,
+                witness: ("GET", "/%2561dmin/probe.txt"),
+                guard: PARENT_POST_FALLBACK,
+            },
+            Ablation {
+                name: "without-head",
+                expect_method_denial: true,
+                witness: ("HEAD", "/admin/probe.txt"),
+                guard: DeploymentSettings {
+                    include_head: false,
+                    decode: DecodeDepth::UpToTwo,
+                    ..PARENT_POST_FALLBACK
+                },
+            },
+            Ablation {
+                name: "without-private-post-fallback",
+                expect_method_denial: true,
+                witness: ("POST", "/files/private/probe.txt"),
+                guard: DeploymentSettings {
+                    decode: DecodeDepth::UpToTwo,
+                    ..SENSITIVE
+                },
+            },
+        ],
+        parsing_probes: &[
+            ParsingProbe {
+                path: "/%2561dmin/probe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+            ParsingProbe {
+                path: "/admin%2fprobe.txt",
+                status: 200,
+                route_id: Some("admin"),
+            },
+        ],
+    },
+    Profile {
         backend: "nginx-axum",
         name: "DecodedUri",
         guard: SENSITIVE,

@@ -18,7 +18,7 @@ single process. The guarantee is "one parser," not "one binary."
 The direct profiles place the guard before one backend:
 
 ```text
-client -> guard / authorization -> Apache, Express, Axum, or SvelteKit
+client -> guard / authorization -> Apache, Express, Axum, SvelteKit, Tomcat–Spring, or Go ServeMux
 ```
 
 There is no intermediate proxy after the guard in these profiles. The harness

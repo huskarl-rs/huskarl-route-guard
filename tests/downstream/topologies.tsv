@@ -16,3 +16,5 @@ apache-proxy-express	NoCanon	express	Sensitive	apache-proxy
 nginx-nginx-express	DecodedUri	express	Sensitive	nginx-decoded,nginx-decoded
 nginx-raw-nginx-apache	Mixed	apache	On	nginx-raw,nginx-decoded
 apache-proxy-nginx-express	Mixed	express	Sensitive	apache-proxy,nginx-decoded
+go	ServeMux	go	ServeMux	-
+nginx-go	DecodedUri	go	ServeMux	nginx-decoded

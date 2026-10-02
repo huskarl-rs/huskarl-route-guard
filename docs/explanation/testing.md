@@ -175,7 +175,7 @@ versioned configuration recommendations supported by these tests.
 These tests challenge deployment assumptions behind configuration recommendations.
 `mise run test-downstream` runs the ignored `tests/downstream.rs` integration test
 against pinned Linux Apache, Express, Axum, `SvelteKit` adapter-node, and
-Tomcat–Spring MVC fixtures,
+Tomcat–Spring MVC, and Go standard-library `ServeMux` fixtures,
 plus configurable NGINX and Apache reverse proxy chains, including multiple hops.
 The topology registry separates origin fixtures from ordered proxy configurations;
 every complete chain retains explicit guard recommendations and witnesses.

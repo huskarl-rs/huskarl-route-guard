@@ -43,6 +43,8 @@ jobs:
         backend:
           - apache
           - express
+          - go
+          - nginx-go
           - axum
           - sveltekit
           - nginx-apache

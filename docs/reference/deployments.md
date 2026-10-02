@@ -34,6 +34,7 @@ default. All profiles now use default backslash handling.
 | Express 5.2.1 | `express.Router({ caseSensitive: false, strict: true })` | `Insensitive` | None |
 | Express 5.2.1 | `express.Router({ caseSensitive: true, strict: true })` | `Sensitive` | None |
 | Tomcat 11.0.26 / Spring MVC 7.0.8 | Embedded Tomcat; explicit connector options; case-sensitive `PathPatternParser` | `Sensitive` | None |
+| Go 1.27.1 | Standard-library `net/http.ServeMux`; modern method/wildcard patterns | `Sensitive` | None |
 | Axum 0.8.9 | Direct routes and fallback, without path-rewriting middleware | `Sensitive` | None |
 | `SvelteKit` 2.70.3 | Production `adapter-node` 5.5.7; rest-parameter endpoints | `Sensitive` | None |
 
@@ -65,6 +66,15 @@ Fixed direct probes pin distinctions that guard filtering could hide:
 returns 400. These are observations of the complete servlet/MVC combination,
 not a claim that every servlet application treats these paths identically.
 They are reported as characterization, separately from authorization evidence.
+
+The Go fixture uses `net/http.Server` and the modern `net/http.ServeMux`, with
+`GODEBUG=httpmuxgo121=0`. It registers native method and wildcard patterns without
+rewriting middleware. Fixed probes distinguish decoded content (`/%61dmin/probe.txt`
+reaches admin) from encoded separators (`/admin%2fprobe.txt` reaches public).
+Raw dot segments and repeated slashes redirect, while escaped dot segments remain
+part of routing. See the [ServeMux reference](https://pkg.go.dev/net/http@go1.27.1#ServeMux)
+and `tests/downstream/go/README.md`. The fixture does not test `http.FileServer`,
+legacy Go 1.21 routing, or authorization based on captured wildcard values.
 
 ## Guard configuration
 
@@ -112,7 +122,7 @@ without a response body. Canonical probes assert successful handlers and expecte
   for POST as well, or enforce a separately tested method restriction. This applies
   to the Apache origin in the NGINX chain too.
 - The framework fixtures register POST for `/files`, but only GET for its private
-  child. Express and the Tomcat–Spring fixture fall through to the parent's POST handler. Mirror that with an
+  child. Express, Go `ServeMux`, and the Tomcat–Spring fixture fall through to the parent's POST handler. Mirror that with an
   explicit POST registration at `/files/private` using the files policy, or enable
   inheritance there to retain the parent POST rule and identity. Without either,
   the guard denies the method gap. Axum and `SvelteKit`
@@ -142,7 +152,7 @@ handlers need their own policy mapping and tests.
 
 ## Evidence for additional settings
 
-All seventeen recommended profiles passed with zero observed policy mismatches.
+All nineteen recommended profiles passed with zero observed policy mismatches.
 The shared 7,024-path corpus combines grammar-generated delimiter injections,
 mixed case, content escapes, double escapes, and separator transformations across
 seven policy layouts, including one with a distinct policy for each fixture route
@@ -169,7 +179,7 @@ method entries are needed for availability, not to prevent default-rule fallthro
 | Fragment truncation for NGINX–Express | `/foo/secret%23/bar` | Public exception matches at guard; origin reaches protected fallback |
 | HEAD declarations | `HEAD /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
 | Apache POST declarations | `POST /admin/probe.txt` | Guard denies with `MethodNotConfigured` |
-| Express or Tomcat–Spring child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
+| Express, Go, or Tomcat–Spring child POST fallback registration | `POST /files/private/probe.txt` | Non-inheriting child denies with `MethodNotConfigured` |
 
 The confusion witnesses justify the parsing settings; the method-denial witnesses
 pin safe failure when an availability requirement is omitted. Backslash handling
@@ -260,6 +270,7 @@ order, and `profiles.rs` assigns explicit guard settings and behavioral witnesse
 
 | Deployment | Chain after authorization | Decode declaration |
 |---|---|---|
+| `nginx-go` | NGINX decoded URI → Go `ServeMux` | `UpToTwo` |
 | `nginx-axum` | NGINX decoded URI → Axum | `UpToOne` |
 | `nginx-raw-express` | NGINX original request URI → Express | `UpToOne` |
 | `apache-proxy-express` | Apache reverse proxy → Express | `UpToOne` |
@@ -274,6 +285,9 @@ reverse proxy uses native `mod_proxy_http`,
 `AllowEncodedSlashes NoDecode`, and `MergeSlashes On`. NGINX original-URI forwarding
 uses `$request_uri` in the same variable-URI proxy configuration. These are
 specific fixture configurations, not claims about every deployment of either proxy.
+
+The NGINX→Go chain makes `/%2561dmin/probe.txt` reach admin and requires a
+second-decode removal witness; HEAD and child POST removal runs pin safe denial.
 
 The two decoded NGINX hops make `/%2561dmin/probe.txt` reach Express's admin
 handler; removing the second-decode declaration must expose policy confusion.
