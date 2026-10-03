@@ -451,6 +451,11 @@ const PROFILES: &[Profile] = &[
                 status: 400,
                 route_id: None,
             },
+            ParsingProbe {
+                path: "/files/../suffix;x=1%%3253bx",
+                status: 500,
+                route_id: None,
+            },
         ],
         backend: "tomcat-spring",
         name: "PathPattern",

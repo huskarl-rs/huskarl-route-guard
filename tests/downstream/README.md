@@ -191,8 +191,9 @@ The TCP client sends HTTP/1.0 with the original request target and zero-length b
 without a client URL parser or redirect following. Readiness and socket operations
 have timeouts. Each layout/method must serve at least five corpus requests to
 prevent a vacuous pass. Successful responses must contain known route IDs.
-Redirects and 400/403/404/405 responses are `no-resource`, not agreement evidence.
-A redirected request needs fresh authorization. Other statuses or network errors fail.
+Redirects, 400/403/404/405, and 500 responses without a route ID are `no-resource`,
+not agreement evidence; 500s also count as `server-errors`.
+A redirected request needs fresh authorization. Other responses or network errors fail.
 
 ## Regressions, seeded search, and shrinking
 

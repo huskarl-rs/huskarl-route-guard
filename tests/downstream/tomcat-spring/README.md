@@ -55,6 +55,13 @@ The harness pins these direct GET probes independently of guard acceptance:
 | `/admin%3Bx=1/probe.txt` | 200 | `public` |
 | `/public/..;x=1/admin/probe.txt` | 200 | `public` |
 | `/admin%2fprobe.txt` | 400 | None |
+| `/files/../suffix;x=1%%3253bx` | 500 | None |
+
+The malformed matrix-parameter escape in the last probe throws an
+`IllegalArgumentException` from Spring's path parsing. Tomcat returns an unmarked
+500. This target came from seed `37112952917` with budget `10000` and is replayed
+from `regressions.tsv` on every run. The harness records it as `no-resource`, counts
+it separately as a server error, and never treats it as policy agreement.
 
 In particular, servlet normalization alone does not predict the final Spring
 handler for `..;`. The observations concern the complete pinned stack. These

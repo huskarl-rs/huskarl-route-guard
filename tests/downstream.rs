@@ -435,6 +435,8 @@ fn classify(response: &Response) -> Result<Option<Policy>, String> {
         },
         // A redirect requires fresh authorization. No resource policy to compare.
         301 | 302 | 307 | 308 | 400 | 403 | 404 | 405 => Ok(None),
+        // Spring parsing errors can return 500; require no route marker.
+        500 if response.route_id.is_none() => Ok(None),
         status => Err(format!("unexpected downstream status {status}")),
     }
 }
@@ -835,10 +837,9 @@ fn characterize_corpus(
     let mut responses = HashMap::new();
     for method in [Method::GET, Method::HEAD, Method::POST] {
         let mut served = 0;
+        let mut server_errors = 0;
         for path in paths {
             let response = fetch(path, &method);
-            // Validate status and route identity even for guard-rejected inputs.
-            served += usize::from(response_policy(&response).is_some());
             // Malformed request lines may be rejected before the server knows
             // this is HEAD, so only successful responses must suppress bodies.
             if method == Method::HEAD && response.status == 200 {
@@ -852,10 +853,17 @@ fn characterize_corpus(
                 )
                 .unwrap();
             }
+            // Record before validation to preserve failing inputs.
+            served += usize::from(
+                classify(&response)
+                    .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
+                    .is_some(),
+            );
+            server_errors += usize::from(response.status == 500);
             responses.insert((method.clone(), path.clone()), response);
         }
         println!(
-            "characterization/{method}: observed={}, served={served}, no-resource={}",
+            "characterization/{method}: observed={}, served={served}, no-resource={}, server-errors={server_errors}",
             paths.len(),
             paths.len() - served
         );
@@ -947,5 +955,52 @@ fn characterization_observes_denied_paths_without_claiming_agreement() {
         assert_eq!(columns[1], "-");
         assert_eq!(columns[4], "-");
         assert_eq!(columns[8], "observed");
+    }
+}
+
+#[test]
+fn characterization_records_server_errors_without_resource_evidence() {
+    let path = "/files/../suffix;x=1%%3253bx";
+    let mut report = Some(Vec::new());
+    let responses = characterize_corpus(&BTreeSet::from([path.to_owned()]), &mut report, |_, _| {
+        Response {
+            status: 500,
+            body: "parser exception".to_owned(),
+            location: None,
+            route_id: None,
+        }
+    });
+    for method in [Method::GET, Method::HEAD, Method::POST] {
+        assert_eq!(classify(&responses[&(method, path.to_owned())]), Ok(None));
+    }
+    let report = String::from_utf8(report.unwrap()).unwrap();
+    assert_eq!(report.lines().count(), 3);
+    assert!(
+        report
+            .lines()
+            .all(|line| line.contains("\t500\tNone\tNone\tobserved"))
+    );
+}
+
+#[test]
+fn characterization_preserves_unexpected_response_diagnostics() {
+    for (status, route_id) in [(500, Some("admin")), (502, None), (503, None), (200, None)] {
+        let path = "/probe;bad=%";
+        let mut report = Some(Vec::new());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            characterize_corpus(&BTreeSet::from([path.to_owned()]), &mut report, |_, _| {
+                Response {
+                    status,
+                    body: String::new(),
+                    location: None,
+                    route_id: route_id.map(str::to_owned),
+                }
+            });
+        }))
+        .expect_err("unexpected responses must still fail");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains(&format!("characterization/GET/{path:?}:")));
+        let report = String::from_utf8(report.unwrap()).unwrap();
+        assert!(report.contains(&format!("{path:?}\t-\t{status}\t")));
     }
 }

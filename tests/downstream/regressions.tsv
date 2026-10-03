@@ -4,3 +4,4 @@
 # minimized mismatches here once their cause is understood and fixed.
 "/foo/secret%23/bar"	tmwxmztl audit 2026-09-26: decoded fragment truncation; nginx-express ParameterizedException GET (CVE-2026-41059 shape)
 "/foo/secret%3F/bar"	tmwxmztl audit 2026-09-26: decoded query truncation; nginx-express ParameterizedException GET
+"/files/../suffix;x=1%%3253bx"	tomcat-spring/PathPattern: malformed matrix-parameter escape returns unmarked 500; seed=37112952917 budget=10000
