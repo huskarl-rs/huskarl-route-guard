@@ -193,6 +193,10 @@ have timeouts. Each layout/method must serve at least five corpus requests to
 prevent a vacuous pass. Successful responses must contain known route IDs.
 Redirects and 400/403/404/405 responses are `no-resource`, not agreement evidence.
 A redirected request needs fresh authorization. Other statuses or network errors fail.
+Unexpected responses are saved in the observation report before validation, and
+the failure identifies the method and target. For proxy errors such as 502, compare
+that observation with the per-hop logs in `target/downstream/`; they are collected
+even when the test fails.
 
 ## Regressions, seeded search, and shrinking
 

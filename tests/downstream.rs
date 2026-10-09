@@ -837,13 +837,6 @@ fn characterize_corpus(
         let mut served = 0;
         for path in paths {
             let response = fetch(path, &method);
-            // Validate status and route identity even for guard-rejected inputs.
-            served += usize::from(response_policy(&response).is_some());
-            // Malformed request lines may be rejected before the server knows
-            // this is HEAD, so only successful responses must suppress bodies.
-            if method == Method::HEAD && response.status == 200 {
-                assert!(response.body.is_empty(), "HEAD body for {path:?}");
-            }
             if let Some(report) = report {
                 writeln!(
                     report,
@@ -851,6 +844,18 @@ fn characterize_corpus(
                     response.status, response.route_id, response.location
                 )
                 .unwrap();
+            }
+            // Preserve the observation before validating it so failed runs keep
+            // the offending target in their report, including rejected inputs.
+            served += usize::from(
+                classify(&response)
+                    .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
+                    .is_some(),
+            );
+            // Malformed request lines may be rejected before the server knows
+            // this is HEAD, so only successful responses must suppress bodies.
+            if method == Method::HEAD && response.status == 200 {
+                assert!(response.body.is_empty(), "HEAD body for {path:?}");
             }
             responses.insert((method.clone(), path.clone()), response);
         }
@@ -948,4 +953,31 @@ fn characterization_observes_denied_paths_without_claiming_agreement() {
         assert_eq!(columns[4], "-");
         assert_eq!(columns[8], "observed");
     }
+}
+
+#[test]
+fn characterization_preserves_and_identifies_unexpected_responses() {
+    let path = "/admin%00/probe.txt";
+    let paths = BTreeSet::from([path.to_owned()]);
+    let mut report = Some(Vec::new());
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        characterize_corpus(&paths, &mut report, |_, method| Response {
+            status: if method == Method::POST { 502 } else { 400 },
+            body: "fixture error".to_owned(),
+            location: None,
+            route_id: None,
+        });
+    }));
+    let panic = failure.expect_err("a gateway error must fail the oracle");
+    let message = panic.downcast_ref::<String>().expect("panic message");
+    assert_eq!(
+        message,
+        &format!("characterization/POST/{path:?}: unexpected downstream status 502")
+    );
+    let report = String::from_utf8(report.unwrap()).unwrap();
+    assert_eq!(report.lines().count(), 3);
+    assert_eq!(
+        report.lines().last().unwrap(),
+        format!("characterization\t-\tPOST\t{path:?}\t-\t502\tNone\tNone\tobserved")
+    );
 }

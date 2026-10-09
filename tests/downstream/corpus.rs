@@ -132,7 +132,7 @@ fn mutate(path: &str, index: usize, rng: &mut Rng) -> Option<String> {
         }
         "seeded/separator" => {
             let at = choose(rng, offsets(path, |_, b| b == b'/'))?;
-            Some(replace(path, at, 1, *rng.pick(SEPARATORS)))
+            Some(replace(path, at, 1, rng.pick(SEPARATORS)))
         }
         "seeded/escape" => {
             let at = choose(rng, offsets(path, |_, b| b.is_ascii_graphic() && b != b'%'))?;
@@ -162,7 +162,7 @@ fn mutate(path: &str, index: usize, rng: &mut Rng) -> Option<String> {
             let mut ends = offsets(path, |_, b| b == b'/');
             ends.push(path.len());
             let at = choose(rng, ends)?;
-            Some(insert(path, at, *rng.pick(PARAMETERS)))
+            Some(insert(path, at, rng.pick(PARAMETERS)))
         }
         "seeded/trailing-slash" => Some(match path.strip_suffix('/') {
             Some(trimmed) if !trimmed.is_empty() => trimmed.to_owned(),
