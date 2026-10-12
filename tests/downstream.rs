@@ -847,11 +847,17 @@ fn characterize_corpus(
             }
             // Preserve the observation before validating it so failed runs keep
             // the offending target in their report, including rejected inputs.
-            served += usize::from(
+            // Native parsers can throw on malformed targets (for example,
+            // Spring matrix parameters with invalid percent escapes). Preserve
+            // an unmarked 500 as an error observation, not resource evidence.
+            // Forwarded requests still use the strict classifier below.
+            let policy = if response.status == 500 && response.route_id.is_none() {
+                None
+            } else {
                 classify(&response)
                     .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
-                    .is_some(),
-            );
+            };
+            served += usize::from(policy.is_some());
             // Malformed request lines may be rejected before the server knows
             // this is HEAD, so only successful responses must suppress bodies.
             if method == Method::HEAD && response.status == 200 {
@@ -953,6 +959,53 @@ fn characterization_observes_denied_paths_without_claiming_agreement() {
         assert_eq!(columns[4], "-");
         assert_eq!(columns[8], "observed");
     }
+}
+
+#[test]
+fn characterization_preserves_native_parser_errors_without_forwarding_evidence() {
+    let path = "/public;x=1%%295cprobe.txt";
+    let guard = router(
+        Layout::Distinct,
+        profiles::find("tomcat-spring", "PathPattern").guard,
+    );
+    for method in [Method::GET, Method::HEAD, Method::POST] {
+        assert!(guard.resolve(path, &method).is_err());
+    }
+    let paths = BTreeSet::from([path.to_owned()]);
+    let mut report = Some(Vec::new());
+    let responses = characterize_corpus(&paths, &mut report, |_, _| Response {
+        status: 500,
+        body: "parser error".to_owned(),
+        location: None,
+        route_id: None,
+    });
+    for method in [Method::GET, Method::HEAD, Method::POST] {
+        let response = &responses[&(method.clone(), path.to_owned())];
+        assert_eq!(response.status, 500);
+        // A 500 remains fatal if this target is accepted and forwarded.
+        assert_eq!(
+            classify(response),
+            Err("unexpected downstream status 500".to_owned())
+        );
+    }
+    let report = String::from_utf8(report.unwrap()).unwrap();
+    assert_eq!(report.lines().count(), 3);
+    assert!(
+        report
+            .lines()
+            .all(|line| line.ends_with("\t500\tNone\tNone\tobserved"))
+    );
+
+    // An error response that identifies a resource is not a parser rejection.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        characterize_corpus(&paths, &mut None::<Vec<u8>>, |_, _| Response {
+            status: 500,
+            body: String::new(),
+            location: None,
+            route_id: Some("public".to_owned()),
+        });
+    }));
+    assert!(failure.is_err());
 }
 
 #[test]

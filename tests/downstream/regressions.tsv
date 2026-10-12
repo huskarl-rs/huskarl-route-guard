@@ -2,5 +2,6 @@
 # Format: <path as a Rust debug string><TAB><provenance>
 # Shrink artifacts (target/downstream/*-shrunk.tsv) use this format; append
 # minimized mismatches here once their cause is understood and fixed.
+"/public;x=1%%295cprobe.txt"	tomcat-spring/PathPattern seed=38241752443 budget=10000: malformed matrix parameter produces native 500 during characterization
 "/foo/secret%23/bar"	tmwxmztl audit 2026-09-26: decoded fragment truncation; nginx-express ParameterizedException GET (CVE-2026-41059 shape)
 "/foo/secret%3F/bar"	tmwxmztl audit 2026-09-26: decoded query truncation; nginx-express ParameterizedException GET

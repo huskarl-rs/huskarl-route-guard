@@ -4,6 +4,10 @@ These tests validate the assumptions behind deployment recommendations. A separa
 characterization pass sends every corpus path directly to the backend with GET,
 HEAD, and POST, independently of guard acceptance. Safety comparisons use only
 requests accepted by each candidate guard configuration.
+Unmarked HTTP 500 responses are retained as characterization observations without
+resource evidence; malformed targets can trigger native parser exceptions. A 500
+for a guard-accepted target still fails the safety comparison, as do gateway errors
+during characterization.
 A reached route's independently assigned policy must agree with the authorized
 policy. Removal runs weaken one setting or registration assumption and must expose
 actual outgoing-request confusion for parsing settings. Removing a method
