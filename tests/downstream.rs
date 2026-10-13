@@ -482,16 +482,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
     });
     let mut families: BTreeMap<(&str, &str), FamilyStats> = BTreeMap::new();
-    for (path, tags) in &corpus {
-        for method in [Method::GET, Method::HEAD, Method::POST] {
-            let reached = response_policy(&responses[&(method, path.clone())]).is_some();
-            for &family in tags {
-                let stats = families.entry(("characterization", family)).or_default();
-                stats.inputs += 1;
-                stats.served += usize::from(reached);
-            }
-        }
-    }
+    record_characterization_families(&corpus, &responses, &mut families);
     // Reuse corpus observations for fixed probes where possible. Profile probes
     // can also cover targets outside the shared corpus.
     for probe in deployment.parsing_probes {
@@ -582,8 +573,11 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                         .get(&(method.clone(), path.clone()))
                         .expect("every method/target has been characterized");
                     forwarded += 1;
-                    let expected =
-                        response_policy(response).map(|policy| layout_policy(layout, policy));
+                    let expected = classify(response)
+                        .unwrap_or_else(|error| {
+                            panic!("{candidate}/{layout:?}/{method}/{path:?}: {error}")
+                        })
+                        .map(|policy| layout_policy(layout, policy));
                     let outcome = match expected {
                         Some(policy) if policy != *matched.rule() => {
                             confusion += 1;
@@ -669,6 +663,25 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         responses.len()
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn record_characterization_families<'a>(
+    corpus: &Corpus,
+    responses: &HashMap<(Method, String), Response>,
+    families: &mut BTreeMap<(&'a str, &'a str), FamilyStats>,
+) {
+    for (path, tags) in corpus {
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            let reached =
+                characterization_policy(&responses[&(method.clone(), path.clone())], &method, path)
+                    .is_some();
+            for &family in tags {
+                let stats = families.entry(("characterization", family)).or_default();
+                stats.inputs += 1;
+                stats.served += usize::from(reached);
+            }
+        }
+    }
 }
 
 fn write_family_report(families: &BTreeMap<(&str, &str), FamilyStats>) {
@@ -825,6 +838,17 @@ impl ShrinkReport {
     }
 }
 
+// Native parsers can throw on malformed targets. An unmarked 500 is an
+// observation without resource evidence; guard-accepted requests still use classify.
+fn characterization_policy(response: &Response, method: &Method, path: &str) -> Option<Policy> {
+    if response.status == 500 && response.route_id.is_none() {
+        None
+    } else {
+        classify(response)
+            .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
+    }
+}
+
 // This deliberately bypasses the guard. Observations are not authorization or
 // model-agreement evidence, including when a backend serves a denied target.
 fn characterize_corpus(
@@ -847,16 +871,7 @@ fn characterize_corpus(
             }
             // Preserve the observation before validating it so failed runs keep
             // the offending target in their report, including rejected inputs.
-            // Native parsers can throw on malformed targets (for example,
-            // Spring matrix parameters with invalid percent escapes). Preserve
-            // an unmarked 500 as an error observation, not resource evidence.
-            // Forwarded requests still use the strict classifier below.
-            let policy = if response.status == 500 && response.route_id.is_none() {
-                None
-            } else {
-                classify(&response)
-                    .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
-            };
+            let policy = characterization_policy(&response, &method, path);
             served += usize::from(policy.is_some());
             // Malformed request lines may be rejected before the server knows
             // this is HEAD, so only successful responses must suppress bodies.
@@ -988,6 +1003,16 @@ fn characterization_preserves_native_parser_errors_without_forwarding_evidence()
             Err("unexpected downstream status 500".to_owned())
         );
     }
+    // Exercise the statistics pass too: it must retain the characterization
+    // semantics when reading cached errors, before any candidate forwards them.
+    let corpus = BTreeMap::from([(path.to_owned(), BTreeSet::from(["regression"]))]);
+    let mut families = BTreeMap::new();
+    record_characterization_families(&corpus, &responses, &mut families);
+    let stats = &families[&("characterization", "regression")];
+    assert_eq!(stats.inputs, 3);
+    assert_eq!(stats.served, 0);
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(stats.confusions, 0);
     let report = String::from_utf8(report.unwrap()).unwrap();
     assert_eq!(report.lines().count(), 3);
     assert!(
