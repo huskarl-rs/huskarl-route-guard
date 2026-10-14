@@ -117,7 +117,12 @@ The proxy fixtures are independent of the selected origin:
 - `nginx-decoded`: the existing normalized `$uri$is_args$args` forwarding behavior.
 - `nginx-raw`: the same pinned NGINX, forwarding `$request_uri`.
 - `apache-proxy`: pinned Apache 2.4.68, native `mod_proxy_http`, `ProxyPass ... nocanon`,
-  `AllowEncodedSlashes NoDecode`, and `MergeSlashes On`.
+  `AllowEncodedSlashes NoDecode`, and `MergeSlashes On`. Upstream connection pooling
+  is disabled with `disablereuse=On`; `KeepAlive Off` controls only client
+  connections. This avoids pooled-connection close races producing intermittent
+  502s during the corpus run. See Apache's
+  [connection reuse documentation](https://httpd.apache.org/docs/2.4/mod/mod_proxy.html#proxypass)
+  and [description of the close race](https://httpd.apache.org/docs/2.4/mod/mod_proxy_http.html#env).
 
 Add a row and a corresponding recommendation/probes/removal witnesses in
 `profiles.rs` to test another coupling or hop sequence. No orchestration branches
