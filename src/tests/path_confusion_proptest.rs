@@ -199,7 +199,8 @@ fn build_router(
 
 /// One sampled backend: which modeled transforms it performs. Each toggle is
 /// only ever set when the corresponding structural class/encoding is enabled in
-/// the config the guard was built with.
+/// the config the guard was built with. Every backend with a decode step also
+/// decodes `%25` to `%`, consuming one pass of the declared decode budget.
 // Each field is an independent transform toggle — a flat set of booleans is the
 // clearest representation (mirroring `StructuralClasses`).
 #[allow(clippy::struct_excessive_bools)]
@@ -209,16 +210,27 @@ struct Backend {
     decode_dot: bool,        // `%2E` → `.`
     decode_unreserved: bool, // every other `%XX` (content) → its byte
     fold_unicode: bool,      // fullwidth `／`·`．`·`；`·`＼` → `/`·`.`·`;`·`\`
-    strip_params: bool,      // drop `;…` in each segment
+    strip_params: bool,      // decode `%3B` within budget; drop literal `;…` in each segment
     merge_slashes: bool,     // `//` → `/`
     resolve_dots: bool,      // RFC 3986 §5.2.4 dot-segment removal
     case_fold: bool,         // ASCII lowercase
-    truncate_query: bool,    // cut at the first decoded ?
-    truncate_fragment: bool, // cut at the first decoded #
-    truncate_nul: bool,      // cut at the first NUL (`%00`)
+    truncate_query: bool,    // decode `%3F` within budget; cut at the first literal ?
+    truncate_fragment: bool, // decode `%23` within budget; cut at the first literal #
+    truncate_nul: bool,      // decode `%00` within budget; cut at the first literal NUL
 }
 
 impl Backend {
+    /// Whether this backend performs percent decoding, including `%25` wrappers.
+    fn decodes_any(self) -> bool {
+        self.decode_sep
+            || self.decode_dot
+            || self.decode_unreserved
+            || self.truncate_nul
+            || self.truncate_query
+            || self.truncate_fragment
+            || self.strip_params
+    }
+
     /// The identity backend — every transform off. The base for a hand-built
     /// backend in a unit test (`Backend { merge_slashes: true, ..Backend::NONE }`),
     /// so the toggles a case actually exercises are the only ones it names.
@@ -286,8 +298,8 @@ enum Step {
     Query,
     Fragment,
     Trunc,
-    DecodeStruct,
-    DecodeUnres,
+    Decode,
+    Backslash,
     FoldUni,
     Strip,
     Merge,
@@ -302,7 +314,6 @@ fn apply(
     t: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeDepth,
     case_insensitive: bool,
 ) -> String {
     match step {
@@ -310,8 +321,9 @@ fn apply(
         Step::Trunc => truncate_at_nul(t),
         Step::Fragment => t.split('#').next().unwrap().to_owned(),
         Step::Query => t.split('?').next().unwrap().to_owned(),
-        Step::DecodeStruct => decode_pass(t, backend, classes, layers),
-        Step::DecodeUnres => decode_unreserved(t),
+        Step::Decode => decode_pass(t, backend, classes),
+        Step::Backslash if classes.backslash => t.replace('\\', "/"),
+        Step::Backslash => t.to_owned(),
         Step::FoldUni => fold_unicode(t),
         Step::Strip => strip_params(t),
         Step::Merge => merge_slashes(t),
@@ -335,11 +347,11 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
     if backend.truncate_nul {
         steps.push(Step::Trunc);
     }
-    if backend.decode_sep || backend.decode_dot {
-        steps.push(Step::DecodeStruct);
+    if backend.decodes_any() {
+        steps.push(Step::Decode);
     }
-    if backend.decode_unreserved {
-        steps.push(Step::DecodeUnres);
+    if backend.decode_sep {
+        steps.push(Step::Backslash);
     }
     if backend.truncate_query {
         steps.push(Step::Query);
@@ -366,7 +378,8 @@ fn canonical_order(backend: Backend) -> Vec<Step> {
 }
 
 /// Normalize `path` as `backend` would, composing its steps in `order` and
-/// iterating to a fixpoint. Independent of the guard's own scanner by
+/// iterating structural rewrites to a fixpoint while bounding whole-path decode
+/// passes by `decode_budget`. Independent of the guard's own scanner by
 /// construction — it rewrites bytes and routing follows.
 ///
 /// # Why order is a sampled axis, not a fixed one
@@ -413,15 +426,23 @@ fn normalize_ordered(
     path: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeDepth,
+    decode_budget: u8,
     case_insensitive: bool,
     order: &[Step],
 ) -> String {
     let mut s = path.to_owned();
+    let mut remaining_decodes = decode_budget;
+    // Structural steps must not create new percent escapes; decode passes are bounded separately.
     for _ in 0..24 {
         let mut t = s.clone();
         for &step in order {
-            t = apply(step, &t, backend, classes, layers, case_insensitive);
+            if step == Step::Decode {
+                if remaining_decodes == 0 {
+                    continue;
+                }
+                remaining_decodes -= 1;
+            }
+            t = apply(step, &t, backend, classes, case_insensitive);
         }
         if t == s {
             break;
@@ -431,20 +452,30 @@ fn normalize_ordered(
     s
 }
 
+/// Each allowed pass budget is a distinct backend interpretation. A second
+/// decode can leave a route reached by the first, so both must be checked.
+fn decode_budgets(layers: DecodeDepth) -> impl Iterator<Item = u8> {
+    1..=max_decode_passes(layers)
+}
+
+fn max_decode_passes(layers: DecodeDepth) -> u8 {
+    if layers.is_up_to_two() { 2 } else { 1 }
+}
+
 /// [`normalize_ordered`] in the canonical order — the reference backend as the
 /// fuzz body and the unit tests use it.
 fn normalize(
     path: &str,
     backend: Backend,
     classes: &StructuralClasses,
-    layers: DecodeDepth,
+    decode_budget: u8,
     case_insensitive: bool,
 ) -> String {
     normalize_ordered(
         path,
         backend,
         classes,
-        layers,
+        decode_budget,
         case_insensitive,
         &canonical_order(backend),
     )
@@ -494,19 +525,20 @@ fn starts_ci(b: &[u8], i: usize, pat: &[u8]) -> bool {
         .all(|(k, &p)| b.get(i + k).is_some_and(|c| c.to_ascii_lowercase() == p))
 }
 
-/// One percent-decoding pass for the modeled structural bytes only (never
-/// general unreserved octets — see the module-level discussion of why that is a
-/// deliberate scope line). Double-encoding is peeled one `%25` layer per pass
-/// (only under a declared [`DecodeDepth::UpToTwo`] model); the fixpoint loop
-/// re-runs the decode.
-fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeDepth) -> String {
+/// One whole-path decode pass over the backend's selected escape classes.
+/// All classes read the same input: decoding a hex digit must not expose an
+/// escape to another decoder within this pass. The caller bounds pass count.
+fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses) -> String {
+    if !backend.decodes_any() {
+        return t.to_owned();
+    }
     let b = t.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
-            // Double-encoding: peel `%25` → `%`, let the next pass decode it.
-            if layers.is_up_to_two() && starts_ci(b, i, b"%25") {
+            // A wrapper consumes a pass even if no further decode is permitted.
+            if starts_ci(b, i, b"%25") {
                 out.push(b'%');
                 i += 3;
                 continue;
@@ -527,6 +559,17 @@ fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeD
                     b'/' if backend.decode_sep => Some(b'/'),
                     b'\\' if backend.decode_sep && c.backslash => Some(b'/'),
                     b'.' if backend.decode_dot => Some(b'.'),
+                    0 if backend.truncate_nul => Some(0),
+                    b';' if backend.strip_params => Some(b';'),
+                    b'?' if backend.truncate_query => Some(b'?'),
+                    b'#' if backend.truncate_fragment => Some(b'#'),
+                    // Content decoding also exposes `?` and `#`; selected truncation
+                    // steps may consume them on a later structural iteration.
+                    byte if backend.decode_unreserved
+                        && !matches!(byte, b'/' | b'.' | b';' | b'\\' | 0) =>
+                    {
+                        Some(byte)
+                    }
                     _ => None,
                 };
                 if let Some(d) = decoded {
@@ -537,36 +580,6 @@ fn decode_pass(t: &str, backend: Backend, c: &StructuralClasses, layers: DecodeD
             }
             out.push(b[i]);
             i += 1;
-        } else if b[i] == b'\\' && backend.decode_sep && c.backslash {
-            out.push(b'/');
-            i += 1;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| t.to_owned())
-}
-
-/// Percent-decode the *content* escapes — every complete `%XX` except those that
-/// decode to a structural byte (`/ . ; \ NUL`) or to the `%` double-encode wrapper.
-/// One pass and idempotent (it produces no new `%`), so it composes safely inside
-/// the normalization fixpoint; the structural and double-decode forms are handled by
-/// their own steps so this never implies them.
-fn decode_unreserved(t: &str) -> String {
-    if !t.contains('%') {
-        return t.to_owned();
-    }
-    let b = t.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && let Some(byte) = pct(b, i)
-            && !matches!(byte, b'/' | b'.' | b';' | b'\\' | 0 | b'%')
-        {
-            out.push(byte);
-            i += 3;
         } else {
             out.push(b[i]);
             i += 1;
@@ -590,7 +603,7 @@ fn fold_unicode(t: &str) -> String {
 }
 
 fn truncate_at_nul(t: &str) -> String {
-    let cut = [t.find("%00"), t.find('\0')].into_iter().flatten().min();
+    let cut = t.find('\0');
     match cut {
         Some(i) => t[..i].to_owned(),
         None => t.to_owned(),
@@ -765,9 +778,7 @@ fn precise_transform_strategy() -> impl Strategy<Value = PreciseTransform> {
             layers: DecodeDepth::UpToTwo,
             case: CaseSensitivity::Sensitive,
             backend: Backend {
-                // The structural decode step peels the `%25` wrapper under a
-                // up-to-two model; the content step then decodes `%61`.
-                decode_sep: true,
+                // The first pass peels `%25`; the second decodes `%61`.
                 decode_unreserved: true,
                 ..Backend::NONE
             },
@@ -862,22 +873,27 @@ fn config_from_bits(bits: u8) -> (StructuralClasses, DecodeDepth, CaseSensitivit
     (c, layers, case)
 }
 
+/// Decode the rooted request path from the shared fuzz input layout.
+fn fuzz_path(data: &[u8]) -> String {
+    // The guard only ever sees `uri.path()`, which is origin-form (a leading `/`). Model
+    // that so the fuzzer explores realistic inputs — and so the reference backend's
+    // dot-segment resolver, which assumes a rooted path, is never handed an impossible one.
+    // A bare `/` prepend preserves `//` and every structural byte; it only roots the path.
+    let raw = String::from_utf8_lossy(data.get(2..).unwrap_or(&[]));
+    if raw.starts_with('/') {
+        raw.into_owned()
+    } else {
+        format!("/{raw}")
+    }
+}
+
 /// Engine-agnostic fuzz body: if the guard *allows* the path, assert no modeled backend
 /// relocates it to a different rule. A failure is a real authorization bypass. Input
 /// layout: `[specs_mask, config_bits, path bytes…]`.
 pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
     let specs_mask = data.first().copied().unwrap_or(0xFF);
     let (classes, layers, case) = config_from_bits(data.get(1).copied().unwrap_or(0));
-    // The guard only ever sees `uri.path()`, which is origin-form (a leading `/`). Model
-    // that so the fuzzer explores realistic inputs — and so the reference backend's
-    // dot-segment resolver, which assumes a rooted path, is never handed an impossible one.
-    // A bare `/` prepend preserves `//` and every structural byte; it only roots the path.
-    let raw = String::from_utf8_lossy(data.get(2..).unwrap_or(&[]));
-    let path = if raw.starts_with('/') {
-        raw.into_owned()
-    } else {
-        format!("/{raw}")
-    };
+    let path = fuzz_path(data);
 
     // The first 8 entries are mask-controlled; any beyond are always included
     // (mirroring `fuzz_matcher_differential` — and keeping the shift in u8 range).
@@ -902,16 +918,18 @@ pub(crate) fn fuzz_guard_relocation(data: &[u8]) {
         return; // denied — sound regardless of any backend
     }
     for backend in modeled_backends(&classes, case) {
-        let normalized = normalize(&path, backend, &classes, layers, case.is_insensitive());
-        if normalized == path {
-            continue;
+        for budget in decode_budgets(layers) {
+            let normalized = normalize(&path, backend, &classes, budget, case.is_insensitive());
+            if normalized == path {
+                continue;
+            }
+            let reloc_rule = router.raw_identity_for_test(&normalized, &http::Method::GET);
+            assert_eq!(
+                reloc_rule, raw_rule,
+                "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend {backend:?} \
+                 normalizes it to {normalized:?}, which routes to rule {reloc_rule:?}"
+            );
         }
-        let reloc_rule = router.raw_identity_for_test(&normalized, &http::Method::GET);
-        assert_eq!(
-            reloc_rule, raw_rule,
-            "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend {backend:?} \
-             normalizes it to {normalized:?}, which routes to rule {reloc_rule:?}"
-        );
     }
 }
 
@@ -1003,21 +1021,23 @@ proptest! {
                 order_seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
             );
             for order in [&canonical, &permuted] {
-                let normalized = normalize_ordered(
-                    &path, backend, &classes, layers, case.is_insensitive(), order,
-                );
-                if normalized == path {
-                    continue;
+                for budget in decode_budgets(layers) {
+                    let normalized = normalize_ordered(
+                        &path, backend, &classes, budget, case.is_insensitive(), order,
+                    );
+                    if normalized == path {
+                        continue;
+                    }
+                    let reloc_rule = router.raw_identity_for_test(&normalized, &method);
+                    prop_assert_eq!(
+                        reloc_rule,
+                        raw_rule,
+                        "BYPASS: guard allowed {:?} (rule {:?}) but backend {:?} applying {:?} \
+                         normalizes it to {:?}, which routes to rule {:?} — table {:?}, \
+                         classes {:?}, case {:?}, method {:?}, method masks {:?}",
+                        path, raw_rule, backend, order, normalized, reloc_rule, specs, classes, case, method, method_masks
+                    );
                 }
-                let reloc_rule = router.raw_identity_for_test(&normalized, &method);
-                prop_assert_eq!(
-                    reloc_rule,
-                    raw_rule,
-                    "BYPASS: guard allowed {:?} (rule {:?}) but backend {:?} applying {:?} \
-                     normalizes it to {:?}, which routes to rule {:?} — table {:?}, \
-                     classes {:?}, case {:?}, method {:?}, method masks {:?}",
-                    path, raw_rule, backend, order, normalized, reloc_rule, specs, classes, case, method, method_masks
-                );
             }
         }
     }
@@ -1052,7 +1072,7 @@ proptest! {
             &raw,
             transform.backend,
             &StructuralClasses::new(),
-            transform.layers,
+            max_decode_passes(transform.layers),
             transform.case.is_insensitive(),
         );
         prop_assert_eq!(&normalized, &literal);
@@ -1111,10 +1131,12 @@ proptest! {
                 order_seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
             );
             for order in [&canonical, &permuted] {
-                let normalized = normalize_ordered(
-                    &path, backend, &classes, layers, case.is_insensitive(), order,
-                );
-                check_anchor_preserved(&path, anchor, &normalized)?;
+                for budget in decode_budgets(layers) {
+                    let normalized = normalize_ordered(
+                        &path, backend, &classes, budget, case.is_insensitive(), order,
+                    );
+                    check_anchor_preserved(&path, anchor, &normalized)?;
+                }
             }
         }
     }
@@ -1175,7 +1197,7 @@ fn anchor_property_detects_strip_and_rescan_mutation() {
         resolve_dots: true,
         ..Backend::NONE
     };
-    let ordinary = normalize(path, backend, &classes, layers, false);
+    let ordinary = normalize(path, backend, &classes, max_decode_passes(layers), false);
     assert_eq!(ordinary, "/safe/..../admin");
     check_anchor_preserved(path, anchor, &ordinary).expect("modeled transforms preserve anchor");
 
@@ -1185,7 +1207,7 @@ fn anchor_property_detects_strip_and_rescan_mutation() {
         path,
         backend,
         &classes,
-        layers,
+        max_decode_passes(layers),
         false,
         &[Step::StripTraversalControl, Step::Merge, Step::Dots],
     );
@@ -1208,6 +1230,158 @@ mod reference_backend_tests {
     use super::*;
 
     #[test]
+    fn budget_sweep_catches_relocation_only_reached_after_one_pass() {
+        let classes = StructuralClasses::new();
+        let router = build_router(
+            &[('e', "/x/%61")],
+            classes.clone(),
+            DecodeDepth::UpToTwo,
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap();
+        let path = "/x/%2561";
+        let backend = Backend {
+            decode_unreserved: true,
+            ..Backend::NONE
+        };
+        let raw_rule = router.raw_identity_for_test(path, &http::Method::GET);
+        let rules: Vec<_> = decode_budgets(DecodeDepth::UpToTwo)
+            .map(|budget| {
+                let normalized = normalize(path, backend, &classes, budget, false);
+                router.raw_identity_for_test(&normalized, &http::Method::GET)
+            })
+            .collect();
+        assert_eq!(rules.len(), 2);
+        assert_ne!(
+            rules[0], raw_rule,
+            "one pass must expose the intermediate route"
+        );
+        assert_eq!(
+            rules[1], raw_rule,
+            "two passes hide the intermediate relocation"
+        );
+        assert!(router.denial_for_test(path, &http::Method::GET).is_some());
+    }
+
+    #[test]
+    fn structural_decoders_unwrap_percent_within_budget() {
+        let classes = StructuralClasses::new();
+        for (backend, path, once) in [
+            (
+                Backend {
+                    strip_params: true,
+                    ..Backend::NONE
+                },
+                "/a%253bx",
+                "/a%3bx",
+            ),
+            (
+                Backend {
+                    truncate_query: true,
+                    ..Backend::NONE
+                },
+                "/a%253fx",
+                "/a%3fx",
+            ),
+            (
+                Backend {
+                    truncate_fragment: true,
+                    ..Backend::NONE
+                },
+                "/a%2523x",
+                "/a%23x",
+            ),
+            (
+                Backend {
+                    truncate_nul: true,
+                    ..Backend::NONE
+                },
+                "/a%2500x",
+                "/a%00x",
+            ),
+        ] {
+            assert_eq!(normalize(path, backend, &classes, 1, false), once);
+            assert_eq!(normalize(path, backend, &classes, 2, false), "/a");
+            assert_eq!(decode_pass(path, Backend::NONE, &classes), path);
+        }
+    }
+
+    #[test]
+    fn reported_relocation_respects_declared_decode_depth() {
+        let input = b"\x5e\x63A%%300\x03\xa1%";
+        // The exact fuzzer input declares UpToOne. A second pass would reveal NUL.
+        fuzz_guard_relocation(input);
+        let (classes, layers, case) = config_from_bits(input[1]);
+        assert_eq!(layers, DecodeDepth::UpToOne);
+        let path = fuzz_path(input);
+        let backend = Backend {
+            decode_unreserved: true,
+            case_fold: true,
+            truncate_nul: true,
+            ..Backend::NONE
+        };
+        assert_eq!(
+            normalize(&path, backend, &classes, max_decode_passes(layers), true),
+            "/a%00\u{3}�%"
+        );
+        assert_eq!(normalize(&path, backend, &classes, 2, true), "/a");
+        let router = build_router(&[('s', "/a")], classes.clone(), layers, case).unwrap();
+        assert!(router.denial_for_test(&path, &http::Method::GET).is_none());
+        let router = build_router(&[('s', "/a")], classes, DecodeDepth::UpToTwo, case).unwrap();
+        assert!(router.denial_for_test(&path, &http::Method::GET).is_some());
+        let mut two_pass_input = *input;
+        two_pass_input[1] |= 8;
+        assert_eq!(config_from_bits(two_pass_input[1]).1, DecodeDepth::UpToTwo);
+        fuzz_guard_relocation(&two_pass_input);
+    }
+
+    #[test]
+    fn normalization_bounds_all_escape_classes_in_one_pass() {
+        let backend = Backend {
+            decode_sep: true,
+            decode_dot: true,
+            decode_unreserved: true,
+            truncate_nul: true,
+            truncate_query: true,
+            truncate_fragment: true,
+            strip_params: true,
+            ..Backend::NONE
+        };
+        let classes = StructuralClasses::new();
+        for (path, once, twice) in [
+            ("/a%%300", "/a%00", "/a"),
+            ("/a%%32fadmin", "/a%2fadmin", "/a/admin"),
+            ("/a%%33fsuffix", "/a%3fsuffix", "/a"),
+            ("/a%%32%33suffix", "/a%23suffix", "/a"),
+            ("/a%%33bsuffix", "/a%3bsuffix", "/a"),
+            ("/%25%36%31", "/%61", "/a"),
+            ("/a%252500", "/a%2500", "/a%00"),
+            ("/a%25252fadmin", "/a%252fadmin", "/a%2fadmin"),
+        ] {
+            let order = canonical_order(backend);
+            let reversed: Vec<_> = order.iter().copied().rev().collect();
+            for order in [&order, &reversed] {
+                for (layers, expected) in
+                    [(DecodeDepth::UpToOne, once), (DecodeDepth::UpToTwo, twice)]
+                {
+                    assert_eq!(
+                        normalize_ordered(
+                            path,
+                            backend,
+                            &classes,
+                            max_decode_passes(layers),
+                            false,
+                            order
+                        ),
+                        expected,
+                        "path={path}, layers={layers:?}, order={order:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn remove_dot_segments_matches_rfc_examples() {
         // RFC 3986 §5.2.4 worked examples.
         assert_eq!(remove_dot_segments("/a/b/c/./../../g"), "/a/g");
@@ -1217,42 +1391,31 @@ mod reference_backend_tests {
     }
 
     #[test]
-    fn decode_pass_is_scoped_to_structural_bytes() {
+    fn decode_pass_respects_selected_classes() {
         let c = StructuralClasses::new().without_backslash();
         let all_decode = Backend {
             decode_sep: true,
             decode_dot: true,
             ..Backend::NONE
         };
-        let single = DecodeDepth::UpToOne;
-        assert_eq!(decode_pass("/a%2fb", all_decode, &c, single), "/a/b");
-        assert_eq!(decode_pass("/a%2eb", all_decode, &c, single), "/a.b");
+        assert_eq!(decode_pass("/a%2fb", all_decode, &c), "/a/b");
+        assert_eq!(decode_pass("/a%2eb", all_decode, &c), "/a.b");
         // A non-structural unreserved escape is left intact — by design.
-        assert_eq!(decode_pass("/%61dmin", all_decode, &c, single), "/%61dmin");
+        assert_eq!(decode_pass("/%61dmin", all_decode, &c), "/%61dmin");
         // Backslash only decodes when the class is enabled.
-        assert_eq!(decode_pass("/a\\b", all_decode, &c, single), "/a\\b");
+        assert_eq!(decode_pass("/a\\b", all_decode, &c), "/a\\b");
         let with_back = StructuralClasses::new().with_backslash();
-        assert_eq!(decode_pass("/a\\b", all_decode, &with_back, single), "/a/b");
-        // The %25 double-encode wrapper peels only under an UpToTwo declaration.
-        assert_eq!(decode_pass("/a%252fb", all_decode, &c, single), "/a%252fb");
-        assert_eq!(
-            decode_pass("/a%252fb", all_decode, &c, DecodeDepth::UpToTwo),
-            "/a%2fb"
-        );
-    }
-
-    #[test]
-    fn decode_unreserved_decodes_content_not_structure() {
-        // Content escapes decode to their byte…
-        assert_eq!(decode_unreserved("/%61dmin"), "/admin");
-        assert_eq!(decode_unreserved("/a%20b"), "/a b");
-        // …but structural bytes and the %25 double-encode wrapper are left to their
-        // own steps, so this never produces `/`, `.`, `;`, `\`, NUL, or a fresh `%`.
-        assert_eq!(decode_unreserved("/a%2fb"), "/a%2fb");
-        assert_eq!(decode_unreserved("/a%2eb"), "/a%2eb");
-        assert_eq!(decode_unreserved("/a%252fb"), "/a%252fb");
-        // Idempotent (no new escapes appear).
-        assert_eq!(decode_unreserved(&decode_unreserved("/%61%20b")), "/a b");
+        assert_eq!(decode_pass("/a%5cb", all_decode, &with_back), "/a/b");
+        // The wrapper consumes one pass; its result needs another pass to decode.
+        assert_eq!(decode_pass("/a%252fb", all_decode, &c), "/a%2fb");
+        let content_only = Backend {
+            decode_unreserved: true,
+            ..Backend::NONE
+        };
+        assert_eq!(decode_pass("/%61%20b", content_only, &c), "/a b");
+        for path in ["/a%2fb", "/a%2eb", "/a%3bb", "/a%5cb", "/a%00b"] {
+            assert_eq!(decode_pass(path, content_only, &c), path);
+        }
     }
 
     #[test]
@@ -1270,7 +1433,8 @@ mod reference_backend_tests {
     fn strip_and_merge_helpers() {
         assert_eq!(strip_params("/a;x=1/b;y/c"), "/a/b/c");
         assert_eq!(merge_slashes("/a//b///c"), "/a/b/c");
-        assert_eq!(truncate_at_nul("/public%00/admin"), "/public");
+        assert_eq!(truncate_at_nul("/public\0/admin"), "/public");
+        assert_eq!(truncate_at_nul("/public%00/admin"), "/public%00/admin");
     }
 }
 
@@ -1318,10 +1482,7 @@ mod transform_order_tests {
         let path = "/admin;x//../b";
 
         // `normalize` merges `//` first, so the `..` climbs out of `/admin` entirely.
-        assert_eq!(
-            normalize(path, backend, &c, DecodeDepth::UpToOne, false),
-            "/b"
-        );
+        assert_eq!(normalize(path, backend, &c, 1, false), "/b");
         // A backend that resolves dot-segments on the raw path first has its `..`
         // consume the *empty* segment instead — landing inside `/admin`, a rule the
         // model's own order never reaches from this input.
@@ -1330,7 +1491,7 @@ mod transform_order_tests {
                 path,
                 backend,
                 &c,
-                DecodeDepth::UpToOne,
+                1,
                 false,
                 &[Step::Strip, Step::Dots, Step::Merge],
             ),
@@ -1426,18 +1587,21 @@ mod transform_order_tests {
             let raw_rule = router.raw_identity_for_test(path, &http::Method::GET);
             for backend in &backends {
                 for order in permutations(&canonical_order(*backend)) {
-                    let normalized =
-                        normalize_ordered(path, *backend, &classes, layers, true, &order);
-                    if normalized == *path {
-                        continue;
+                    for budget in decode_budgets(layers) {
+                        let normalized =
+                            normalize_ordered(path, *backend, &classes, budget, true, &order);
+                        if normalized == *path {
+                            continue;
+                        }
+                        let reloc_rule =
+                            router.raw_identity_for_test(&normalized, &http::Method::GET);
+                        assert_eq!(
+                            reloc_rule, raw_rule,
+                            "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend \
+                             {backend:?} applying {order:?} normalizes it to {normalized:?}, \
+                             which routes to rule {reloc_rule:?}"
+                        );
                     }
-                    let reloc_rule = router.raw_identity_for_test(&normalized, &http::Method::GET);
-                    assert_eq!(
-                        reloc_rule, raw_rule,
-                        "BYPASS: guard allowed {path:?} (rule {raw_rule:?}) but backend \
-                         {backend:?} applying {order:?} normalizes it to {normalized:?}, \
-                         which routes to rule {reloc_rule:?}"
-                    );
                 }
             }
         }
@@ -1475,7 +1639,7 @@ mod over_approximation_tests {
         let raw = router.raw_identity_for_test(path, &http::Method::GET);
         modeled_backends(classes, CaseSensitivity::Sensitive)
             .into_iter()
-            .map(|b| normalize(path, b, classes, DecodeDepth::UpToOne, false))
+            .map(|b| normalize(path, b, classes, 1, false))
             .filter(|n| n != path)
             .filter(|n| router.raw_identity_for_test(n, &http::Method::GET) != raw)
             .collect()
