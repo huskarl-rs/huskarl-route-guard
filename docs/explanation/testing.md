@@ -222,7 +222,10 @@ available decode setting and mandatory built-in structural classes are not
 individually removable and have no necessity claim from these tests.
 
 Canonical route probes and a minimum served-request count prevent vacuous passes.
-Redirects and backend rejections establish no policy agreement. Reports separate
+Redirects and backend rejections establish no policy agreement. Unmarked HTTP 500
+responses are reported as inconclusive, even for guard-accepted paths, and do not
+count toward served coverage. Gateway errors (502/503/504) fail the run as
+infrastructure failures. Reports separate
 recommended and weakened configurations, including every accepted-request
 counterexample. These are bounded GET/HEAD/POST routing and static-file baselines, not proof
 for arbitrary deployments or all inputs. Setup, configuration advice, and report
