@@ -421,6 +421,12 @@ fn response_policy(response: &Response) -> Option<Policy> {
     classify(response).unwrap_or_else(|error| panic!("{error}"))
 }
 
+// An unmarked server error provides no resource identity. Keep it distinct
+// from a rejection and never count it as agreement or a shrinking witness.
+fn inconclusive(response: &Response) -> bool {
+    response.status == 500 && response.route_id.is_none()
+}
+
 fn classify(response: &Response) -> Result<Option<Policy>, String> {
     match response.status {
         200 => match response.route_id.as_deref() {
@@ -433,6 +439,11 @@ fn classify(response: &Response) -> Result<Option<Policy>, String> {
             Some(other) => Err(format!("unknown resource marker {other:?}")),
             None => Err("successful response must identify its route".to_owned()),
         },
+        500 if inconclusive(response) => Ok(None),
+        502..=504 => Err(format!(
+            "downstream infrastructure failure (HTTP {}); inspect proxy and origin logs in target/downstream/",
+            response.status
+        )),
         // A redirect requires fresh authorization. No resource policy to compare.
         301 | 302 | 307 | 308 | 400 | 403 | 404 | 405 => Ok(None),
         status => Err(format!("unexpected downstream status {status}")),
@@ -524,6 +535,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
         let mut witness_observed = false;
         let mut forwarded = 0;
         let mut served = 0;
+        let mut inconclusive_count = 0;
         let mut skipped = 0;
         let mut confusion = 0;
         let mut unexpected = Vec::new();
@@ -593,6 +605,10 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
                             "route-confusion"
                         }
                         Some(_) => "agreement",
+                        None if inconclusive(response) => {
+                            inconclusive_count += 1;
+                            "inconclusive"
+                        }
                         None => "no-resource",
                     };
                     if expected.is_some() {
@@ -653,7 +669,7 @@ fn compare_corpus(address: SocketAddr, deployment: &Profile) {
             ));
         }
         println!(
-            "{}/{}/{candidate}: forwarded={forwarded}, served={served}, not-forwarded={skipped}, route-confusions={confusion}",
+            "{}/{}/{candidate}: forwarded={forwarded}, served={served}, inconclusive={inconclusive_count}, not-forwarded={skipped}, route-confusions={confusion}",
             deployment.backend, deployment.name
         );
     }
@@ -838,15 +854,8 @@ impl ShrinkReport {
     }
 }
 
-// Native parsers can throw on malformed targets. An unmarked 500 is an
-// observation without resource evidence; guard-accepted requests still use classify.
 fn characterization_policy(response: &Response, method: &Method, path: &str) -> Option<Policy> {
-    if response.status == 500 && response.route_id.is_none() {
-        None
-    } else {
-        classify(response)
-            .unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
-    }
+    classify(response).unwrap_or_else(|error| panic!("characterization/{method}/{path:?}: {error}"))
 }
 
 // This deliberately bypasses the guard. Observations are not authorization or
@@ -859,6 +868,7 @@ fn characterize_corpus(
     let mut responses = HashMap::new();
     for method in [Method::GET, Method::HEAD, Method::POST] {
         let mut served = 0;
+        let mut inconclusive_count = 0;
         for path in paths {
             let response = fetch(path, &method);
             if let Some(report) = report {
@@ -873,6 +883,7 @@ fn characterize_corpus(
             // the offending target in their report, including rejected inputs.
             let policy = characterization_policy(&response, &method, path);
             served += usize::from(policy.is_some());
+            inconclusive_count += usize::from(inconclusive(&response));
             // Malformed request lines may be rejected before the server knows
             // this is HEAD, so only successful responses must suppress bodies.
             if method == Method::HEAD && response.status == 200 {
@@ -881,9 +892,9 @@ fn characterize_corpus(
             responses.insert((method.clone(), path.clone()), response);
         }
         println!(
-            "characterization/{method}: observed={}, served={served}, no-resource={}",
+            "characterization/{method}: observed={}, served={served}, inconclusive={inconclusive_count}, no-resource={}",
             paths.len(),
-            paths.len() - served
+            paths.len() - served - inconclusive_count
         );
     }
     responses
@@ -997,11 +1008,8 @@ fn characterization_preserves_native_parser_errors_without_forwarding_evidence()
     for method in [Method::GET, Method::HEAD, Method::POST] {
         let response = &responses[&(method.clone(), path.to_owned())];
         assert_eq!(response.status, 500);
-        // A 500 remains fatal if this target is accepted and forwarded.
-        assert_eq!(
-            classify(response),
-            Err("unexpected downstream status 500".to_owned())
-        );
+        assert!(inconclusive(response));
+        assert_eq!(classify(response), Ok(None));
     }
     // Exercise the statistics pass too: it must retain the characterization
     // semantics when reading cached errors, before any candidate forwards them.
@@ -1050,7 +1058,9 @@ fn characterization_preserves_and_identifies_unexpected_responses() {
     let message = panic.downcast_ref::<String>().expect("panic message");
     assert_eq!(
         message,
-        &format!("characterization/POST/{path:?}: unexpected downstream status 502")
+        &format!(
+            "characterization/POST/{path:?}: downstream infrastructure failure (HTTP 502); inspect proxy and origin logs in target/downstream/"
+        )
     );
     let report = String::from_utf8(report.unwrap()).unwrap();
     assert_eq!(report.lines().count(), 3);
@@ -1058,4 +1068,37 @@ fn characterization_preserves_and_identifies_unexpected_responses() {
         report.lines().last().unwrap(),
         format!("characterization\t-\tPOST\t{path:?}\t-\t502\tNone\tNone\tobserved")
     );
+}
+
+#[test]
+fn accepted_parser_error_is_inconclusive_and_gateway_errors_remain_fatal() {
+    let path = "/foo/other/bar;x=1%%3253bx";
+    let guard = router(
+        Layout::Nested,
+        profiles::find("tomcat-spring", "PathPattern").guard,
+    );
+    assert!(guard.resolve(path, &Method::GET).is_ok());
+    let mut response = Response {
+        status: 500,
+        body: String::new(),
+        route_id: None,
+        location: None,
+    };
+    assert!(inconclusive(&response));
+    assert_eq!(classify(&response), Ok(None));
+    response.route_id = Some("private".to_owned());
+    assert!(!inconclusive(&response));
+    assert!(classify(&response).is_err());
+    for status in [502, 503, 504] {
+        response.status = status;
+        for marker in [None, Some("private".to_owned())] {
+            response.route_id = marker;
+            assert!(!inconclusive(&response));
+            assert!(
+                classify(&response)
+                    .unwrap_err()
+                    .contains("infrastructure failure")
+            );
+        }
+    }
 }

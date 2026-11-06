@@ -4,10 +4,10 @@ These tests validate the assumptions behind deployment recommendations. A separa
 characterization pass sends every corpus path directly to the backend with GET,
 HEAD, and POST, independently of guard acceptance. Safety comparisons use only
 requests accepted by each candidate guard configuration.
-Unmarked HTTP 500 responses are retained as characterization observations without
-resource evidence; malformed targets can trigger native parser exceptions. A 500
-for a guard-accepted target still fails the safety comparison, as do gateway errors
-during characterization.
+Unmarked HTTP 500 responses are inconclusive, including for guard-accepted targets:
+they provide no resource or policy-agreement evidence. Malformed targets can trigger
+native parser exceptions, but the status alone does not establish their cause.
+Marked 500 responses still fail, as do 502/503/504 infrastructure errors.
 A reached route's independently assigned policy must agree with the authorized
 policy. Removal runs weaken one setting or registration assumption and must expose
 actual outgoing-request confusion for parsing settings. Removing a method
@@ -201,7 +201,9 @@ without a client URL parser or redirect following. Readiness and socket operatio
 have timeouts. Each layout/method must serve at least five corpus requests to
 prevent a vacuous pass. Successful responses must contain known route IDs.
 Redirects and 400/403/404/405 responses are `no-resource`, not agreement evidence.
-A redirected request needs fresh authorization. Other statuses or network errors fail.
+A redirected request needs fresh authorization. Unmarked 500 responses are counted
+separately as `inconclusive`; they do not count toward minimum served coverage.
+Other statuses or network errors fail.
 Unexpected responses are saved in the observation report before validation, and
 the failure identifies the method and target. For proxy errors such as 502, compare
 that observation with the per-hop logs in `target/downstream/`; they are collected
@@ -264,7 +266,7 @@ built-in behaviors.
 
 `target/downstream/<backend>-<profile>.tsv` records candidate, layout, method, path,
 authorized policy, status, route ID, redirect location, and outcome: `agreement`,
-`route-confusion`, `no-resource`, or `not-forwarded`. The `characterization`
+`route-confusion`, `no-resource`, `inconclusive`, or `not-forwarded`. The `characterization`
 candidate contains every corpus path for GET, HEAD, and POST with outcome
 `observed` (21,072 corpus rows per profile, plus any fixed GET probes outside the
 corpus). These rows have no guard policy and never count as forwarding or agreement
