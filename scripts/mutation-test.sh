@@ -19,8 +19,10 @@ rustc --version >> "$output/run.txt"
 
 case "$mode" in
   full)
+    # Concurrent property runs can take ~45s on hosted runners. Leave enough
+    # headroom for Cargo to report a caught mutant before enforcing the hang limit.
     exec cargo mutants --file src/guard.rs --file src/structural.rs \
-      --jobs 3 --timeout 45 --build-timeout 120 \
+      --jobs 3 --timeout 90 --build-timeout 120 \
       --output "$output" "$@" -- --locked --lib --tests
     ;;
   property)
