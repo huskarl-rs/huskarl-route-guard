@@ -111,7 +111,9 @@ jobs:
     name: mutation (full audit)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The audit already takes ~28 minutes, excluding tool installation. Allow
+    # runner variability and the per-mutant hang budget without truncating evidence.
+    timeout-minutes: 60
     env:
       # Changes each scheduled run; reruns keep the same seed for reproduction.
       PROPTEST_RNG_SEED: ${{ github.run_id }}
